@@ -1,0 +1,24 @@
+[package]
+name = "alice-train"
+version = "0.1.0"
+edition = "2021"
+authors = ["Moroya Sakamoto"]
+description = "Backpropagation & Training Framework for ALICE-ML ternary networks"
+license = "AGPL-3.0"
+repository = "https://github.com/ext-sakamoro/ALICE-Train"
+keywords = ["machine-learning", "training", "backpropagation", "bitnet"]
+categories = ["science"]
+publish = false
+
+[dependencies]
+alice-ml = { path = "../ALICE-ML", default-features = true }
+
+[dev-dependencies]
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
