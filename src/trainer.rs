@@ -556,4 +556,79 @@ mod tests {
         let trainer = Trainer::new(TrainConfig::new().with_epochs(1));
         trainer.train(&mut net, &[vec![1.0]], &[vec![2.0]], mse_loss); // in_size=2だが1
     }
+
+    // ---- 追加テスト ----
+
+    #[test]
+    fn train_config_batch_size_field() {
+        // batch_size フィールドが正しくアクセスできることを検証
+        let cfg = TrainConfig {
+            epochs: 10,
+            batch_size: 64,
+            learning_rate: 0.01,
+            log_interval: 5,
+        };
+        assert_eq!(cfg.batch_size, 64);
+        assert_eq!(cfg.log_interval, 5);
+    }
+
+    #[test]
+    fn trainer_negative_target() {
+        // 負のターゲット値でも収束することを検証
+        let mut net = SimpleLinear::with_weights(1, 1, vec![0.0]);
+        let trainer = Trainer::new(TrainConfig::new().with_epochs(100).with_learning_rate(0.1));
+        let inputs = vec![vec![1.0], vec![2.0], vec![3.0]];
+        let targets = vec![vec![-1.0], vec![-2.0], vec![-3.0]];
+        let results = trainer.train(&mut net, &inputs, &targets, mse_loss);
+        let last = results.last().unwrap().avg_loss;
+        assert!(
+            last < 0.01,
+            "should learn negative targets: last_loss={last}"
+        );
+    }
+
+    #[test]
+    fn trainer_high_dimensional() {
+        // 高次元 (4入力, 3出力) で loss が減少することを検証
+        let mut net = SimpleLinear::new(4, 3);
+        let trainer = Trainer::new(
+            TrainConfig::new()
+                .with_epochs(100)
+                .with_learning_rate(0.001),
+        );
+        let inputs = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ];
+        let targets = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![1.0, 1.0, 0.0],
+        ];
+        let results = trainer.train(&mut net, &inputs, &targets, mse_loss);
+        let first = results[0].avg_loss;
+        let last = results.last().unwrap().avg_loss;
+        assert!(
+            last < first,
+            "high-dim loss should decrease: first={first}, last={last}"
+        );
+    }
+
+    #[test]
+    fn trainer_first_epoch_loss_positive() {
+        // 初期状態で target と出力が異なるため、最初のエポックの loss は正であること
+        let mut net = SimpleLinear::with_weights(1, 1, vec![0.0]);
+        let trainer = Trainer::new(TrainConfig::new().with_epochs(1));
+        let inputs = vec![vec![1.0]];
+        let targets = vec![vec![5.0]];
+        let results = trainer.train(&mut net, &inputs, &targets, mse_loss);
+        assert!(
+            results[0].avg_loss > 0.0,
+            "first epoch loss should be positive: {}",
+            results[0].avg_loss
+        );
+    }
 }

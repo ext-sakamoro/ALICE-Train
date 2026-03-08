@@ -645,4 +645,78 @@ mod tests {
     fn ste_weight_grad_panics_on_size_mismatch() {
         ste_weight_grad(&[1.0, 2.0], &[3.0], &mut [0.0; 3]); // 1*2=2 != 3
     }
+
+    // ---- 追加テスト ----
+
+    #[test]
+    fn ternary_backward_rectangular_2x4() {
+        // 非正方行列 (2x4) での転置 matvec を検証
+        // W = [[1, -1, 0, 1], [0, 1, -1, 0]] (2行4列)
+        let kernel = TernaryWeightKernel::from_ternary(&[1, -1, 0, 1, 0, 1, -1, 0], 2, 4);
+        let grad_out = [3.0_f32, 5.0];
+        let mut grad_in = [0.0_f32; 4];
+        ternary_matvec_backward(&grad_out, &kernel, &mut grad_in);
+        // W^T * [3,5]:
+        // col0: 1*3 + 0*5 = 3
+        // col1: (-1)*3 + 1*5 = 2
+        // col2: 0*3 + (-1)*5 = -5
+        // col3: 1*3 + 0*5 = 3
+        assert!((grad_in[0] - 3.0).abs() < 1e-6);
+        assert!((grad_in[1] - 2.0).abs() < 1e-6);
+        assert!((grad_in[2] - (-5.0)).abs() < 1e-6);
+        assert!((grad_in[3] - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bitlinear_backward_no_norm_zero_input() {
+        // 入力がゼロベクトルの場合、勾配が正しく計算されることを検証
+        let kernel = TernaryWeightKernel::from_ternary(&[1, -1, 0, 1], 2, 2);
+        let input = [0.0_f32, 0.0];
+        let grad_out = [1.0_f32, 1.0];
+        let mut grad_in = [0.0_f32; 2];
+        bitlinear_backward(&input, &grad_out, &kernel, false, 1e-5, &mut grad_in, None);
+        // norm なしなので ternary_matvec_backward と同じ結果
+        let mut expected = [0.0_f32; 2];
+        ternary_matvec_backward(&grad_out, &kernel, &mut expected);
+        assert!((grad_in[0] - expected[0]).abs() < 1e-6);
+        assert!((grad_in[1] - expected[1]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bitlinear_backward_pre_norm_uniform_input() {
+        // 均一入力 [c, c] での pre_norm backward が有限値を返すことを検証
+        let kernel = TernaryWeightKernel::from_ternary(&[1, -1, -1, 1], 2, 2);
+        let input = [3.0_f32, 3.0];
+        let grad_out = [1.0_f32, -1.0];
+        let mut grad_in = [0.0_f32; 2];
+        bitlinear_backward(&input, &grad_out, &kernel, true, 1e-5, &mut grad_in, None);
+        for &g in &grad_in {
+            assert!(g.is_finite(), "gradient should be finite for uniform input");
+        }
+        // 均一入力でW=[1,-1; -1,1], grad_out=[1,-1] → 勾配は非ゼロ
+        assert!(
+            grad_in.iter().any(|&g| g.abs() > 1e-8),
+            "gradients should be non-zero"
+        );
+    }
+
+    #[test]
+    fn ste_weight_grad_large_matrix() {
+        // 4x4 行列での STE 重み勾配を検証
+        let input = [1.0_f32, 2.0, 3.0, 4.0];
+        let grad_out = [0.5_f32, -1.0, 1.5, -0.5];
+        let mut grad_w = [0.0_f32; 16]; // 4x4
+        ste_weight_grad(&input, &grad_out, &mut grad_w);
+        // dW[j][i] = dy[j] * x[i] を全要素検証
+        for j in 0..4 {
+            for i in 0..4 {
+                let expected = grad_out[j] * input[i];
+                assert!(
+                    (grad_w[j * 4 + i] - expected).abs() < 1e-6,
+                    "mismatch at [{j}][{i}]: got={}, expected={expected}",
+                    grad_w[j * 4 + i]
+                );
+            }
+        }
+    }
 }

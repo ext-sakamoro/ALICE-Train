@@ -366,4 +366,80 @@ mod tests {
     fn gelu_backward_panics_on_length_mismatch() {
         gelu_backward(&[1.0], &[1.0], &mut [0.0; 2]);
     }
+
+    // ---- 追加テスト ----
+
+    #[test]
+    fn relu_backward_negative_grad_output() {
+        // 負の grad_output が正の入力に対してそのまま通ることを検証
+        let input = [1.0, 2.0, -1.0, 3.0];
+        let grad_out = [-5.0, -3.0, -1.0, -7.0];
+        let mut grad_in = [0.0_f32; 4];
+        relu_backward(&input, &grad_out, &mut grad_in);
+        assert_eq!(grad_in, [-5.0, -3.0, 0.0, -7.0]);
+    }
+
+    #[test]
+    fn silu_backward_numerical_wide_range() {
+        // 広範囲 [-5, 5] で SiLU の解析微分と数値微分が一致することを検証
+        let silu = |x: f32| x / (1.0 + (-x).exp());
+        for i in -50..=50 {
+            let x = i as f32 * 0.1;
+            let mut grad_in = [0.0_f32];
+            silu_backward(&[x], &[1.0], &mut grad_in);
+            let numeric = numerical_grad(silu, x, 1e-4);
+            assert!(
+                (grad_in[0] - numeric).abs() < 5e-3,
+                "silu wide range mismatch at x={x}: analytic={}, numeric={numeric}",
+                grad_in[0]
+            );
+        }
+    }
+
+    #[test]
+    fn gelu_backward_positive_for_positive_input() {
+        // GELU' は正の入力領域で常に正であることを検証
+        // 注: GELU' は単調ではない（x≈1.5 で一度 1 を超えてから 1 に収束する）
+        for i in 1..=100 {
+            let x = i as f32 * 0.1;
+            let mut g = [0.0_f32];
+            gelu_backward(&[x], &[1.0], &mut g);
+            assert!(g[0] > 0.0, "gelu'({x}) should be positive, got {}", g[0]);
+        }
+    }
+
+    #[test]
+    fn all_activations_single_vs_vector_consistency() {
+        // 単一要素とベクトルの結果が一致することを検証
+        let vals = [0.5_f32, -1.0, 2.0];
+        let ones = [1.0_f32; 3];
+
+        let mut relu_vec = [0.0_f32; 3];
+        let mut silu_vec = [0.0_f32; 3];
+        let mut gelu_vec = [0.0_f32; 3];
+        relu_backward(&vals, &ones, &mut relu_vec);
+        silu_backward(&vals, &ones, &mut silu_vec);
+        gelu_backward(&vals, &ones, &mut gelu_vec);
+
+        for i in 0..3 {
+            let mut r = [0.0_f32];
+            let mut s = [0.0_f32];
+            let mut g = [0.0_f32];
+            relu_backward(&[vals[i]], &[1.0], &mut r);
+            silu_backward(&[vals[i]], &[1.0], &mut s);
+            gelu_backward(&[vals[i]], &[1.0], &mut g);
+            assert!(
+                (r[0] - relu_vec[i]).abs() < 1e-6,
+                "relu mismatch at index {i}"
+            );
+            assert!(
+                (s[0] - silu_vec[i]).abs() < 1e-6,
+                "silu mismatch at index {i}"
+            );
+            assert!(
+                (g[0] - gelu_vec[i]).abs() < 1e-6,
+                "gelu mismatch at index {i}"
+            );
+        }
+    }
 }
