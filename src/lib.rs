@@ -27,6 +27,7 @@
 //! | [`mixed_precision`] | BF16 変換、動的 loss scaling |
 //! | [`pipeline`] | QAT パイプライン (FP32→BF16→Ternary 統合ループ) |
 //! | [`offload`] | ZeRO-Offload (AdamW m/v CPU RAM オフロード) |
+//! | [`llama`] | Llama-3 アーキテクチャ定義 (QAT 学習用レイヤー構造) |
 //! | `gpu` | GPU コンテキスト (wgpu Device/Queue) *(feature: `gpu`)* |
 //! | `gpu_backward` | GPU ternary backward (compute shader) *(feature: `gpu`)* |
 //!
@@ -87,6 +88,7 @@ pub mod checkpoint;
 pub mod dataloader;
 pub mod distill;
 pub mod evaluator;
+pub mod llama;
 pub mod logger;
 pub mod mixed_precision;
 pub mod offload;
