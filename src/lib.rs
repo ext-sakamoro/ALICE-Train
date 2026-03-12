@@ -16,9 +16,19 @@
 //! |-----------|------|
 //! | [`activation`] | 活性化関数の backward (`ReLU`, `SiLU`, GELU) |
 //! | [`backward`] | レイヤー逆伝播 (ternary matvec transpose, `BitLinear` backward, STE) |
-//! | [`trainer`] | 学習ループ (`TrainableNetwork` トレイト, `Trainer`) |
+//! | [`trainer`] | 学習ループ (`TrainableNetwork` トレイト, `Trainer`, 勾配累積) |
 //! | [`qat`] | 量子化再学習 (`FakeQuantize`, `QatTrainer`, `CalibrationStats`) |
 //! | [`distill`] | 知識蒸留 (`DistillTrainer`, KL-divergence + hard label 混合損失) |
+//! | [`checkpoint`] | 重み保存/復元 (`CheckpointData`, バイナリフォーマット) |
+//! | [`dataloader`] | メモリマップデータ読み込み (`MmapDataset`, `DataLoader`) |
+//! | [`scheduler`] | 学習率スケジューラ (warmup + cosine decay) |
+//! | [`evaluator`] | perplexity 算出、ベストチェックポイント自動保存 |
+//! | [`logger`] | loss/lr/grad_norm の CSV/JSON 記録 |
+//! | [`mixed_precision`] | BF16 変換、動的 loss scaling |
+//! | [`pipeline`] | QAT パイプライン (FP32→BF16→Ternary 統合ループ) |
+//! | [`offload`] | ZeRO-Offload (AdamW m/v CPU RAM オフロード) |
+//! | `gpu` | GPU コンテキスト (wgpu Device/Queue) *(feature: `gpu`)* |
+//! | `gpu_backward` | GPU ternary backward (compute shader) *(feature: `gpu`)* |
 //!
 //! # Quick Start
 //!
@@ -73,15 +83,44 @@
 
 pub mod activation;
 pub mod backward;
+pub mod checkpoint;
+pub mod dataloader;
 pub mod distill;
+pub mod evaluator;
+pub mod logger;
+pub mod mixed_precision;
+pub mod offload;
+pub mod pipeline;
 pub mod qat;
+pub mod scheduler;
 pub mod trainer;
+
+// GPU モジュール (feature gate)
+#[cfg(feature = "gpu")]
+pub mod gpu;
+#[cfg(feature = "gpu")]
+pub mod gpu_backward;
 
 // Re-exports
 pub use activation::{gelu_backward, relu_backward, silu_backward};
 pub use backward::{bitlinear_backward, ste_weight_grad, ternary_matvec_backward};
+pub use checkpoint::{CheckpointData, CheckpointMeta};
+pub use dataloader::{Batch, DataLoader, DataLoaderConfig, MmapDataset};
 pub use distill::{DistillConfig, DistillEpochResult, DistillTrainer};
-pub use qat::{
-    CalibrationStats, FakeQuantize, QatConfig, QatEpochResult, QatTrainer, QuantBits,
+pub use evaluator::{evaluate, BestCheckpointTracker, EvalResult};
+pub use logger::{compute_grad_norm, LogEntry, TrainLog};
+pub use mixed_precision::{
+    bf16_to_f32_batch, bf16_to_f32_vec, f32_to_bf16_batch, f32_to_bf16_vec, Bf16, LossScaler,
+    MixedPrecisionConfig,
 };
+pub use offload::{MemoryBudget, OffloadConfig, OffloadOptimizer};
+pub use pipeline::{QatEpochSummary, QatPipeline, QatPipelineConfig, QatRunResult, QatStepResult};
+pub use qat::{CalibrationStats, FakeQuantize, QatConfig, QatEpochResult, QatTrainer, QuantBits};
+pub use scheduler::{ConstantScheduler, LrScheduler, WarmupCosineScheduler};
 pub use trainer::{EpochResult, TrainConfig, TrainableNetwork, Trainer};
+
+// GPU re-exports
+#[cfg(feature = "gpu")]
+pub use gpu::GpuContext;
+#[cfg(feature = "gpu")]
+pub use gpu_backward::GpuBackwardEngine;

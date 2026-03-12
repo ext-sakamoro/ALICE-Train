@@ -282,8 +282,12 @@ impl CalibrationStats {
         let mut dot_qq = 0.0f64;
 
         for (&w, &q) in weights.iter().zip(quantized.iter()) {
-            if w < min { min = w; }
-            if w > max { max = w; }
+            if w < min {
+                min = w;
+            }
+            if w > max {
+                max = w;
+            }
             sum_abs += w.abs() as f64;
             sum_err += (w - q).abs() as f64;
             dot_wq += (w as f64) * (q as f64);
@@ -308,8 +312,12 @@ impl CalibrationStats {
     /// Activation 統計を更新する。
     pub fn update_activations(&mut self, activations: &[f32]) {
         for &a in activations {
-            if a < self.activation_min { self.activation_min = a; }
-            if a > self.activation_max { self.activation_max = a; }
+            if a < self.activation_min {
+                self.activation_min = a;
+            }
+            if a > self.activation_max {
+                self.activation_max = a;
+            }
         }
         self.sample_count += 1;
     }
@@ -409,7 +417,10 @@ impl QatTrainer {
 
         // 5. STE backward → weight gradient (simplified: dy * x^T)
         let grad_len = grad_weight_buf.len().min(latent_weights.len());
-        fq.ste_backward(&grad_output_buf[..grad_len], &mut grad_weight_buf[..grad_len]);
+        fq.ste_backward(
+            &grad_output_buf[..grad_len],
+            &mut grad_weight_buf[..grad_len],
+        );
 
         // 6. SGD update on latent weights
         let lr = self.learning_rate;

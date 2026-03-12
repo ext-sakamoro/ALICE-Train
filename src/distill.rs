@@ -54,7 +54,9 @@ fn softmax_with_temperature(logits: &[f32], temperature: f32, output: &mut [f32]
     let inv_t = 1.0 / temperature.max(1e-10);
     let mut max_val = f32::MIN;
     for &l in logits {
-        if l > max_val { max_val = l; }
+        if l > max_val {
+            max_val = l;
+        }
     }
 
     let mut sum = 0.0f64;
@@ -289,7 +291,10 @@ mod tests {
         let p = [0.9, 0.1];
         let q = [0.5, 0.5];
         let kl = kl_divergence(&p, &q);
-        assert!(kl > 0.0, "KL should be positive for different distributions");
+        assert!(
+            kl > 0.0,
+            "KL should be positive for different distributions"
+        );
     }
 
     // --- distill_loss ---
@@ -303,7 +308,10 @@ mod tests {
 
         let (total, soft, _hard) = distill_loss(&logits, &logits, &labels, &config, &mut grad);
         // Same logits → soft loss ≈ 0
-        assert!(soft < 1e-5, "Soft loss should be ~0 for identical logits, got {soft}");
+        assert!(
+            soft < 1e-5,
+            "Soft loss should be ~0 for identical logits, got {soft}"
+        );
         assert!(total >= 0.0);
     }
 
@@ -334,7 +342,10 @@ mod tests {
         let mut grad = [0.0; 2];
 
         let (total, soft, hard) = distill_loss(&teacher, &student, &labels, &config, &mut grad);
-        assert!((total - hard).abs() < 1e-5, "alpha=0 → total should equal hard loss");
+        assert!(
+            (total - hard).abs() < 1e-5,
+            "alpha=0 → total should equal hard loss"
+        );
         let _ = soft; // soft loss computed but not weighted
     }
 
@@ -347,7 +358,10 @@ mod tests {
         let mut grad = [0.0; 2];
 
         let (total, soft, _hard) = distill_loss(&teacher, &student, &labels, &config, &mut grad);
-        assert!((total - soft).abs() < 1e-4, "alpha=1 → total should equal soft loss");
+        assert!(
+            (total - soft).abs() < 1e-4,
+            "alpha=1 → total should equal soft loss"
+        );
     }
 
     // --- DistillTrainer ---

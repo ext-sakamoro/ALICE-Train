@@ -1,6 +1,6 @@
 [package]
 name = "alice-train"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Moroya Sakamoto"]
 description = "Backpropagation & Training Framework for ALICE-ML ternary networks"
@@ -10,11 +10,24 @@ keywords = ["machine-learning", "training", "backpropagation", "bitnet"]
 categories = ["science"]
 publish = false
 
+[features]
+default = []
+gpu = ["wgpu", "pollster", "bytemuck"]
+
 [dependencies]
 alice-ml = { path = "../ALICE-ML", default-features = true }
+memmap2 = "0.9"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# GPU backward (optional)
+wgpu = { version = "24", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
-rand = "0.8"
+tempfile = "3"
 
 [profile.release]
 opt-level = 3
