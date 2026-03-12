@@ -17,6 +17,8 @@
 //! | [`activation`] | 活性化関数の backward (`ReLU`, `SiLU`, GELU) |
 //! | [`backward`] | レイヤー逆伝播 (ternary matvec transpose, `BitLinear` backward, STE) |
 //! | [`trainer`] | 学習ループ (`TrainableNetwork` トレイト, `Trainer`) |
+//! | [`qat`] | 量子化再学習 (`FakeQuantize`, `QatTrainer`, `CalibrationStats`) |
+//! | [`distill`] | 知識蒸留 (`DistillTrainer`, KL-divergence + hard label 混合損失) |
 //!
 //! # Quick Start
 //!
@@ -58,15 +60,28 @@
     clippy::many_single_char_names,
     clippy::module_name_repetitions,
     clippy::inline_always,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::doc_markdown,
+    clippy::missing_const_for_fn,
+    clippy::missing_panics_doc,
+    clippy::too_many_arguments,
+    clippy::suboptimal_flops,
+    clippy::type_complexity,
+    clippy::match_same_arms
 )]
 #![warn(missing_docs)]
 
 pub mod activation;
 pub mod backward;
+pub mod distill;
+pub mod qat;
 pub mod trainer;
 
 // Re-exports
 pub use activation::{gelu_backward, relu_backward, silu_backward};
 pub use backward::{bitlinear_backward, ste_weight_grad, ternary_matvec_backward};
+pub use distill::{DistillConfig, DistillEpochResult, DistillTrainer};
+pub use qat::{
+    CalibrationStats, FakeQuantize, QatConfig, QatEpochResult, QatTrainer, QuantBits,
+};
 pub use trainer::{EpochResult, TrainConfig, TrainableNetwork, Trainer};
