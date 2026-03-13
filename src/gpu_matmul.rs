@@ -296,7 +296,24 @@ impl GpuMatmul {
     /// C = A × B^T を GPU で計算。
     ///
     /// A: (m × k), B: (n × k), C: (m × n)
+    ///
+    /// B が `max_storage_buffer_binding_size` を超える場合、N方向をチャンク分割して
+    /// 複数回 dispatch → 結果を結合する。
     pub fn matmul_bt(&self, ctx: &GpuContext, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+        let max_binding = ctx.device().limits().max_storage_buffer_binding_size as usize;
+        let b_bytes = n * k * 4;
+        let c_bytes = m * n * 4;
+
+        // A, B, C いずれかが制限を超えるならチャンク分割
+        if b_bytes > max_binding || c_bytes > max_binding {
+            return self.matmul_bt_chunked(ctx, a, b, m, n, k, max_binding);
+        }
+
+        self.matmul_bt_single(ctx, a, b, m, n, k)
+    }
+
+    /// 単一 dispatch 版 matmul_bt（バッファが制限内の場合）。
+    fn matmul_bt_single(&self, ctx: &GpuContext, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
         let buf_a = Self::create_readonly_buf(ctx, a);
         let buf_b = Self::create_readonly_buf(ctx, b);
 
@@ -334,6 +351,46 @@ impl GpuMatmul {
         ctx.queue().submit(Some(encoder.finish()));
 
         Self::download(ctx, &buf_c, output_size)
+    }
+
+    /// チャンク分割版 matmul_bt — B の N 方向を分割して複数回 dispatch。
+    ///
+    /// C[:,chunk_start..chunk_end] = A × B[chunk_start..chunk_end]^T
+    fn matmul_bt_chunked(
+        &self, ctx: &GpuContext, a: &[f32], b: &[f32],
+        m: usize, n: usize, k: usize, max_binding: usize,
+    ) -> Vec<f32> {
+        // チャンクサイズ: B の1行 = k*4 bytes, C の1行出力 = m*4 bytes
+        // B チャンク: chunk_n 行 × k 要素 ≤ max_binding / 4
+        // C チャンク: m × chunk_n 要素 ≤ max_binding / 4
+        let max_elems = max_binding / 4;
+        let chunk_n_by_b = max_elems / k;       // B の行数制限
+        let chunk_n_by_c = max_elems / m;       // C の列数制限
+        let chunk_n = chunk_n_by_b.min(chunk_n_by_c).max(1);
+
+        let mut result = vec![0.0f32; m * n];
+        let mut offset = 0;
+
+        while offset < n {
+            let end = (offset + chunk_n).min(n);
+            let cn = end - offset;
+
+            // B のチャンク: rows [offset..end], 各行 k 要素
+            let b_chunk: Vec<f32> = b[offset * k..end * k].to_vec();
+
+            // この chunk の matmul: C_chunk = A × B_chunk^T, shape (m × cn)
+            let c_chunk = self.matmul_bt_single(ctx, a, &b_chunk, m, cn, k);
+
+            // 結果を合体: result[i][offset..end] = c_chunk[i][0..cn]
+            for i in 0..m {
+                result[i * n + offset..i * n + end]
+                    .copy_from_slice(&c_chunk[i * cn..(i + 1) * cn]);
+            }
+
+            offset = end;
+        }
+
+        result
     }
 
     /// SwiGLU FFN を GPU で実行。

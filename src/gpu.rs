@@ -53,12 +53,18 @@ impl GpuContext {
             })
             .await?;
 
+        // アダプタの最大 buffer サイズを使用（デフォルト 128MB → RTX5000 で ~2GB）
+        let adapter_limits = adapter.limits();
+        let mut limits = wgpu::Limits::default();
+        limits.max_storage_buffer_binding_size = adapter_limits.max_storage_buffer_binding_size;
+        limits.max_buffer_size = adapter_limits.max_buffer_size;
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("ALICE-Train GPU"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    required_limits: limits,
                     ..Default::default()
                 },
                 None,
