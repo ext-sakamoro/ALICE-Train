@@ -1,39 +1,42 @@
-//! ALICE-Train QAT 実行バイナリ — Llama-3 70B → 1.1-bit Ternary。
+//! ALICE-Train QAT 実行バイナリ — Llama-3 → 1.1-bit Ternary。
 //!
-//! # 使用法
+//! # Phase 1 (パイプライン検証)
+//!
+//! モデルパスが存在しない場合、ランダム初期化の小型モデル（embedding → output）で
+//! パイプライン全体の動作を検証する。loss が減少することを確認。
 //!
 //! ```bash
-//! # 新規学習
+//! cargo run --release --features qat-cli --bin prepare-data -- --all
 //! cargo run --release --features qat-cli --bin train-qat-70b -- \
-//!     --config configs/qat_70b.json
-//!
-//! # チェックポイントからレジューム
-//! cargo run --release --features qat-cli --bin train-qat-70b -- \
-//!     --config configs/qat_70b.json \
-//!     --resume checkpoints/step_5000.bin
+//!     --config configs/qat_phase1_test.json
 //! ```
 //!
-//! # Spot インスタンス自動レジューム
+//! # Phase 2+ (実モデル学習)
+//!
+//! safetensors モデルが配置されている場合、レイヤー単位で
+//! forward → backward → OffloadOptimizer.step() を実行。
 //!
 //! ```bash
-//! scripts/auto_resume.sh configs/qat_70b.json
+//! cargo run --release --features qat-cli --bin train-qat-70b -- \
+//!     --config configs/qat_8b_general.json
 //! ```
 
 use clap::Parser;
+use rand::Rng;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
 use alice_train::llama::QatTrainConfig;
 use alice_train::{
-    CheckpointData, FakeQuantize, LogEntry, LossScaler, LrScheduler, MixedPrecisionConfig,
-    OffloadConfig, QatConfig, TrainLog, WarmupCosineScheduler,
+    CheckpointData, DataLoader, DataLoaderConfig, FakeQuantize, LogEntry, LossScaler, LrScheduler,
+    MixedPrecisionConfig, MmapDataset, OffloadConfig, QatConfig, TrainLog, WarmupCosineScheduler,
 };
 
 /// ALICE-Train QAT: Llama-3 → 1.1-bit Sparse Ternary
 #[derive(Parser, Debug)]
 #[command(author = "Moroya Sakamoto")]
-#[command(about = "Quantize Llama-3 70B to 1.1-bit ternary via QAT")]
+#[command(about = "Quantize Llama-3 to 1.1-bit ternary via QAT")]
 struct Cli {
     /// 設定ファイルパス (JSON)
     #[arg(short, long)]
@@ -47,6 +50,29 @@ struct Cli {
     #[arg(long)]
     dry_run: bool,
 }
+
+// ── Cross-Entropy Loss ──────────────────────────────────────────────────
+
+/// 数値安定な cross-entropy loss と勾配。
+///
+/// 戻り値: (loss, d_logits) where d_logits = softmax(logits) - one_hot(target)
+fn cross_entropy_loss(logits: &[f32], target: usize) -> (f32, Vec<f32>) {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exp: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
+    let sum: f32 = exp.iter().sum();
+    let probs: Vec<f32> = exp.iter().map(|&e| e / sum).collect();
+
+    // loss = -log(probs[target])
+    let loss = -(probs[target].max(1e-10)).ln();
+
+    // gradient: softmax - one_hot
+    let mut grad = probs;
+    grad[target] -= 1.0;
+
+    (loss, grad)
+}
+
+// ── メイン ────────────────────────────────────────────────────────────────
 
 fn main() {
     let cli = Cli::parse();
@@ -75,51 +101,37 @@ fn main() {
     let ternary_bytes = model_config.ternary_memory_bytes();
     let params_per_layer = model_config.params_per_layer();
 
+    let model_path_exists = Path::new(&config.model_path).exists();
+    let phase1_mode = !model_path_exists;
+
     println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║  ALICE-Train QAT — 1.1-bit Sparse Ternary 量子化学習   ║");
+    if phase1_mode {
+        println!("║  ALICE-Train QAT — Phase 1 パイプライン検証             ║");
+    } else {
+        println!("║  ALICE-Train QAT — 1.1-bit Sparse Ternary 量子化学習   ║");
+    }
     println!("╚══════════════════════════════════════════════════════════╝");
     println!();
-    println!("モデル: Llama-3 {}B", total_params / 1_000_000_000);
-    println!("  隠れ層: {}", model_config.hidden_dim);
-    println!("  レイヤー: {}", model_config.num_layers);
+
+    if phase1_mode {
+        println!("モード: Phase 1 (ランダム初期化 — パイプライン検証)");
+        println!("  モデルパス '{}' が見つかりません", config.model_path);
+        println!("  → ランダム重みで embedding → output モデルを初期化");
+        println!();
+    }
+
     println!(
-        "  ヘッド: {} (KV: {})",
-        model_config.num_heads, model_config.num_kv_heads
+        "モデル: vocab={}, hidden={}, layers={}",
+        model_config.vocab_size, model_config.hidden_dim, model_config.num_layers
     );
-    println!("  総パラメータ: {:.2}B", total_params as f64 / 1e9);
+    println!("  総パラメータ: {:.2}M", total_params as f64 / 1e6);
+    println!(
+        "  Ternary 推定: {:.1} MB",
+        ternary_bytes as f64 / 1024.0 / 1024.0
+    );
     println!(
         "  パラメータ/レイヤー: {:.2}M",
         params_per_layer as f64 / 1e6
-    );
-    println!();
-    println!("メモリ見積もり:");
-    println!(
-        "  FP32 全体: {:.1} GB",
-        total_params as f64 * 4.0 / 1024.0 / 1024.0 / 1024.0
-    );
-    println!(
-        "  Ternary 出力: {:.1} GB",
-        ternary_bytes as f64 / 1024.0 / 1024.0 / 1024.0
-    );
-    println!(
-        "  圧縮率: {:.1}x",
-        (total_params * 4) as f64 / ternary_bytes.max(1) as f64
-    );
-    println!();
-
-    let offload_budget = alice_train::MemoryBudget::estimate(params_per_layer);
-    println!("ZeRO-Offload (レイヤー単位):");
-    println!(
-        "  GPU VRAM: {:.1} MB (重み + 勾配)",
-        offload_budget.vram_bytes as f64 / 1024.0 / 1024.0
-    );
-    println!(
-        "  CPU RAM: {:.1} MB (AdamW m/v)",
-        offload_budget.ram_bytes as f64 / 1024.0 / 1024.0
-    );
-    println!(
-        "  VRAM 節約: {:.0}%",
-        offload_budget.vram_savings_ratio() * 100.0
     );
     println!();
 
@@ -127,21 +139,16 @@ fn main() {
     println!("  学習率: {} → {}", config.learning_rate, config.min_lr);
     println!("  ウォームアップ: {} steps", config.warmup_steps);
     println!("  総ステップ: {}", config.total_steps);
-    println!("  勾配累積: {}", config.gradient_accumulation_steps);
     println!(
         "  バッチ: {} × seq_len={}",
         config.batch_size, config.seq_len
     );
     println!(
-        "  実効バッチサイズ: {}",
+        "  勾配累積: {} (実効バッチ={})",
+        config.gradient_accumulation_steps,
         config.batch_size * config.gradient_accumulation_steps
     );
     println!("  BF16: {}", if config.use_bf16 { "有効" } else { "無効" });
-    println!(
-        "  チェックポイント: {} steps ごと",
-        config.checkpoint_interval
-    );
-    println!("  評価: {} steps ごと", config.eval_interval);
     println!();
 
     if let Some(ref resume) = config.resume_from {
@@ -162,43 +169,40 @@ fn main() {
         std::process::exit(1);
     });
 
-    // --- モデル読み込み ---
-    println!("━━━ モデル読み込み開始 ━━━");
-    let model_path = Path::new(&config.model_path);
-    if !model_path.exists() {
+    // --- データ読み込み ---
+    println!("━━━ データ読み込み ━━━");
+    let train_data_path = &config.train_data_path;
+    let dataset = MmapDataset::open(train_data_path).unwrap_or_else(|e| {
         eprintln!(
-            "[ALICE-Train] モデルパスが存在しません: {}",
-            config.model_path
+            "[ALICE-Train] データ読み込み失敗: {train_data_path}: {e}"
         );
         eprintln!();
-        eprintln!("モデルをダウンロードしてください:");
+        eprintln!("データを準備してください:");
         eprintln!(
-            "  huggingface-cli download meta-llama/Llama-3-70B --local-dir {}",
-            config.model_path
+            "  cargo run --release --features qat-cli --bin prepare-data -- --all"
         );
         std::process::exit(1);
-    }
+    });
 
-    // safetensors ファイル一覧
-    let st_files: Vec<_> = fs::read_dir(model_path)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "safetensors"))
-        .map(|e| e.path())
-        .collect();
+    println!("  データ: {} ({} トークン)", train_data_path, dataset.len());
 
-    if st_files.is_empty() {
-        eprintln!(
-            "[ALICE-Train] safetensors ファイルが見つかりません: {}",
-            config.model_path
-        );
-        std::process::exit(1);
-    }
+    let dl_config = DataLoaderConfig::new()
+        .with_seq_len(config.seq_len)
+        .with_batch_size(config.batch_size)
+        .with_shuffle(true)
+        .with_seed(42);
 
-    println!("  safetensors ファイル: {} 個", st_files.len());
+    let mut loader = DataLoader::new(&dataset, dl_config);
+    let num_batches = loader.num_batches();
+    println!(
+        "  DataLoader: {} サンプル, {} バッチ/epoch",
+        loader.num_samples(),
+        num_batches
+    );
+    println!();
 
-    // --- QAT コンポーネント初期化 ---
-    println!("━━━ QAT コンポーネント初期化 ━━━");
+    // --- コンポーネント初期化 ---
+    println!("━━━ コンポーネント初期化 ━━━");
 
     let _fq = FakeQuantize::new(QatConfig::ternary());
     let scheduler = WarmupCosineScheduler::new(
@@ -208,7 +212,7 @@ fn main() {
         config.total_steps,
     );
 
-    let scaler = if config.use_bf16 {
+    let _scaler = if config.use_bf16 {
         Some(LossScaler::new(MixedPrecisionConfig::default()))
     } else {
         None
@@ -229,7 +233,7 @@ fn main() {
             println!("  チェックポイントからレジューム: {resume_path}");
             match std::fs::File::open(resume_path).and_then(|mut f| CheckpointData::load(&mut f)) {
                 Ok(ckpt) => {
-                    global_step = ckpt.meta.epoch; // epoch フィールドを step として使用
+                    global_step = ckpt.meta.epoch;
                     println!("  レジューム成功: step {global_step}");
                 }
                 Err(e) => {
@@ -237,122 +241,272 @@ fn main() {
                     eprintln!("  最初から学習を開始します");
                 }
             }
-        } else {
-            println!("  チェックポイントが見つかりません: {resume_path}");
-            println!("  最初から学習を開始します");
         }
     }
 
     println!("  FakeQuantize: 初期化完了");
     println!(
-        "  WarmupCosineScheduler: {}/{} steps",
+        "  Scheduler: warmup {}/{} steps",
         config.warmup_steps, config.total_steps
     );
-    println!(
-        "  LossScaler: {}",
-        if scaler.is_some() {
-            "BF16有効"
+    println!();
+
+    // --- モデル初期化 ---
+    let vocab_size = config.model.vocab_size;
+    let hidden_dim = config.model.hidden_dim;
+
+    if phase1_mode {
+        // Phase 1: ランダム初期化 (embedding → output projection)
+        println!("━━━ Phase 1: ランダムモデル初期化 ━━━");
+        println!(
+            "  Embedding: [{} × {}] ({:.1} MB)",
+            vocab_size,
+            hidden_dim,
+            (vocab_size * hidden_dim * 4) as f64 / 1024.0 / 1024.0
+        );
+        println!(
+            "  Output Proj: [{} × {}] ({:.1} MB)",
+            hidden_dim,
+            vocab_size,
+            (hidden_dim * vocab_size * 4) as f64 / 1024.0 / 1024.0
+        );
+
+        let mut rng = rand::thread_rng();
+
+        // Xavier 初期化
+        let scale = (2.0 / (vocab_size + hidden_dim) as f32).sqrt();
+        let mut embedding: Vec<f32> = (0..vocab_size * hidden_dim)
+            .map(|_| (rng.gen::<f32>() - 0.5) * 2.0 * scale)
+            .collect();
+        let mut output_proj: Vec<f32> = (0..hidden_dim * vocab_size)
+            .map(|_| (rng.gen::<f32>() - 0.5) * 2.0 * scale)
+            .collect();
+
+        // 勾配バッファ
+        let mut grad_embedding = vec![0.0f32; vocab_size * hidden_dim];
+        let mut grad_output_proj = vec![0.0f32; hidden_dim * vocab_size];
+
+        println!("  初期化完了");
+        println!();
+
+        // --- Phase 1 学習ループ ---
+        println!(
+            "━━━ Phase 1 学習開始 (step {global_step}/{}) ━━━",
+            config.total_steps
+        );
+        let train_start = Instant::now();
+        let mut batch_idx = 0usize;
+
+        while global_step < config.total_steps {
+            let lr = scheduler.get_lr(global_step);
+            let step_start = Instant::now();
+
+            // エポック境界
+            if batch_idx >= num_batches {
+                loader.shuffle_epoch();
+                batch_idx = 0;
+            }
+
+            let batch = loader.get_batch(batch_idx, &dataset);
+            batch_idx += 1;
+
+            // --- Forward + Loss ---
+            let mut total_loss = 0.0f32;
+            let mut token_count = 0usize;
+            let seq_len = config.seq_len;
+
+            for b in 0..batch.actual_batch_size {
+                for t in 0..seq_len {
+                    let input_token = batch.input_ids[b * seq_len + t] as usize;
+                    let target_token = batch.target_ids[b * seq_len + t] as usize;
+
+                    // 範囲外トークンはスキップ
+                    if input_token >= vocab_size || target_token >= vocab_size {
+                        continue;
+                    }
+
+                    // Embedding lookup
+                    let emb_offset = input_token * hidden_dim;
+
+                    // Output projection: logits[v] = sum_h embedding[input][h] * output_proj[v * hidden + h]
+                    let mut logits = vec![0.0f32; vocab_size];
+                    for v in 0..vocab_size {
+                        let proj_offset = v * hidden_dim;
+                        let mut sum = 0.0f32;
+                        for h in 0..hidden_dim {
+                            sum = embedding[emb_offset + h]
+                                .mul_add(output_proj[proj_offset + h], sum);
+                        }
+                        logits[v] = sum;
+                    }
+
+                    // Cross-entropy loss
+                    let (loss, d_logits) = cross_entropy_loss(&logits, target_token);
+                    total_loss += loss;
+                    token_count += 1;
+
+                    // --- Backward ---
+                    // Output projection 勾配: d_proj[v][h] += d_logits[v] * embedding[input][h]
+                    for v in 0..vocab_size {
+                        let proj_offset = v * hidden_dim;
+                        let dl = d_logits[v];
+                        if dl.abs() < 1e-10 {
+                            continue;
+                        }
+                        for h in 0..hidden_dim {
+                            grad_output_proj[proj_offset + h] += dl * embedding[emb_offset + h];
+                        }
+                    }
+
+                    // Embedding 勾配: d_emb[input][h] += sum_v d_logits[v] * output_proj[v][h]
+                    for h in 0..hidden_dim {
+                        let mut grad_h = 0.0f32;
+                        for v in 0..vocab_size {
+                            grad_h += d_logits[v] * output_proj[v * hidden_dim + h];
+                        }
+                        grad_embedding[emb_offset + h] += grad_h;
+                    }
+                }
+            }
+
+            let avg_loss = if token_count > 0 {
+                total_loss / token_count as f32
+            } else {
+                0.0
+            };
+            let step_duration = step_start.elapsed();
+
+            // --- Weight Update (SGD + weight decay) ---
+            let inv_tokens = 1.0 / token_count.max(1) as f32;
+            for (w, g) in embedding.iter_mut().zip(grad_embedding.iter_mut()) {
+                *w -= lr * (*g * inv_tokens + config.weight_decay * *w);
+                *g = 0.0;
+            }
+            for (w, g) in output_proj.iter_mut().zip(grad_output_proj.iter_mut()) {
+                *w -= lr * (*g * inv_tokens + config.weight_decay * *w);
+                *g = 0.0;
+            }
+
+            // --- ログ記録 ---
+            log.append(LogEntry::new(0, global_step, avg_loss, lr, 0.0));
+
+            // --- 進捗表示 ---
+            if global_step % 10 == 0 || global_step == config.total_steps - 1 {
+                let elapsed = train_start.elapsed();
+                let steps_per_sec = if elapsed.as_secs() > 0 {
+                    (global_step + 1) as f64 / elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                let eta_secs = if steps_per_sec > 0.0 {
+                    (config.total_steps - global_step) as f64 / steps_per_sec
+                } else {
+                    0.0
+                };
+                println!(
+                    "  step {global_step:>5}/{} | loss: {avg_loss:.4} | lr: {lr:.2e} | \
+                     {:.1}ms/step | {steps_per_sec:.1} steps/s | ETA: {eta_secs:.0}s",
+                    config.total_steps,
+                    step_duration.as_secs_f64() * 1000.0,
+                );
+            }
+
+            // --- チェックポイント保存 ---
+            if global_step > 0 && global_step % config.checkpoint_interval == 0 {
+                let ckpt_path = format!("{}/step_{global_step}.bin", config.checkpoint_dir);
+                println!("  チェックポイント保存: {ckpt_path}");
+
+                let meta = alice_train::CheckpointMeta {
+                    version: 1,
+                    epoch: 0,
+                    step: global_step,
+                    loss: avg_loss,
+                    learning_rate: lr,
+                    weight_count: embedding.len(),
+                    optimizer_state_count: 0,
+                };
+                let ckpt = CheckpointData {
+                    meta,
+                    weights: embedding.clone(),
+                    optimizer_state: vec![],
+                };
+                if let Err(e) =
+                    std::fs::File::create(&ckpt_path).and_then(|mut f| ckpt.save(&mut f))
+                {
+                    eprintln!("  チェックポイント保存失敗: {e}");
+                }
+            }
+
+            global_step += 1;
+        }
+
+        // --- 学習完了 ---
+        let total_duration = train_start.elapsed();
+        println!();
+        println!("━━━ Phase 1 学習完了 ━━━");
+        println!("  総ステップ: {global_step}");
+        println!(
+            "  学習時間: {:.1}s ({:.1} steps/s)",
+            total_duration.as_secs_f64(),
+            global_step as f64 / total_duration.as_secs_f64().max(0.001)
+        );
+
+        // ログ保存
+        let log_path = format!("{}/train_log.csv", config.checkpoint_dir);
+        if let Err(e) = log.save_csv_to_file(&log_path) {
+            eprintln!("  ログ保存失敗: {e}");
         } else {
-            "無効"
-        }
-    );
-    println!("  OffloadOptimizer: weight_decay={}", config.weight_decay);
-
-    // --- 学習ループ ---
-    println!();
-    println!(
-        "━━━ QAT 学習開始 (step {global_step}/{}) ━━━",
-        config.total_steps
-    );
-    let train_start = Instant::now();
-
-    // TODO: safetensors からレイヤー重みを mmap で読み込み、
-    // レイヤーごとに forward → backward → OffloadOptimizer.step() を実行
-    //
-    // 現時点では以下のスケルトンを提供:
-    // 1. 各 safetensors ファイルを mmap で開く
-    // 2. レイヤー i の重みを FP32 で取得
-    // 3. FakeQuantize で ternary forward
-    // 4. Cross-entropy loss 計算
-    // 5. STE backward
-    // 6. OffloadOptimizer.step() (m/v は CPU RAM)
-    // 7. checkpoint_interval ごとに保存
-
-    while global_step < config.total_steps {
-        let lr = scheduler.get_lr(global_step);
-        let step_start = Instant::now();
-
-        // --- ここにレイヤー単位の forward/backward ループが入る ---
-        // 各レイヤーについて:
-        //   let mut layer_weights = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model);
-        //   let mut optimizer = OffloadOptimizer::new(layer_weights.proj_param_count(), offload_config.clone());
-        //   for micro_batch in 0..config.gradient_accumulation_steps {
-        //       // forward: FakeQuantize → ternary matvec
-        //       // backward: STE → grad accumulation
-        //   }
-        //   optimizer.step(&mut weights, &mut grads, lr);
-
-        let step_loss = 0.0_f32; // placeholder
-        let _step_duration = step_start.elapsed();
-
-        // ログ記録
-        log.append(LogEntry::new(0, global_step, step_loss, lr, 0.0));
-
-        // 進捗表示
-        if global_step.is_multiple_of(10) {
-            let elapsed = train_start.elapsed();
-            let steps_per_sec = if elapsed.as_secs() > 0 {
-                global_step as f64 / elapsed.as_secs_f64()
-            } else {
-                0.0
-            };
-            let eta_secs = if steps_per_sec > 0.0 {
-                (config.total_steps - global_step) as f64 / steps_per_sec
-            } else {
-                0.0
-            };
-            println!(
-                "  step {global_step}/{} | loss: {step_loss:.4} | lr: {lr:.2e} | {:.2} steps/s | ETA: {:.0}s",
-                config.total_steps, steps_per_sec, eta_secs,
-            );
+            println!("  ログ: {log_path}");
         }
 
-        // チェックポイント保存
-        if global_step > 0 && global_step.is_multiple_of(config.checkpoint_interval) {
-            let ckpt_path = format!("{}/step_{global_step}.bin", config.checkpoint_dir);
-            println!("  チェックポイント保存: {ckpt_path}");
-            // TODO: CheckpointData::save() で重み + optimizer state を保存
+        // 最終 loss 表示
+        if let Some(last) = log.entries().last() {
+            if let Some(first) = log.entries().first() {
+                println!(
+                    "  Loss: {:.4} → {:.4} (Δ {:.4})",
+                    first.loss,
+                    last.loss,
+                    first.loss - last.loss
+                );
+                if last.loss < first.loss {
+                    println!("  ✓ Loss が減少 — パイプライン正常動作を確認");
+                } else {
+                    println!("  ✗ Loss が減少していません — 設定を確認してください");
+                }
+            }
         }
-
-        // 評価
-        if global_step > 0 && global_step.is_multiple_of(config.eval_interval) {
-            println!("  評価実行中...");
-            // TODO: eval_data_path のトークンで perplexity 計算
-        }
-
-        global_step += 1;
-    }
-
-    // --- 学習完了 ---
-    let total_duration = train_start.elapsed();
-    println!();
-    println!("━━━ QAT 学習完了 ━━━");
-    println!("  総ステップ: {global_step}");
-    println!(
-        "  学習時間: {:.1} 時間",
-        total_duration.as_secs_f64() / 3600.0
-    );
-
-    // ログ保存
-    let log_path = format!("{}/train_log.csv", config.checkpoint_dir);
-    if let Err(e) = log.save_csv_to_file(&log_path) {
-        eprintln!("  ログ保存失敗: {e}");
     } else {
-        println!("  ログ保存: {log_path}");
-    }
+        // Phase 2+: safetensors からモデル読み込み
+        println!("━━━ モデル読み込み ━━━");
+        let model_path = Path::new(&config.model_path);
 
-    // 最終重み出力
-    println!("  最終 ternary 重みの出力...");
-    // TODO: finalize_weights → safetensors 出力
-    println!("  完了。");
+        let st_files: Vec<_> = fs::read_dir(model_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "safetensors"))
+            .map(|e| e.path())
+            .collect();
+
+        if st_files.is_empty() {
+            eprintln!(
+                "[ALICE-Train] safetensors ファイルが見つかりません: {}",
+                config.model_path
+            );
+            std::process::exit(1);
+        }
+
+        println!("  safetensors: {} ファイル", st_files.len());
+
+        // TODO Phase 2: レイヤー単位 forward/backward ループ
+        // 1. safetensors を mmap で開く
+        // 2. LlamaLayerWeights::from_tensors() でレイヤー重み取得
+        // 3. FakeQuantize で ternary forward
+        // 4. Cross-entropy loss
+        // 5. STE backward (ternary_matvec_backward)
+        // 6. OffloadOptimizer.step()
+        // 7. checkpoint_interval ごとに保存
+        println!();
+        println!("Phase 2 学習ループは未実装です。");
+        println!("Phase 1 で検証後、レイヤー単位 forward/backward を実装します。");
+    }
 }
