@@ -89,11 +89,15 @@ pub mod dataloader;
 pub mod distill;
 pub mod evaluator;
 pub mod llama;
+pub mod llama_backward;
+pub mod llama_forward;
 pub mod logger;
 pub mod mixed_precision;
 pub mod offload;
 pub mod pipeline;
 pub mod qat;
+#[cfg(feature = "qat-cli")]
+pub mod safetensors_loader;
 pub mod scheduler;
 pub mod trainer;
 
