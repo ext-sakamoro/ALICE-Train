@@ -106,6 +106,8 @@ pub mod trainer;
 pub mod gpu;
 #[cfg(feature = "gpu")]
 pub mod gpu_backward;
+#[cfg(feature = "gpu")]
+pub mod gpu_matmul;
 
 // Re-exports
 pub use activation::{gelu_backward, relu_backward, silu_backward};
@@ -130,3 +132,5 @@ pub use trainer::{EpochResult, TrainConfig, TrainableNetwork, Trainer};
 pub use gpu::GpuContext;
 #[cfg(feature = "gpu")]
 pub use gpu_backward::GpuBackwardEngine;
+#[cfg(feature = "gpu")]
+pub use gpu_matmul::GpuMatmul;

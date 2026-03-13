@@ -14,11 +14,12 @@ publish = false
 default = []
 gpu = ["wgpu", "pollster", "bytemuck"]
 qat-cli = ["safetensors", "clap"]
+qat-gpu = ["gpu", "qat-cli"]
 
 [[bin]]
 name = "train-qat-70b"
 path = "src/bin/train_qat_70b.rs"
-required-features = ["qat-cli"]
+required-features = ["qat-gpu"]
 
 [[bin]]
 name = "prepare-data"

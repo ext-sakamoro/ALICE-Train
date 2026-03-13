@@ -29,8 +29,9 @@ use std::time::Instant;
 
 use alice_train::llama::QatTrainConfig;
 use alice_train::{
-    CheckpointData, DataLoader, DataLoaderConfig, FakeQuantize, LogEntry, LossScaler, LrScheduler,
-    MixedPrecisionConfig, MmapDataset, OffloadConfig, QatConfig, TrainLog, WarmupCosineScheduler,
+    CheckpointData, DataLoader, DataLoaderConfig, FakeQuantize, GpuContext, GpuMatmul, LogEntry,
+    LossScaler, LrScheduler, MixedPrecisionConfig, MmapDataset, OffloadConfig, QatConfig, TrainLog,
+    WarmupCosineScheduler,
 };
 
 /// ALICE-Train QAT: Llama-3 → 1.1-bit Sparse Ternary
@@ -483,7 +484,8 @@ fn main() {
 
         use alice_train::llama::LlamaLayerWeights;
         use alice_train::llama_backward::{layer_backward, rmsnorm_backward_output};
-        use alice_train::llama_forward::{layer_forward, rmsnorm, LayerCache};
+        use alice_train::llama_forward::{rmsnorm, LayerCache};
+        use alice_train::gpu_matmul::gpu_layer_forward;
         use alice_train::safetensors_loader::ShardedModel;
 
         let model = ShardedModel::open(&config.model_path).unwrap_or_else(|e| {
@@ -520,6 +522,16 @@ fn main() {
         );
 
         let num_layers = config.model.num_layers;
+
+        // GPU 初期化
+        println!("  GPU 初期化...");
+        let gpu_ctx = GpuContext::new_blocking().unwrap_or_else(|| {
+            eprintln!("[ALICE-Train] GPU 初期化失敗 — wgpu バックエンドが見つかりません");
+            std::process::exit(1);
+        });
+        let gpu = GpuMatmul::new(&gpu_ctx);
+        println!("    GPU ready: matmul_bt + swiglu_ffn パイプラインコンパイル完了");
+        println!();
 
         // メモリ見積もり
         let layer_bytes = config.model.params_per_layer() * 4;
@@ -569,7 +581,7 @@ fn main() {
                     }
                 }
 
-                // Forward: 1レイヤーずつ読み込み → forward → cache 保存 → 重み破棄
+                // Forward: 1レイヤーずつ読み込み → GPU forward → cache 保存 → 重み破棄
                 let mut caches: Vec<LayerCache> = Vec::with_capacity(num_layers);
                 for i in 0..num_layers {
                     let lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
@@ -577,7 +589,7 @@ fn main() {
                             eprintln!("[ALICE-Train] レイヤー {i} の重み読み込み失敗");
                             std::process::exit(1);
                         });
-                    let cache = layer_forward(&mut hidden, &lw, &config.model, seq_len);
+                    let cache = gpu_layer_forward(&gpu, &gpu_ctx, &mut hidden, &lw, &config.model, seq_len);
                     caches.push(cache);
                     // lw はここで drop — メモリ解放
                 }
@@ -586,7 +598,10 @@ fn main() {
                 let hidden_pre_norm = hidden.clone();
                 rmsnorm(&mut hidden, &output_norm, hidden_dim, config.model.norm_eps);
 
-                // logits 計算 — vocab が大きいので1トークンずつ処理
+                // logits 計算 — GPU matmul_bt: hidden (seq×hidden) × output_proj^T → logits (seq×vocab)
+                let logits = gpu.matmul_bt(&gpu_ctx, &hidden, &output_proj, seq_len, vocab_size, hidden_dim);
+
+                // Loss + 勾配計算 (CPU — softmax は軽い)
                 let mut d_logits_per_token = Vec::with_capacity(seq_len);
                 for t in 0..seq_len {
                     let target = targets[t] as usize;
@@ -595,19 +610,8 @@ fn main() {
                         continue;
                     }
 
-                    // logits[v] = hidden[t] · output_proj[v] for all v
-                    let h_off = t * hidden_dim;
-                    let mut logits_t = vec![0.0f32; vocab_size];
-                    for v in 0..vocab_size {
-                        let p_off = v * hidden_dim;
-                        let mut sum = 0.0f32;
-                        for h in 0..hidden_dim {
-                            sum = hidden[h_off + h].mul_add(output_proj[p_off + h], sum);
-                        }
-                        logits_t[v] = sum;
-                    }
-
-                    let (loss, grad) = cross_entropy_loss(&logits_t, target);
+                    let logits_t = &logits[t * vocab_size..(t + 1) * vocab_size];
+                    let (loss, grad) = cross_entropy_loss(logits_t, target);
                     total_loss += loss;
                     token_count += 1;
                     d_logits_per_token.push(Some(grad));
@@ -616,20 +620,34 @@ fn main() {
                 // --- Backward ---
                 let inv_tokens = 1.0 / token_count.max(1) as f32;
 
-                // Output projection backward (1トークンずつ — vocab_size の全ベクトル確保を避ける)
-                let mut d_hidden_normed = vec![0.0f32; seq_len * hidden_dim];
+                // Output projection backward — GPU matmul_bt で d_hidden を計算
+                // d_hidden_normed = d_logits × output_proj (regular matmul)
+                // = matmul_bt(d_logits, output_proj^T) — output_proj^T を使う
+                // output_proj: (vocab × hidden), output_proj^T: (hidden × vocab)
+                let mut d_logits_flat = vec![0.0f32; seq_len * vocab_size];
+                for t in 0..seq_len {
+                    if let Some(ref d_logits_t) = d_logits_per_token[t] {
+                        d_logits_flat[t * vocab_size..(t + 1) * vocab_size]
+                            .copy_from_slice(d_logits_t);
+                    }
+                }
+                // output_proj^T を作成 (hidden × vocab) — matmul_bt で使うため
+                let mut output_proj_t = vec![0.0f32; hidden_dim * vocab_size];
+                for v in 0..vocab_size {
+                    for h in 0..hidden_dim {
+                        output_proj_t[h * vocab_size + v] = output_proj[v * hidden_dim + h];
+                    }
+                }
+                let d_hidden_normed = gpu.matmul_bt(
+                    &gpu_ctx, &d_logits_flat, &output_proj_t,
+                    seq_len, hidden_dim, vocab_size,
+                );
+                drop(output_proj_t);
+
+                // output_proj weight update (CPU SGD — 重みが小さくないので GPU 上で行うには追加 shader 要)
                 for t in 0..seq_len {
                     if let Some(ref d_logits_t) = d_logits_per_token[t] {
                         let h_off = t * hidden_dim;
-                        // d_hidden = d_logits × output_proj (transpose backward)
-                        for h in 0..hidden_dim {
-                            let mut sum = 0.0f32;
-                            for v in 0..vocab_size {
-                                sum += d_logits_t[v] * output_proj[v * hidden_dim + h];
-                            }
-                            d_hidden_normed[h_off + h] = sum;
-                        }
-                        // output_proj weight update (online SGD per token)
                         for v in 0..vocab_size {
                             let dl = d_logits_t[v];
                             if dl.abs() < 1e-10 {
