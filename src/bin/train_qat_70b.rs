@@ -29,7 +29,7 @@ use std::time::Instant;
 
 use alice_train::llama::QatTrainConfig;
 use alice_train::{
-    CheckpointData, DataLoader, DataLoaderConfig, FakeQuantize, GpuContext, GpuMatmul, LogEntry,
+    CheckpointData, CudaMatmul, DataLoader, DataLoaderConfig, FakeQuantize, LogEntry,
     LossScaler, LrScheduler, MixedPrecisionConfig, MmapDataset, OffloadConfig, QatConfig, TrainLog,
     WarmupCosineScheduler,
 };
@@ -485,7 +485,7 @@ fn main() {
         use alice_train::llama::LlamaLayerWeights;
         use alice_train::llama_backward::{layer_backward, rmsnorm_backward_output};
         use alice_train::llama_forward::{rmsnorm, LayerCache};
-        use alice_train::gpu_matmul::gpu_layer_forward;
+        use alice_train::cuda_matmul::cuda_layer_forward;
         use alice_train::safetensors_loader::ShardedModel;
 
         let model = ShardedModel::open(&config.model_path).unwrap_or_else(|e| {
@@ -523,14 +523,10 @@ fn main() {
 
         let num_layers = config.model.num_layers;
 
-        // GPU 初期化
-        println!("  GPU 初期化...");
-        let gpu_ctx = GpuContext::new_blocking().unwrap_or_else(|| {
-            eprintln!("[ALICE-Train] GPU 初期化失敗 — wgpu バックエンドが見つかりません");
-            std::process::exit(1);
-        });
-        let gpu = GpuMatmul::new(&gpu_ctx);
-        println!("    GPU ready: matmul_bt + swiglu_ffn パイプラインコンパイル完了");
+        // CUDA 初期化
+        println!("  CUDA 初期化...");
+        let cuda = CudaMatmul::new();
+        println!("    CUDA ready: cuBLAS sgemm 初期化完了");
         println!();
 
         // メモリ見積もり
@@ -589,7 +585,7 @@ fn main() {
                             eprintln!("[ALICE-Train] レイヤー {i} の重み読み込み失敗");
                             std::process::exit(1);
                         });
-                    let cache = gpu_layer_forward(&gpu, &gpu_ctx, &mut hidden, &lw, &config.model, seq_len);
+                    let cache = cuda_layer_forward(&cuda, &mut hidden, &lw, &config.model, seq_len);
                     caches.push(cache);
                     // lw はここで drop — メモリ解放
                 }
@@ -598,8 +594,8 @@ fn main() {
                 let hidden_pre_norm = hidden.clone();
                 rmsnorm(&mut hidden, &output_norm, hidden_dim, config.model.norm_eps);
 
-                // logits 計算 — GPU matmul_bt: hidden (seq×hidden) × output_proj^T → logits (seq×vocab)
-                let logits = gpu.matmul_bt(&gpu_ctx, &hidden, &output_proj, seq_len, vocab_size, hidden_dim);
+                // logits 計算 — CUDA cuBLAS sgemm: hidden (seq×hidden) × output_proj^T → logits (seq×vocab)
+                let logits = cuda.matmul_bt(&hidden, &output_proj, seq_len, vocab_size, hidden_dim);
 
                 // Loss + 勾配計算 (CPU — softmax は軽い)
                 let mut d_logits_per_token = Vec::with_capacity(seq_len);
@@ -638,8 +634,8 @@ fn main() {
                         output_proj_t[h * vocab_size + v] = output_proj[v * hidden_dim + h];
                     }
                 }
-                let d_hidden_normed = gpu.matmul_bt(
-                    &gpu_ctx, &d_logits_flat, &output_proj_t,
+                let d_hidden_normed = cuda.matmul_bt(
+                    &d_logits_flat, &output_proj_t,
                     seq_len, hidden_dim, vocab_size,
                 );
                 drop(output_proj_t);

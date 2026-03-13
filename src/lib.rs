@@ -109,6 +109,10 @@ pub mod gpu_backward;
 #[cfg(feature = "gpu")]
 pub mod gpu_matmul;
 
+// CUDA モジュール (feature gate)
+#[cfg(feature = "cuda")]
+pub mod cuda_matmul;
+
 // Re-exports
 pub use activation::{gelu_backward, relu_backward, silu_backward};
 pub use backward::{bitlinear_backward, ste_weight_grad, ternary_matvec_backward};
@@ -134,3 +138,7 @@ pub use gpu::GpuContext;
 pub use gpu_backward::GpuBackwardEngine;
 #[cfg(feature = "gpu")]
 pub use gpu_matmul::GpuMatmul;
+
+// CUDA re-exports
+#[cfg(feature = "cuda")]
+pub use cuda_matmul::CudaMatmul;
