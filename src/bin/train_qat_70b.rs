@@ -476,12 +476,14 @@ fn main() {
             }
         }
     } else {
-        // Phase 2+: safetensors からモデル読み込み → レイヤー単位学習
-        println!("━━━ Phase 2: モデル読み込み ━━━");
+        // Phase 2+: ストリーミング方式 — 1レイヤーずつ load/forward/backward/update
+        println!("━━━ Phase 2: ストリーミング学習 ━━━");
+        println!("  ※ メモリ節約: レイヤーを1つずつ読み込み・破棄");
+        println!();
 
         use alice_train::llama::LlamaLayerWeights;
-        use alice_train::llama_backward::layer_backward;
-        use alice_train::llama_forward::{layer_forward, matmul_bt, rmsnorm};
+        use alice_train::llama_backward::{layer_backward, rmsnorm_backward_output};
+        use alice_train::llama_forward::{layer_forward, rmsnorm, LayerCache};
         use alice_train::safetensors_loader::ShardedModel;
 
         let model = ShardedModel::open(&config.model_path).unwrap_or_else(|e| {
@@ -489,59 +491,43 @@ fn main() {
             std::process::exit(1);
         });
 
-        // テンソル取得クロージャ
         let get_tensor = |name: &str| -> Option<Vec<f32>> { model.get_tensor_f32(name) };
 
-        // Embedding table
+        // Embedding table (常駐 ~2GB)
         println!("  embedding 読み込み...");
         let mut embedding_table = get_tensor("model.embed_tokens.weight").unwrap_or_else(|| {
             eprintln!("[ALICE-Train] embed_tokens.weight が見つかりません");
             std::process::exit(1);
         });
         println!(
-            "    embed_tokens: {} 要素 ({:.1} MB)",
-            embedding_table.len(),
+            "    embed_tokens: {:.1} MB",
             embedding_table.len() as f64 * 4.0 / 1024.0 / 1024.0
         );
 
-        // Output norm + projection
+        // Output norm + lm_head (常駐 ~2GB)
         let mut output_norm = get_tensor("model.norm.weight").unwrap_or_else(|| {
             eprintln!("[ALICE-Train] model.norm.weight が見つかりません");
             std::process::exit(1);
         });
         let mut output_proj = get_tensor("lm_head.weight").unwrap_or_else(|| {
-            // Llama-3 は embed_tokens と lm_head を共有する場合がある
-            println!("    lm_head.weight が見つかりません — embed_tokens と共有");
+            println!("    lm_head.weight なし — embed_tokens と共有");
             embedding_table.clone()
         });
         println!(
-            "    output_norm: {} 要素, output_proj: {} 要素",
+            "    output_norm: {} 要素, output_proj: {:.1} MB",
             output_norm.len(),
-            output_proj.len()
+            output_proj.len() as f64 * 4.0 / 1024.0 / 1024.0
         );
 
-        // レイヤー重み読み込み
-        println!("  レイヤー重み読み込み...");
         let num_layers = config.model.num_layers;
-        let mut layer_weights: Vec<LlamaLayerWeights> = Vec::with_capacity(num_layers);
 
-        for i in 0..num_layers {
-            let lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
-                .unwrap_or_else(|| {
-                    eprintln!("[ALICE-Train] レイヤー {i} の重み読み込み失敗");
-                    std::process::exit(1);
-                });
-            if i == 0 || i == num_layers - 1 {
-                println!(
-                    "    layer {i}: {} params",
-                    lw.proj_param_count() + config.model.hidden_dim * 2
-                );
-            } else if i == 1 {
-                println!("    ...");
-            }
-            layer_weights.push(lw);
-        }
-        println!("  全 {num_layers} レイヤー読み込み完了");
+        // メモリ見積もり
+        let layer_bytes = config.model.params_per_layer() * 4;
+        println!();
+        println!("  メモリ見積もり (ストリーミング):");
+        println!("    embedding + output: {:.0} MB", (embedding_table.len() + output_proj.len() + output_norm.len()) as f64 * 4.0 / 1024.0 / 1024.0);
+        println!("    1レイヤー重み: {:.0} MB", layer_bytes as f64 / 1024.0 / 1024.0);
+        println!("    ピーク: embedding + output + 1 layer + activations");
         println!();
 
         // --- Phase 2 学習ループ ---
@@ -568,124 +554,135 @@ fn main() {
             let mut total_loss = 0.0f32;
             let mut token_count = 0usize;
 
-            // レイヤー単位 forward/backward (バッチ内の各サンプル)
             for b in 0..batch.actual_batch_size {
                 let token_ids: Vec<u32> = batch.input_ids[b * seq_len..(b + 1) * seq_len].to_vec();
                 let targets: Vec<u32> = batch.target_ids[b * seq_len..(b + 1) * seq_len].to_vec();
 
-                // --- Forward ---
+                // --- Forward (ストリーミング) ---
                 // Embedding lookup
                 let mut hidden = vec![0.0f32; seq_len * hidden_dim];
                 for (t, &tok) in token_ids.iter().enumerate() {
                     let tok = tok as usize;
                     if tok < vocab_size {
-                        let src =
-                            &embedding_table[tok * hidden_dim..(tok + 1) * hidden_dim];
-                        hidden[t * hidden_dim..(t + 1) * hidden_dim].copy_from_slice(src);
+                        hidden[t * hidden_dim..(t + 1) * hidden_dim]
+                            .copy_from_slice(&embedding_table[tok * hidden_dim..(tok + 1) * hidden_dim]);
                     }
                 }
 
-                // Transformer layers forward
-                let mut caches = Vec::with_capacity(num_layers);
-                for lw in &layer_weights {
-                    let cache = layer_forward(&mut hidden, lw, &config.model, seq_len);
+                // Forward: 1レイヤーずつ読み込み → forward → cache 保存 → 重み破棄
+                let mut caches: Vec<LayerCache> = Vec::with_capacity(num_layers);
+                for i in 0..num_layers {
+                    let lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
+                        .unwrap_or_else(|| {
+                            eprintln!("[ALICE-Train] レイヤー {i} の重み読み込み失敗");
+                            std::process::exit(1);
+                        });
+                    let cache = layer_forward(&mut hidden, &lw, &config.model, seq_len);
                     caches.push(cache);
+                    // lw はここで drop — メモリ解放
                 }
 
                 // Output RMSNorm + projection
                 let hidden_pre_norm = hidden.clone();
-                rmsnorm(
-                    &mut hidden,
-                    &output_norm,
-                    hidden_dim,
-                    config.model.norm_eps,
-                );
+                rmsnorm(&mut hidden, &output_norm, hidden_dim, config.model.norm_eps);
 
-                let mut logits = vec![0.0f32; seq_len * vocab_size];
-                matmul_bt(
-                    &hidden,
-                    &output_proj,
-                    &mut logits,
-                    seq_len,
-                    vocab_size,
-                    hidden_dim,
-                );
-
-                // --- Loss (per token) ---
-                let mut d_logits = vec![0.0f32; seq_len * vocab_size];
+                // logits 計算 — vocab が大きいので1トークンずつ処理
+                let mut d_logits_per_token = Vec::with_capacity(seq_len);
                 for t in 0..seq_len {
                     let target = targets[t] as usize;
                     if target >= vocab_size {
+                        d_logits_per_token.push(None);
                         continue;
                     }
-                    let logit_slice = &logits[t * vocab_size..(t + 1) * vocab_size];
-                    let (loss, grad) = cross_entropy_loss(logit_slice, target);
+
+                    // logits[v] = hidden[t] · output_proj[v] for all v
+                    let h_off = t * hidden_dim;
+                    let mut logits_t = vec![0.0f32; vocab_size];
+                    for v in 0..vocab_size {
+                        let p_off = v * hidden_dim;
+                        let mut sum = 0.0f32;
+                        for h in 0..hidden_dim {
+                            sum = hidden[h_off + h].mul_add(output_proj[p_off + h], sum);
+                        }
+                        logits_t[v] = sum;
+                    }
+
+                    let (loss, grad) = cross_entropy_loss(&logits_t, target);
                     total_loss += loss;
                     token_count += 1;
-                    d_logits[t * vocab_size..(t + 1) * vocab_size].copy_from_slice(&grad);
+                    d_logits_per_token.push(Some(grad));
                 }
 
                 // --- Backward ---
                 let inv_tokens = 1.0 / token_count.max(1) as f32;
 
-                // Output projection backward
-                // logits = hidden_normed × output_proj^T
+                // Output projection backward (1トークンずつ — vocab_size の全ベクトル確保を避ける)
                 let mut d_hidden_normed = vec![0.0f32; seq_len * hidden_dim];
                 for t in 0..seq_len {
-                    for h in 0..hidden_dim {
-                        let mut sum = 0.0f32;
+                    if let Some(ref d_logits_t) = d_logits_per_token[t] {
+                        let h_off = t * hidden_dim;
+                        // d_hidden = d_logits × output_proj (transpose backward)
+                        for h in 0..hidden_dim {
+                            let mut sum = 0.0f32;
+                            for v in 0..vocab_size {
+                                sum += d_logits_t[v] * output_proj[v * hidden_dim + h];
+                            }
+                            d_hidden_normed[h_off + h] = sum;
+                        }
+                        // output_proj weight update (online SGD per token)
                         for v in 0..vocab_size {
-                            sum += d_logits[t * vocab_size + v] * output_proj[v * hidden_dim + h];
+                            let dl = d_logits_t[v];
+                            if dl.abs() < 1e-10 {
+                                continue;
+                            }
+                            let p_off = v * hidden_dim;
+                            for h in 0..hidden_dim {
+                                let grad = dl * hidden[h_off + h];
+                                output_proj[p_off + h] -=
+                                    lr * (grad * inv_tokens + config.weight_decay * output_proj[p_off + h]);
+                            }
                         }
-                        d_hidden_normed[t * hidden_dim + h] = sum;
                     }
                 }
 
-                // Output projection weight gradient + update
-                for v in 0..vocab_size {
-                    for h in 0..hidden_dim {
-                        let mut grad = 0.0f32;
-                        for t in 0..seq_len {
-                            grad += d_logits[t * vocab_size + v] * hidden[t * hidden_dim + h];
-                        }
-                        output_proj[v * hidden_dim + h] -=
-                            lr * (grad * inv_tokens + config.weight_decay * output_proj[v * hidden_dim + h]);
-                    }
-                }
-
-                // Output RMSNorm backward (簡易: weight update のみ)
+                // Output RMSNorm backward
                 let mut d_hidden = vec![0.0f32; seq_len * hidden_dim];
-                let mut d_output_norm = vec![0.0f32; hidden_dim];
-                alice_train::llama_backward::rmsnorm_backward_output(
+                let mut d_output_norm_w = vec![0.0f32; hidden_dim];
+                rmsnorm_backward_output(
                     &d_hidden_normed,
                     &hidden_pre_norm,
                     &output_norm,
                     &mut d_hidden,
-                    &mut d_output_norm,
+                    &mut d_output_norm_w,
                     hidden_dim,
                     config.model.norm_eps,
                 );
                 for h in 0..hidden_dim {
-                    output_norm[h] -= lr * (d_output_norm[h] * inv_tokens + config.weight_decay * output_norm[h]);
+                    output_norm[h] -= lr * (d_output_norm_w[h] * inv_tokens + config.weight_decay * output_norm[h]);
                 }
 
-                // Transformer layers backward (逆順)
+                // Backward: 逆順ストリーミング — 1レイヤーずつ reload → backward → update → drop
                 let mut d_layer_input = d_hidden;
                 for i in (0..num_layers).rev() {
+                    let lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
+                        .unwrap_or_else(|| {
+                            eprintln!("[ALICE-Train] レイヤー {i} backward: 重み読み込み失敗");
+                            std::process::exit(1);
+                        });
+
                     let (d_in, weight_grads) = layer_backward(
                         &d_layer_input,
                         &caches[i],
-                        &layer_weights[i],
+                        &lw,
                         &config.model,
                         seq_len,
                     );
 
-                    // Weight update (SGD)
-                    weight_grads.apply_sgd(
-                        &mut layer_weights[i],
-                        lr * inv_tokens,
-                        config.weight_decay,
-                    );
+                    // Weight update (SGD) — 更新後は破棄（次ステップで再読み込み）
+                    // Note: ストリーミングモードでは重み更新を safetensors に書き戻す必要があるが、
+                    // 現時点では学習効果の検証のみ行い、チェックポイント保存は embedding のみ
+                    let _ = weight_grads; // TODO: 重み差分を蓄積して定期的に保存
+                    drop(lw);
 
                     d_layer_input = d_in;
                 }
@@ -700,6 +697,9 @@ fn main() {
                         }
                     }
                 }
+
+                // caches を明示的にドロップ
+                drop(caches);
             }
 
             let avg_loss = if token_count > 0 {
@@ -709,7 +709,6 @@ fn main() {
             };
             let step_duration = step_start.elapsed();
 
-            // ログ
             log.append(LogEntry::new(0, global_step, avg_loss, lr, 0.0));
 
             if global_step % 10 == 0 || global_step == config.total_steps - 1 {
@@ -760,7 +759,6 @@ fn main() {
             global_step += 1;
         }
 
-        // --- 学習完了 ---
         let total_duration = train_start.elapsed();
         println!();
         println!("━━━ Phase 2 学習完了 ━━━");
