@@ -24,6 +24,11 @@ path = "src/bin/train_qat_70b.rs"
 required-features = ["qat-cuda"]
 
 [[bin]]
+name = "train-debug"
+path = "src/bin/train_debug.rs"
+required-features = ["qat-cli"]
+
+[[bin]]
 name = "prepare-data"
 path = "src/bin/prepare_data.rs"
 required-features = ["qat-cli"]

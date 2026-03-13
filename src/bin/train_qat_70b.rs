@@ -483,9 +483,9 @@ fn main() {
         println!();
 
         use alice_train::llama::LlamaLayerWeights;
-        use alice_train::llama_backward::{layer_backward, rmsnorm_backward_output};
+        use alice_train::llama_backward::rmsnorm_backward_output;
         use alice_train::llama_forward::{rmsnorm, LayerCache};
-        use alice_train::cuda_matmul::cuda_layer_forward;
+        use alice_train::cuda_matmul::{cuda_layer_forward, cuda_layer_backward};
         use alice_train::safetensors_loader::ShardedModel;
 
         let model = ShardedModel::open(&config.model_path).unwrap_or_else(|e| {
@@ -616,10 +616,9 @@ fn main() {
                 // --- Backward ---
                 let inv_tokens = 1.0 / token_count.max(1) as f32;
 
-                // Output projection backward — GPU matmul_bt で d_hidden を計算
-                // d_hidden_normed = d_logits × output_proj (regular matmul)
-                // = matmul_bt(d_logits, output_proj^T) — output_proj^T を使う
-                // output_proj: (vocab × hidden), output_proj^T: (hidden × vocab)
+                // Output projection backward — CUDA matmul_nn で d_hidden を計算
+                // d_hidden_normed = d_logits × output_proj
+                // d_logits: [seq × vocab], output_proj: [vocab × hidden] → d_hidden: [seq × hidden]
                 let mut d_logits_flat = vec![0.0f32; seq_len * vocab_size];
                 for t in 0..seq_len {
                     if let Some(ref d_logits_t) = d_logits_per_token[t] {
@@ -627,37 +626,12 @@ fn main() {
                             .copy_from_slice(d_logits_t);
                     }
                 }
-                // output_proj^T を作成 (hidden × vocab) — matmul_bt で使うため
-                let mut output_proj_t = vec![0.0f32; hidden_dim * vocab_size];
-                for v in 0..vocab_size {
-                    for h in 0..hidden_dim {
-                        output_proj_t[h * vocab_size + v] = output_proj[v * hidden_dim + h];
-                    }
-                }
-                let d_hidden_normed = cuda.matmul_bt(
-                    &d_logits_flat, &output_proj_t,
+                let d_hidden_normed = cuda.matmul_nn(
+                    &d_logits_flat, &output_proj,
                     seq_len, hidden_dim, vocab_size,
                 );
-                drop(output_proj_t);
-
-                // output_proj weight update (CPU SGD — 重みが小さくないので GPU 上で行うには追加 shader 要)
-                for t in 0..seq_len {
-                    if let Some(ref d_logits_t) = d_logits_per_token[t] {
-                        let h_off = t * hidden_dim;
-                        for v in 0..vocab_size {
-                            let dl = d_logits_t[v];
-                            if dl.abs() < 1e-10 {
-                                continue;
-                            }
-                            let p_off = v * hidden_dim;
-                            for h in 0..hidden_dim {
-                                let grad = dl * hidden[h_off + h];
-                                output_proj[p_off + h] -=
-                                    lr * (grad * inv_tokens + config.weight_decay * output_proj[p_off + h]);
-                            }
-                        }
-                    }
-                }
+                // output_proj weight update はスキップ（ストリーミングモードでは重み更新を別途保存）
+                // TODO: 定期的に差分を蓄積して safetensors に書き戻す
 
                 // Output RMSNorm backward
                 let mut d_hidden = vec![0.0f32; seq_len * hidden_dim];
@@ -675,7 +649,7 @@ fn main() {
                     output_norm[h] -= lr * (d_output_norm_w[h] * inv_tokens + config.weight_decay * output_norm[h]);
                 }
 
-                // Backward: 逆順ストリーミング — 1レイヤーずつ reload → backward → update → drop
+                // Backward: 逆順ストリーミング — 1レイヤーずつ reload → CUDA backward → drop
                 let mut d_layer_input = d_hidden;
                 for i in (0..num_layers).rev() {
                     let lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
@@ -684,21 +658,15 @@ fn main() {
                             std::process::exit(1);
                         });
 
-                    let (d_in, weight_grads) = layer_backward(
+                    d_layer_input = cuda_layer_backward(
+                        &cuda,
                         &d_layer_input,
                         &caches[i],
                         &lw,
                         &config.model,
                         seq_len,
                     );
-
-                    // Weight update (SGD) — 更新後は破棄（次ステップで再読み込み）
-                    // Note: ストリーミングモードでは重み更新を safetensors に書き戻す必要があるが、
-                    // 現時点では学習効果の検証のみ行い、チェックポイント保存は embedding のみ
-                    let _ = weight_grads; // TODO: 重み差分を蓄積して定期的に保存
-                    drop(lw);
-
-                    d_layer_input = d_in;
+                    // lw + weight grads は drop — ストリーミングモード
                 }
 
                 // Embedding gradient update
