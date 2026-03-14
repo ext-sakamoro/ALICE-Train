@@ -700,10 +700,15 @@ pub fn cuda_layer_forward(
 
 /// レイヤー重みの勾配。
 pub struct LayerWeightGrads {
+    /// Attention RMSNorm 勾配
     pub attn_norm: Vec<f32>,
+    /// Q projection 勾配
     pub q_proj: Vec<f32>,
+    /// K projection 勾配
     pub k_proj: Vec<f32>,
+    /// V projection 勾配
     pub v_proj: Vec<f32>,
+    /// O projection 勾配
     pub o_proj: Vec<f32>,
     /// Q bias 勾配 (attention_bias=true の場合のみ Some)
     pub q_bias: Option<Vec<f32>>,
@@ -711,9 +716,13 @@ pub struct LayerWeightGrads {
     pub k_bias: Option<Vec<f32>>,
     /// V bias 勾配
     pub v_bias: Option<Vec<f32>>,
+    /// FFN RMSNorm 勾配
     pub ffn_norm: Vec<f32>,
+    /// Gate projection 勾配
     pub gate_proj: Vec<f32>,
+    /// Up projection 勾配
     pub up_proj: Vec<f32>,
+    /// Down projection 勾配
     pub down_proj: Vec<f32>,
 }
 
