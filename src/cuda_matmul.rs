@@ -234,12 +234,193 @@ impl CudaMatmul {
 // ── CUDA レイヤー Forward / Backward ──────────────────────────────────────
 
 use crate::llama::{LlamaConfig, LlamaLayerWeights};
-use crate::llama_forward::{apply_rope, gqa_attention, rmsnorm, LayerCache};
+use crate::llama_forward::{apply_rope, rmsnorm, LayerCache};
+
+// ── CUDA GQA Attention ──────────────────────────────────────────────────
+
+/// ヘッドデータ抽出: interleaved [seq_len, num_heads * head_dim] → [seq_len, head_dim]
+fn extract_head(data: &[f32], head: usize, num_heads: usize, head_dim: usize, seq_len: usize) -> Vec<f32> {
+    let stride = num_heads * head_dim;
+    let mut out = vec![0.0f32; seq_len * head_dim];
+    for t in 0..seq_len {
+        let src = &data[t * stride + head * head_dim..t * stride + (head + 1) * head_dim];
+        out[t * head_dim..(t + 1) * head_dim].copy_from_slice(src);
+    }
+    out
+}
+
+/// ヘッドデータ書き戻し: [seq_len, head_dim] → interleaved [seq_len, num_heads * head_dim]
+fn scatter_head(src: &[f32], dst: &mut [f32], head: usize, num_heads: usize, head_dim: usize, seq_len: usize) {
+    let stride = num_heads * head_dim;
+    for t in 0..seq_len {
+        dst[t * stride + head * head_dim..t * stride + (head + 1) * head_dim]
+            .copy_from_slice(&src[t * head_dim..(t + 1) * head_dim]);
+    }
+}
+
+/// ヘッドデータ加算: [seq_len, head_dim] を interleaved dst に加算（GQA 用）
+fn accumulate_head(src: &[f32], dst: &mut [f32], head: usize, num_heads: usize, head_dim: usize, seq_len: usize) {
+    let stride = num_heads * head_dim;
+    for t in 0..seq_len {
+        for d in 0..head_dim {
+            dst[t * stride + head * head_dim + d] += src[t * head_dim + d];
+        }
+    }
+}
+
+/// Causal softmax (in-place): scores [seq_len, seq_len] に causal mask + softmax 適用
+fn causal_softmax(scores: &mut [f32], seq_len: usize) {
+    for t in 0..seq_len {
+        let row = &mut scores[t * seq_len..(t + 1) * seq_len];
+        // Causal mask: s > t → -inf
+        for s in (t + 1)..seq_len {
+            row[s] = f32::NEG_INFINITY;
+        }
+        // Stable softmax
+        let max_val = row[..=t].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for s in 0..=t {
+            let e = (row[s] - max_val).exp();
+            row[s] = e;
+            sum += e;
+        }
+        let inv = 1.0 / sum.max(1e-10);
+        for s in 0..=t {
+            row[s] *= inv;
+        }
+        for s in (t + 1)..seq_len {
+            row[s] = 0.0;
+        }
+    }
+}
+
+/// Softmax backward (in-place): d_scores = attn * (d_attn_w - row_dot)
+fn softmax_backward(d_attn_w: &[f32], attn: &[f32], seq_len: usize) -> Vec<f32> {
+    let mut d_scores = vec![0.0f32; seq_len * seq_len];
+    for t in 0..seq_len {
+        let aw = &attn[t * seq_len..(t + 1) * seq_len];
+        let dw = &d_attn_w[t * seq_len..(t + 1) * seq_len];
+        // dot = sum(attn[t,s] * d_attn_w[t,s]) for s=0..=t
+        let mut dot = 0.0f32;
+        for s in 0..=t {
+            dot += aw[s] * dw[s];
+        }
+        for s in 0..=t {
+            d_scores[t * seq_len + s] = aw[s] * (dw[s] - dot);
+        }
+    }
+    d_scores
+}
+
+/// CUDA GQA Attention forward。
+///
+/// 各ヘッドの QK^T と attn×V を cuBLAS で実行。
+/// Causal softmax は CPU（要素演算のため軽量）。
+pub fn cuda_gqa_attention(
+    cuda: &CudaMatmul,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    output: &mut [f32],
+    attn_weights_out: &mut [f32],
+    config: &LlamaConfig,
+    seq_len: usize,
+) {
+    let num_heads = config.num_heads;
+    let num_kv_heads = config.num_kv_heads;
+    let head_dim = config.head_dim;
+    let kv_group_size = num_heads / num_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    for h in 0..num_heads {
+        let kv_h = h / kv_group_size;
+
+        let q_h = extract_head(q, h, num_heads, head_dim, seq_len);
+        let k_h = extract_head(k, kv_h, num_kv_heads, head_dim, seq_len);
+        let v_h = extract_head(v, kv_h, num_kv_heads, head_dim, seq_len);
+
+        // scores = Q_h × K_h^T: [seq_len, seq_len] — GPU matmul_bt
+        let mut scores = cuda.matmul_bt(&q_h, &k_h, seq_len, seq_len, head_dim);
+
+        // Scale
+        for s in &mut scores {
+            *s *= scale;
+        }
+
+        // Causal mask + softmax (CPU)
+        causal_softmax(&mut scores, seq_len);
+
+        // Store attn_weights
+        attn_weights_out[h * seq_len * seq_len..(h + 1) * seq_len * seq_len]
+            .copy_from_slice(&scores);
+
+        // output_h = scores × V_h: [seq_len, head_dim] — GPU matmul_nn
+        let out_h = cuda.matmul_nn(&scores, &v_h, seq_len, head_dim, seq_len);
+
+        // Scatter into output
+        scatter_head(&out_h, output, h, num_heads, head_dim, seq_len);
+    }
+}
+
+/// CUDA GQA Attention backward。
+///
+/// 各ヘッドの勾配計算を cuBLAS で実行。
+pub fn cuda_gqa_attention_backward(
+    cuda: &CudaMatmul,
+    d_attn_raw: &[f32],
+    attn_weights: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    d_q: &mut [f32],
+    d_k: &mut [f32],
+    d_v: &mut [f32],
+    config: &LlamaConfig,
+    seq_len: usize,
+) {
+    let num_heads = config.num_heads;
+    let num_kv_heads = config.num_kv_heads;
+    let head_dim = config.head_dim;
+    let kv_group_size = num_heads / num_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    for h in 0..num_heads {
+        let kv_h = h / kv_group_size;
+
+        let d_out_h = extract_head(d_attn_raw, h, num_heads, head_dim, seq_len);
+        let v_h = extract_head(v, kv_h, num_kv_heads, head_dim, seq_len);
+        let aw_h = &attn_weights[h * seq_len * seq_len..(h + 1) * seq_len * seq_len];
+
+        // d_attn_w = d_out_h × V_h^T: [seq_len, seq_len] — GPU matmul_bt
+        let d_attn_w = cuda.matmul_bt(&d_out_h, &v_h, seq_len, seq_len, head_dim);
+
+        // d_V_h = attn^T × d_out_h: [seq_len, head_dim] — GPU matmul_tn
+        let d_v_h = cuda.matmul_tn(aw_h, &d_out_h, seq_len, head_dim, seq_len);
+        accumulate_head(&d_v_h, d_v, kv_h, num_kv_heads, head_dim, seq_len);
+
+        // Softmax backward (CPU)
+        let mut d_scores = softmax_backward(&d_attn_w, aw_h, seq_len);
+        // Apply scale
+        for s in &mut d_scores {
+            *s *= scale;
+        }
+
+        // d_Q_h = d_scores × K_h: [seq_len, head_dim] — GPU matmul_nn
+        let k_h = extract_head(k, kv_h, num_kv_heads, head_dim, seq_len);
+        let d_q_h = cuda.matmul_nn(&d_scores, &k_h, seq_len, head_dim, seq_len);
+        scatter_head(&d_q_h, d_q, h, num_heads, head_dim, seq_len);
+
+        // d_K_h = d_scores^T × Q_h: [seq_len, head_dim] — GPU matmul_tn
+        let q_h = extract_head(q, h, num_heads, head_dim, seq_len);
+        let d_k_h = cuda.matmul_tn(&d_scores, &q_h, seq_len, head_dim, seq_len);
+        accumulate_head(&d_k_h, d_k, kv_h, num_kv_heads, head_dim, seq_len);
+    }
+}
 
 /// CUDA 加速版 Transformer レイヤー forward。
 ///
-/// QKV/O projection と SwiGLU FFN を cuBLAS sgemm で実行。
-/// RMSNorm, RoPE, GQA Attention は CPU（小規模なので十分高速）。
+/// QKV/O projection, GQA Attention, SwiGLU FFN を cuBLAS sgemm で実行。
+/// RMSNorm, RoPE は CPU。
 pub fn cuda_layer_forward(
     cuda: &CudaMatmul,
     input: &mut Vec<f32>,
@@ -279,10 +460,10 @@ pub fn cuda_layer_forward(
     apply_rope(&mut q, num_heads, head_dim, seq_len, config.rope_theta);
     apply_rope(&mut k, num_kv_heads, head_dim, seq_len, config.rope_theta);
 
-    // 4. GQA Attention (CPU)
+    // 4. GQA Attention (CUDA — per-head matmul)
     let mut attn_out_raw = vec![0.0f32; seq_len * num_heads * head_dim];
     let mut attn_weights = vec![0.0f32; num_heads * seq_len * seq_len];
-    gqa_attention(&q, &k, &v, &mut attn_out_raw, &mut attn_weights, config, seq_len);
+    cuda_gqa_attention(cuda, &q, &k, &v, &mut attn_out_raw, &mut attn_weights, config, seq_len);
 
     // 5. O projection (CUDA)
     let attn_out = cuda.matmul_bt(&attn_out_raw, &weights.o_proj, seq_len, hidden_dim, num_heads * head_dim);
@@ -442,58 +623,24 @@ pub fn cuda_layer_backward(
         hidden_dim,
     );
 
-    // 5. GQA Attention backward (CPU)
-    let kv_group_size = num_heads / num_kv_heads;
+    // 5. GQA Attention backward (CUDA — per-head matmul)
     let mut d_q = vec![0.0f32; seq_len * num_heads * head_dim];
     let mut d_k = vec![0.0f32; seq_len * num_kv_heads * head_dim];
     let mut d_v = vec![0.0f32; seq_len * num_kv_heads * head_dim];
 
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    for h in 0..num_heads {
-        let kv_h = h / kv_group_size;
-        for t in 0..seq_len {
-            // d_attn_weights from d_attn_raw and V
-            let mut d_attn_w = vec![0.0f32; seq_len];
-            for s in 0..=t {
-                let mut d_w = 0.0f32;
-                for d in 0..head_dim {
-                    let v_idx = s * num_kv_heads * head_dim + kv_h * head_dim + d;
-                    let do_idx = t * num_heads * head_dim + h * head_dim + d;
-                    d_w += d_attn_raw[do_idx] * cache.v[v_idx];
-                }
-                d_attn_w[s] = d_w;
-            }
-
-            // dV
-            for s in 0..=t {
-                let attn_w = cache.attn_weights[h * seq_len * seq_len + t * seq_len + s];
-                for d in 0..head_dim {
-                    let do_idx = t * num_heads * head_dim + h * head_dim + d;
-                    let v_idx = s * num_kv_heads * head_dim + kv_h * head_dim + d;
-                    d_v[v_idx] += attn_w * d_attn_raw[do_idx];
-                }
-            }
-
-            // Softmax backward: d_score = attn * (d_w - dot(attn, d_w))
-            let aw_off = h * seq_len * seq_len + t * seq_len;
-            let mut dot = 0.0f32;
-            for s in 0..=t {
-                dot += cache.attn_weights[aw_off + s] * d_attn_w[s];
-            }
-            for s in 0..=t {
-                let attn_w = cache.attn_weights[aw_off + s];
-                let d_score = attn_w * (d_attn_w[s] - dot) * scale;
-
-                // dQ += d_score * K[s]
-                for d in 0..head_dim {
-                    let q_idx = t * num_heads * head_dim + h * head_dim + d;
-                    let k_idx = s * num_kv_heads * head_dim + kv_h * head_dim + d;
-                    d_q[q_idx] += d_score * cache.k[k_idx];
-                    d_k[k_idx] += d_score * cache.q[q_idx];
-                }
-            }
-        }
-    }
+    cuda_gqa_attention_backward(
+        cuda,
+        &d_attn_raw,
+        &cache.attn_weights,
+        &cache.q,
+        &cache.k,
+        &cache.v,
+        &mut d_q,
+        &mut d_k,
+        &mut d_v,
+        config,
+        seq_len,
+    );
 
     // 6. RoPE backward (CPU — inverse rotation)
     crate::llama_backward::rope_backward(&mut d_q, num_heads, head_dim, seq_len, config.rope_theta);
@@ -522,24 +669,16 @@ pub fn cuda_layer_backward(
     }
 
     // O projection weight grad: o_proj[hidden×(heads*head_dim)] ← d_attn_output^T × attn_out_raw
-    // attn_out はcacheに保存されているが attn_out_raw (= o_proj適用前) は保存されていない
-    // cache.attn_out は o_proj 適用後なので、attn_out_raw を再計算する必要がある
-    // ただし RoPE 適用後の Q,K,V + attention weights から復元可能
-    // ここでは近似として cache の q,k,v,attn_weights から再計算
+    // attn_out_raw を attn_weights × V から再計算 (CUDA)
     let mut attn_out_raw = vec![0.0f32; seq_len * num_heads * head_dim];
-    let kv_group_size2 = num_heads / num_kv_heads;
-    for h in 0..num_heads {
-        let kv_h = h / kv_group_size2;
-        for t in 0..seq_len {
-            for d in 0..head_dim {
-                let mut val = 0.0f32;
-                for s in 0..=t {
-                    let aw = cache.attn_weights[h * seq_len * seq_len + t * seq_len + s];
-                    let v_idx = s * num_kv_heads * head_dim + kv_h * head_dim + d;
-                    val += aw * cache.v[v_idx];
-                }
-                attn_out_raw[t * num_heads * head_dim + h * head_dim + d] = val;
-            }
+    {
+        let kv_group_size2 = num_heads / num_kv_heads;
+        for h in 0..num_heads {
+            let kv_h = h / kv_group_size2;
+            let aw_h = &cache.attn_weights[h * seq_len * seq_len..(h + 1) * seq_len * seq_len];
+            let v_h = extract_head(&cache.v, kv_h, num_kv_heads, head_dim, seq_len);
+            let out_h = cuda.matmul_nn(aw_h, &v_h, seq_len, head_dim, seq_len);
+            scatter_head(&out_h, &mut attn_out_raw, h, num_heads, head_dim, seq_len);
         }
     }
     let d_o_proj = cuda.matmul_tn(
