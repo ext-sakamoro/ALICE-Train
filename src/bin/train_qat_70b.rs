@@ -507,7 +507,7 @@ fn main() {
 
         use alice_train::llama::LlamaLayerWeights;
         use alice_train::llama_backward::rmsnorm_backward_output;
-        use alice_train::llama_forward::{rmsnorm, LayerCache};
+        use alice_train::llama_forward::rmsnorm;
         use alice_train::cuda_matmul::{cuda_layer_forward, cuda_layer_backward};
         use alice_train::safetensors_loader::ShardedModel;
 
@@ -520,7 +520,7 @@ fn main() {
 
         // Embedding table (常駐 ~2GB)
         println!("  embedding 読み込み...");
-        let mut embedding_table = get_tensor("model.embed_tokens.weight").unwrap_or_else(|| {
+        let embedding_table = get_tensor("model.embed_tokens.weight").unwrap_or_else(|| {
             eprintln!("[ALICE-Train] embed_tokens.weight が見つかりません");
             std::process::exit(1);
         });
@@ -534,7 +534,7 @@ fn main() {
             eprintln!("[ALICE-Train] model.norm.weight が見つかりません");
             std::process::exit(1);
         });
-        let mut output_proj = get_tensor("lm_head.weight").unwrap_or_else(|| {
+        let output_proj = get_tensor("lm_head.weight").unwrap_or_else(|| {
             println!("    lm_head.weight なし — embed_tokens と共有");
             embedding_table.clone()
         });
@@ -657,7 +657,6 @@ fn main() {
 
         let accum_steps = config.gradient_accumulation_steps.max(1);
         let mut accum_loss = 0.0f32;
-        let mut accum_tokens = 0usize;
         let mut micro_step = 0usize;
 
         // ゼロアロケーション用ワークスペース（ループ外で1回だけ確保）
@@ -845,7 +844,6 @@ fn main() {
 
             // 勾配累積カウント
             accum_loss += avg_loss;
-            accum_tokens += token_count;
             micro_step += 1;
 
             // accumulation_steps に達したら global_step を進める
@@ -854,7 +852,6 @@ fn main() {
             }
             let accumulated_loss = accum_loss / accum_steps as f32;
             accum_loss = 0.0;
-            accum_tokens = 0;
             micro_step = 0;
 
             log.append(LogEntry::new(0, global_step, accumulated_loss, lr, 0.0));
@@ -1092,64 +1089,6 @@ impl LayerDeltaCache {
         }
     }
 
-    /// delta をレイヤー重みに加算（in-place）。
-    fn apply_to(&self, lw: &mut LlamaLayerWeights) {
-        add_vec(&mut lw.attn_norm, &self.attn_norm);
-        add_vec(&mut lw.q_proj, &self.q_proj);
-        add_vec(&mut lw.k_proj, &self.k_proj);
-        add_vec(&mut lw.v_proj, &self.v_proj);
-        add_vec(&mut lw.o_proj, &self.o_proj);
-        add_vec(&mut lw.ffn_norm, &self.ffn_norm);
-        add_vec(&mut lw.gate_proj, &self.gate_proj);
-        add_vec(&mut lw.up_proj, &self.up_proj);
-        add_vec(&mut lw.down_proj, &self.down_proj);
-        if let (Some(ref mut b), Some(ref d)) = (&mut lw.q_bias, &self.q_bias) {
-            add_vec(b, d);
-        }
-        if let (Some(ref mut b), Some(ref d)) = (&mut lw.k_bias, &self.k_bias) {
-            add_vec(b, d);
-        }
-        if let (Some(ref mut b), Some(ref d)) = (&mut lw.v_bias, &self.v_bias) {
-            add_vec(b, d);
-        }
-    }
-
-    /// base + delta を計算して新しい LlamaLayerWeights を生成（base を変更しない）。
-    /// clone() + apply_to() と同等だが、base の完全コピーを避けて fused 加算で構築。
-    fn build_merged(&self, base: &LlamaLayerWeights) -> LlamaLayerWeights {
-        use rayon::prelude::*;
-
-        let add_new = |b: &[f32], d: &[f32]| -> Vec<f32> {
-            b.par_iter().zip(d.par_iter()).map(|(&bi, &di)| bi + di).collect()
-        };
-        LlamaLayerWeights {
-            attn_norm: add_new(&base.attn_norm, &self.attn_norm),
-            q_proj: add_new(&base.q_proj, &self.q_proj),
-            k_proj: add_new(&base.k_proj, &self.k_proj),
-            v_proj: add_new(&base.v_proj, &self.v_proj),
-            o_proj: add_new(&base.o_proj, &self.o_proj),
-            q_bias: match (&base.q_bias, &self.q_bias) {
-                (Some(b), Some(d)) => Some(add_new(b, d)),
-                (Some(b), None) => Some(b.clone()),
-                _ => None,
-            },
-            k_bias: match (&base.k_bias, &self.k_bias) {
-                (Some(b), Some(d)) => Some(add_new(b, d)),
-                (Some(b), None) => Some(b.clone()),
-                _ => None,
-            },
-            v_bias: match (&base.v_bias, &self.v_bias) {
-                (Some(b), Some(d)) => Some(add_new(b, d)),
-                (Some(b), None) => Some(b.clone()),
-                _ => None,
-            },
-            ffn_norm: add_new(&base.ffn_norm, &self.ffn_norm),
-            gate_proj: add_new(&base.gate_proj, &self.gate_proj),
-            up_proj: add_new(&base.up_proj, &self.up_proj),
-            down_proj: add_new(&base.down_proj, &self.down_proj),
-        }
-    }
-
     /// 事前確保済みの workspace に base + delta を書き込み、同時に FakeQuantize を適用。
     /// アロケーションゼロで merge + quantize を 1 パスで実行。
     fn fused_merge_and_quantize(
@@ -1300,13 +1239,6 @@ impl LayerDeltaCache {
         if let Some(ref d) = self.q_bias { sv("q_bias", d); }
         if let Some(ref d) = self.k_bias { sv("k_bias", d); }
         if let Some(ref d) = self.v_bias { sv("v_bias", d); }
-    }
-}
-
-/// element-wise 加算ヘルパー
-fn add_vec(dst: &mut [f32], src: &[f32]) {
-    for (d, &s) in dst.iter_mut().zip(src.iter()) {
-        *d += s;
     }
 }
 
@@ -1501,176 +1433,6 @@ fn clip_grad(grad: &mut [f32], max_norm: f32) -> f32 {
         }
     }
     norm
-}
-
-/// レイヤーの勾配を delta ファイルにSGD更新で蓄積。
-fn apply_layer_grads_to_delta(
-    layer_idx: usize,
-    grads: &LayerWeightGrads,
-    lr: f32,
-    inv_tokens: f32,
-    weight_decay: f32,
-    checkpoint_dir: &str,
-) {
-    let names_and_grads: &[(&str, &[f32])] = &[
-        ("attn_norm", &grads.attn_norm),
-        ("q_proj", &grads.q_proj),
-        ("k_proj", &grads.k_proj),
-        ("v_proj", &grads.v_proj),
-        ("o_proj", &grads.o_proj),
-        ("ffn_norm", &grads.ffn_norm),
-        ("gate_proj", &grads.gate_proj),
-        ("up_proj", &grads.up_proj),
-        ("down_proj", &grads.down_proj),
-    ];
-
-    for &(name, grad) in names_and_grads {
-        // gradient norm clipping per weight tensor
-        let mut scaled_grad: Vec<f32> = grad.iter().map(|&g| g * inv_tokens).collect();
-        clip_grad(&mut scaled_grad, 1.0);
-
-        let mut delta = load_layer_delta(layer_idx, name, grad.len(), checkpoint_dir);
-        for j in 0..delta.len() {
-            delta[j] -= lr * (scaled_grad[j] + weight_decay * delta[j]);
-        }
-        save_layer_delta(layer_idx, name, &delta, checkpoint_dir);
-    }
-
-    // Bias 勾配（weight_decay なし）
-    let bias_names_and_grads: Vec<(&str, &[f32])> = [
-        ("q_bias", grads.q_bias.as_deref()),
-        ("k_bias", grads.k_bias.as_deref()),
-        ("v_bias", grads.v_bias.as_deref()),
-    ]
-    .iter()
-    .filter_map(|&(name, opt)| opt.map(|g| (name, g)))
-    .collect();
-
-    for (name, grad) in bias_names_and_grads {
-        let mut scaled_grad: Vec<f32> = grad.iter().map(|&g| g * inv_tokens).collect();
-        clip_grad(&mut scaled_grad, 1.0);
-
-        let mut delta = load_layer_delta(layer_idx, name, grad.len(), checkpoint_dir);
-        for j in 0..delta.len() {
-            delta[j] -= lr * scaled_grad[j]; // bias に weight_decay は適用しない
-        }
-        save_layer_delta(layer_idx, name, &delta, checkpoint_dir);
-    }
-}
-
-/// レイヤーの projection 重みに FakeQuantize を適用（attn_norm/ffn_norm はスキップ）。
-/// 戻り値: (total_mae, total_cosine_sim, num_weights) — 統計用
-fn fake_quantize_layer_weights(lw: &mut LlamaLayerWeights, fq: &mut FakeQuantize) -> (f64, f64, usize) {
-    let mut total_mae = 0.0f64;
-    let mut total_cos = 0.0f64;
-    let mut count = 0usize;
-
-    let proj_fields: Vec<&mut Vec<f32>> = vec![
-        &mut lw.q_proj,
-        &mut lw.k_proj,
-        &mut lw.v_proj,
-        &mut lw.o_proj,
-        &mut lw.gate_proj,
-        &mut lw.up_proj,
-        &mut lw.down_proj,
-    ];
-
-    for weights in proj_fields {
-        if weights.is_empty() {
-            continue;
-        }
-        fq.calibrate_scale(weights);
-        let mut quantized = vec![0.0f32; weights.len()];
-        fq.fake_quantize_forward(weights, &mut quantized);
-
-        // 統計: MAE + cosine similarity
-        let mut sum_err = 0.0f64;
-        let mut dot_wq = 0.0f64;
-        let mut dot_ww = 0.0f64;
-        let mut dot_qq = 0.0f64;
-        for i in 0..weights.len() {
-            let w = weights[i] as f64;
-            let q = quantized[i] as f64;
-            sum_err += (w - q).abs();
-            dot_wq += w * q;
-            dot_ww += w * w;
-            dot_qq += q * q;
-        }
-        let n = weights.len() as f64;
-        total_mae += sum_err / n;
-        let denom = (dot_ww * dot_qq).sqrt();
-        if denom > 1e-10 {
-            total_cos += dot_wq / denom;
-        }
-        count += 1;
-
-        // 量子化済み重みで上書き
-        weights.copy_from_slice(&quantized);
-    }
-
-    (total_mae, total_cos, count)
-}
-
-/// delta をレイヤー重みに適用（forward用）。
-fn apply_delta_to_weights(lw: &mut LlamaLayerWeights, layer_idx: usize, checkpoint_dir: &str) {
-    let fields: &mut [(&str, &mut Vec<f32>)] = &mut [
-        ("attn_norm", &mut lw.attn_norm),
-        ("q_proj", &mut lw.q_proj),
-        ("k_proj", &mut lw.k_proj),
-        ("v_proj", &mut lw.v_proj),
-        ("o_proj", &mut lw.o_proj),
-        ("ffn_norm", &mut lw.ffn_norm),
-        ("gate_proj", &mut lw.gate_proj),
-        ("up_proj", &mut lw.up_proj),
-        ("down_proj", &mut lw.down_proj),
-    ];
-    for (name, weight) in fields.iter_mut() {
-        let delta_path = format!("{}/delta_layer{layer_idx}_{name}.bin", checkpoint_dir);
-        if let Ok(data) = std::fs::read(&delta_path) {
-            if data.len() == weight.len() * 4 {
-                for i in 0..weight.len() {
-                    weight[i] += f32::from_le_bytes([data[i*4], data[i*4+1], data[i*4+2], data[i*4+3]]);
-                }
-            }
-        }
-    }
-
-    // Bias delta の適用
-    for (name, bias_opt) in [
-        ("q_bias", &mut lw.q_bias),
-        ("k_bias", &mut lw.k_bias),
-        ("v_bias", &mut lw.v_bias),
-    ] {
-        if let Some(ref mut bias) = bias_opt {
-            let delta_path = format!("{}/delta_layer{layer_idx}_{name}.bin", checkpoint_dir);
-            if let Ok(data) = std::fs::read(&delta_path) {
-                if data.len() == bias.len() * 4 {
-                    for i in 0..bias.len() {
-                        bias[i] += f32::from_le_bytes([data[i*4], data[i*4+1], data[i*4+2], data[i*4+3]]);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// グローバル重み（embedding / output_proj / output_norm）の勾配を delta ファイルに蓄積。
-fn apply_global_grads_to_delta(
-    name: &str,
-    grad: &[f32],
-    lr: f32,
-    inv_tokens: f32,
-    weight_decay: f32,
-    checkpoint_dir: &str,
-) {
-    let mut scaled_grad: Vec<f32> = grad.iter().map(|&g| g * inv_tokens).collect();
-    clip_grad(&mut scaled_grad, 1.0);
-
-    let mut delta = load_layer_delta(0, &format!("global_{name}"), grad.len(), checkpoint_dir);
-    for j in 0..delta.len() {
-        delta[j] -= lr * (scaled_grad[j] + weight_decay * delta[j]);
-    }
-    save_layer_delta(0, &format!("global_{name}"), &delta, checkpoint_dir);
 }
 
 /// グローバル delta をモデル重みに適用（起動時に呼ぶ）。
