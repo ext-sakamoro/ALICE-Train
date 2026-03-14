@@ -28,7 +28,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
-use alice_train::llama::QatTrainConfig;
+use alice_train::llama::{LlamaConfig, QatTrainConfig};
 use alice_train::{
     CheckpointData, CudaMatmul, DataLoader, DataLoaderConfig, FakeQuantize, LayerWeightGrads,
     LogEntry, LossScaler, LrScheduler, MixedPrecisionConfig, MmapDataset, OffloadConfig,
@@ -547,22 +547,45 @@ fn main() {
         let num_layers = config.model.num_layers;
 
         // delta 適用: output_norm（小さいので delta ファイル方式）
-        // embedding / output_proj は常駐メモリなので直接更新→チェックポイントで保存
         apply_global_delta(&mut output_norm, "output_norm", &config.checkpoint_dir);
+
+        // 全レイヤー重みをRAMにプリロード（safetensor I/O 排除）
+        println!("  全レイヤー重みをRAMにプリロード中...");
+        let mut base_weights: Vec<LlamaLayerWeights> = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            let lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
+                .unwrap_or_else(|| {
+                    eprintln!("[ALICE-Train] レイヤー {i} の重み読み込み失敗");
+                    std::process::exit(1);
+                });
+            base_weights.push(lw);
+        }
+        let layer_bytes = config.model.params_per_layer() * 4;
+        println!(
+            "    {} レイヤー読み込み完了 ({:.1} GB)",
+            num_layers,
+            (num_layers * layer_bytes) as f64 / 1024.0 / 1024.0 / 1024.0
+        );
+
+        // Delta をRAMにキャッシュ（ファイルI/O排除）
+        let mut delta_cache: Vec<LayerDeltaCache> = (0..num_layers)
+            .map(|i| LayerDeltaCache::load_from_disk(i, &config.model, &config.checkpoint_dir))
+            .collect();
+        println!("    delta キャッシュ初期化完了");
 
         // CUDA 初期化
         println!("  CUDA 初期化...");
         let cuda = CudaMatmul::new();
         println!("    CUDA ready: cuBLAS sgemm 初期化完了");
-        println!();
 
         // メモリ見積もり
-        let layer_bytes = config.model.params_per_layer() * 4;
+        let embed_mb = (embedding_table.len() + output_proj.len() + output_norm.len()) as f64 * 4.0 / 1024.0 / 1024.0;
+        let layers_mb = (num_layers * layer_bytes) as f64 / 1024.0 / 1024.0;
         println!();
-        println!("  メモリ見積もり (ストリーミング):");
-        println!("    embedding + output: {:.0} MB", (embedding_table.len() + output_proj.len() + output_norm.len()) as f64 * 4.0 / 1024.0 / 1024.0);
-        println!("    1レイヤー重み: {:.0} MB", layer_bytes as f64 / 1024.0 / 1024.0);
-        println!("    ピーク: embedding + output + 1 layer + activations");
+        println!("  メモリ見積もり (プリロード):");
+        println!("    embedding + output: {:.0} MB", embed_mb);
+        println!("    全レイヤー重み: {:.0} MB (RAM常駐)", layers_mb);
+        println!("    ピーク: embedding + output + all layers + activations");
         println!();
 
         // --- Phase 2 学習ループ ---
@@ -622,18 +645,10 @@ fn main() {
                 let mut layer_inputs: Vec<Vec<f32>> = Vec::with_capacity(num_layers);
                 for i in 0..num_layers {
                     layer_inputs.push(hidden.clone());
-                    let mut lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
-                        .unwrap_or_else(|| {
-                            eprintln!("[ALICE-Train] レイヤー {i} の重み読み込み失敗");
-                            std::process::exit(1);
-                        });
-                    // 学習済み delta を適用
-                    apply_delta_to_weights(&mut lw, i, &config.checkpoint_dir);
-                    // FakeQuantize: projection 重みを ternary に量子化
+                    let mut lw = base_weights[i].clone();
+                    delta_cache[i].apply_to(&mut lw);
                     fake_quantize_layer_weights(&mut lw, &mut fq);
-                    // forward のみ — cache は捨てる
                     let _cache = cuda_layer_forward(&cuda, &mut hidden, &lw, &config.model, seq_len);
-                    // lw + _cache はここで drop — メモリ解放
                 }
 
                 // Output RMSNorm + projection
@@ -702,21 +717,14 @@ fn main() {
                 // Backward: 逆順 — 勾配チェックポインティング + 重み更新
                 let mut d_layer_input = d_hidden;
                 for i in (0..num_layers).rev() {
-                    let mut lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
-                        .unwrap_or_else(|| {
-                            eprintln!("[ALICE-Train] レイヤー {i} backward: 重み読み込み失敗");
-                            std::process::exit(1);
-                        });
-                    apply_delta_to_weights(&mut lw, i, &config.checkpoint_dir);
-                    // FakeQuantize: forward と同じ量子化を適用して再計算
+                    let mut lw = base_weights[i].clone();
+                    delta_cache[i].apply_to(&mut lw);
                     let (mae, cos, cnt) = fake_quantize_layer_weights(&mut lw, &mut fq);
                     if i == 0 {
-                        // layer 0 の統計をステップログ用に記録
                         step_mae = mae / cnt.max(1) as f64;
                         step_cos = cos / cnt.max(1) as f64;
                     }
 
-                    // forward 再計算で cache を取得
                     let mut recompute_hidden = layer_inputs[i].clone();
                     let cache = cuda_layer_forward(&cuda, &mut recompute_hidden, &lw, &config.model, seq_len);
 
@@ -730,12 +738,8 @@ fn main() {
                     );
                     d_layer_input = d_input;
 
-                    // 重み更新: delta ファイルにSGDで蓄積
-                    apply_layer_grads_to_delta(
-                        i, &grads, effective_lr, inv_tokens, config.weight_decay,
-                        &config.checkpoint_dir,
-                    );
-                    // lw + cache + grads は drop — メモリ解放
+                    // 重み更新: delta RAMキャッシュにSGDで蓄積
+                    delta_cache[i].apply_grads(&grads, effective_lr, inv_tokens, config.weight_decay);
                 }
 
                 // Embedding: QAT では凍結（BitNet 標準 — embedding/lm_head は FP32 保持）
@@ -824,9 +828,8 @@ fn main() {
                             }
                         }
                         for i in 0..num_layers {
-                            let mut lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
-                                .unwrap_or_else(|| { std::process::exit(1); });
-                            apply_delta_to_weights(&mut lw, i, &config.checkpoint_dir);
+                            let mut lw = base_weights[i].clone();
+                            delta_cache[i].apply_to(&mut lw);
                             fake_quantize_layer_weights(&mut lw, &mut fq);
                             let _cache = cuda_layer_forward(&cuda, &mut hidden, &lw, &config.model, seq_len);
                         }
@@ -856,8 +859,12 @@ fn main() {
                 let _ = std::io::stdout().flush();
             }
 
-            // チェックポイント: step 番号 + delta 一覧を保存
+            // チェックポイント: step 番号 + delta 一覧を保存（delta をディスクにフラッシュ）
             if global_step > 0 && global_step % config.checkpoint_interval == 0 {
+                // Delta キャッシュをディスクにフラッシュ
+                for (i, dc) in delta_cache.iter().enumerate() {
+                    dc.save_to_disk(i, &config.checkpoint_dir);
+                }
                 let ckpt_path = format!("{}/step_{global_step}.bin", config.checkpoint_dir);
                 println!("  チェックポイント保存: {ckpt_path}");
                 let meta = alice_train::CheckpointMeta {
@@ -882,6 +889,11 @@ fn main() {
             }
 
             global_step += 1;
+        }
+
+        // 学習終了時に delta をディスクにフラッシュ
+        for (i, dc) in delta_cache.iter().enumerate() {
+            dc.save_to_disk(i, &config.checkpoint_dir);
         }
 
         let total_duration = train_start.elapsed();
@@ -914,7 +926,147 @@ fn main() {
     }
 }
 
-// ── Delta Weight 管理 ────────────────────────────────────────────────────
+// ── Delta Weight RAMキャッシュ ────────────────────────────────────────────
+
+/// レイヤー delta のRAMキャッシュ。ファイルI/Oを排除して高速化。
+struct LayerDeltaCache {
+    attn_norm: Vec<f32>,
+    q_proj: Vec<f32>,
+    k_proj: Vec<f32>,
+    v_proj: Vec<f32>,
+    o_proj: Vec<f32>,
+    ffn_norm: Vec<f32>,
+    gate_proj: Vec<f32>,
+    up_proj: Vec<f32>,
+    down_proj: Vec<f32>,
+    q_bias: Option<Vec<f32>>,
+    k_bias: Option<Vec<f32>>,
+    v_bias: Option<Vec<f32>>,
+}
+
+impl LayerDeltaCache {
+    /// ディスクから既存 delta を読み込む。存在しなければゼロ初期化。
+    fn load_from_disk(layer_idx: usize, config: &LlamaConfig, checkpoint_dir: &str) -> Self {
+        let hidden = config.hidden_dim;
+        let num_heads = config.num_heads;
+        let num_kv_heads = config.num_kv_heads;
+        let head_dim = config.head_dim;
+        let inter = config.intermediate_dim;
+
+        let ld = |name: &str, size: usize| load_layer_delta(layer_idx, name, size, checkpoint_dir);
+
+        let q_bias = if config.attention_bias {
+            Some(ld("q_bias", num_heads * head_dim))
+        } else {
+            None
+        };
+        let k_bias = if config.attention_bias {
+            Some(ld("k_bias", num_kv_heads * head_dim))
+        } else {
+            None
+        };
+        let v_bias = if config.attention_bias {
+            Some(ld("v_bias", num_kv_heads * head_dim))
+        } else {
+            None
+        };
+
+        Self {
+            attn_norm: ld("attn_norm", hidden),
+            q_proj: ld("q_proj", num_heads * head_dim * hidden),
+            k_proj: ld("k_proj", num_kv_heads * head_dim * hidden),
+            v_proj: ld("v_proj", num_kv_heads * head_dim * hidden),
+            o_proj: ld("o_proj", hidden * num_heads * head_dim),
+            ffn_norm: ld("ffn_norm", hidden),
+            gate_proj: ld("gate_proj", inter * hidden),
+            up_proj: ld("up_proj", inter * hidden),
+            down_proj: ld("down_proj", hidden * inter),
+            q_bias,
+            k_bias,
+            v_bias,
+        }
+    }
+
+    /// delta をレイヤー重みに加算（in-place）。
+    fn apply_to(&self, lw: &mut LlamaLayerWeights) {
+        add_vec(&mut lw.attn_norm, &self.attn_norm);
+        add_vec(&mut lw.q_proj, &self.q_proj);
+        add_vec(&mut lw.k_proj, &self.k_proj);
+        add_vec(&mut lw.v_proj, &self.v_proj);
+        add_vec(&mut lw.o_proj, &self.o_proj);
+        add_vec(&mut lw.ffn_norm, &self.ffn_norm);
+        add_vec(&mut lw.gate_proj, &self.gate_proj);
+        add_vec(&mut lw.up_proj, &self.up_proj);
+        add_vec(&mut lw.down_proj, &self.down_proj);
+        if let (Some(ref mut b), Some(ref d)) = (&mut lw.q_bias, &self.q_bias) {
+            add_vec(b, d);
+        }
+        if let (Some(ref mut b), Some(ref d)) = (&mut lw.k_bias, &self.k_bias) {
+            add_vec(b, d);
+        }
+        if let (Some(ref mut b), Some(ref d)) = (&mut lw.v_bias, &self.v_bias) {
+            add_vec(b, d);
+        }
+    }
+
+    /// 勾配からSGD更新を delta キャッシュに適用。
+    fn apply_grads(&mut self, grads: &LayerWeightGrads, lr: f32, inv_tokens: f32, weight_decay: f32) {
+        let update = |delta: &mut Vec<f32>, grad: &[f32], wd: f32| {
+            let mut scaled: Vec<f32> = grad.iter().map(|&g| g * inv_tokens).collect();
+            clip_grad(&mut scaled, 1.0);
+            for j in 0..delta.len() {
+                delta[j] -= lr * (scaled[j] + wd * delta[j]);
+            }
+        };
+
+        update(&mut self.attn_norm, &grads.attn_norm, weight_decay);
+        update(&mut self.q_proj, &grads.q_proj, weight_decay);
+        update(&mut self.k_proj, &grads.k_proj, weight_decay);
+        update(&mut self.v_proj, &grads.v_proj, weight_decay);
+        update(&mut self.o_proj, &grads.o_proj, weight_decay);
+        update(&mut self.ffn_norm, &grads.ffn_norm, weight_decay);
+        update(&mut self.gate_proj, &grads.gate_proj, weight_decay);
+        update(&mut self.up_proj, &grads.up_proj, weight_decay);
+        update(&mut self.down_proj, &grads.down_proj, weight_decay);
+
+        // Bias: weight_decay なし
+        if let (Some(ref mut d), Some(ref g)) = (&mut self.q_bias, &grads.q_bias) {
+            update(d, g, 0.0);
+        }
+        if let (Some(ref mut d), Some(ref g)) = (&mut self.k_bias, &grads.k_bias) {
+            update(d, g, 0.0);
+        }
+        if let (Some(ref mut d), Some(ref g)) = (&mut self.v_bias, &grads.v_bias) {
+            update(d, g, 0.0);
+        }
+    }
+
+    /// delta をディスクに保存。
+    fn save_to_disk(&self, layer_idx: usize, checkpoint_dir: &str) {
+        let sv = |name: &str, data: &[f32]| save_layer_delta(layer_idx, name, data, checkpoint_dir);
+        sv("attn_norm", &self.attn_norm);
+        sv("q_proj", &self.q_proj);
+        sv("k_proj", &self.k_proj);
+        sv("v_proj", &self.v_proj);
+        sv("o_proj", &self.o_proj);
+        sv("ffn_norm", &self.ffn_norm);
+        sv("gate_proj", &self.gate_proj);
+        sv("up_proj", &self.up_proj);
+        sv("down_proj", &self.down_proj);
+        if let Some(ref d) = self.q_bias { sv("q_bias", d); }
+        if let Some(ref d) = self.k_bias { sv("k_bias", d); }
+        if let Some(ref d) = self.v_bias { sv("v_bias", d); }
+    }
+}
+
+/// element-wise 加算ヘルパー
+fn add_vec(dst: &mut [f32], src: &[f32]) {
+    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+        *d += s;
+    }
+}
+
+// ── Delta Weight ファイルI/O ────────────────────────────────────────────
 use alice_train::llama::LlamaLayerWeights;
 
 /// レイヤーiの重み delta をファイルから読み込む。存在しなければゼロ初期化。
