@@ -205,7 +205,7 @@ fn main() {
     // --- コンポーネント初期化 ---
     println!("━━━ コンポーネント初期化 ━━━");
 
-    let _fq = FakeQuantize::new(QatConfig::ternary());
+    let mut fq = FakeQuantize::new(QatConfig::ternary());
     let scheduler = WarmupCosineScheduler::new(
         config.learning_rate,
         config.min_lr,
@@ -245,7 +245,7 @@ fn main() {
         }
     }
 
-    println!("  FakeQuantize: 初期化完了");
+    println!("  FakeQuantize: 初期化完了 (Ternary 1.58-bit, STE backward)");
     println!(
         "  Scheduler: warmup {}/{} steps",
         config.warmup_steps, config.total_steps
@@ -562,6 +562,8 @@ fn main() {
             let seq_len = config.seq_len;
             let mut total_loss = 0.0f32;
             let mut token_count = 0usize;
+            let mut step_mae = 0.0f64;
+            let mut step_cos = 0.0f64;
 
             for b in 0..batch.actual_batch_size {
                 let token_ids: Vec<u32> = batch.input_ids[b * seq_len..(b + 1) * seq_len].to_vec();
@@ -589,6 +591,8 @@ fn main() {
                         });
                     // 学習済み delta を適用
                     apply_delta_to_weights(&mut lw, i, &config.checkpoint_dir);
+                    // FakeQuantize: projection 重みを ternary に量子化
+                    fake_quantize_layer_weights(&mut lw, &mut fq);
                     // forward のみ — cache は捨てる
                     let _cache = cuda_layer_forward(&cuda, &mut hidden, &lw, &config.model, seq_len);
                     // lw + _cache はここで drop — メモリ解放
@@ -664,6 +668,13 @@ fn main() {
                             std::process::exit(1);
                         });
                     apply_delta_to_weights(&mut lw, i, &config.checkpoint_dir);
+                    // FakeQuantize: forward と同じ量子化を適用して再計算
+                    let (mae, cos, cnt) = fake_quantize_layer_weights(&mut lw, &mut fq);
+                    if i == 0 {
+                        // layer 0 の統計をステップログ用に記録
+                        step_mae = mae / cnt.max(1) as f64;
+                        step_cos = cos / cnt.max(1) as f64;
+                    }
 
                     // forward 再計算で cache を取得
                     let mut recompute_hidden = layer_inputs[i].clone();
@@ -726,6 +737,7 @@ fn main() {
                 };
                 println!(
                     "  step {global_step:>5}/{} | loss: {avg_loss:.4} | lr: {lr:.2e} | \
+                     qat_mae: {step_mae:.4} | cos: {step_cos:.4} | \
                      {:.1}ms/step | {steps_per_sec:.1} steps/s | ETA: {eta_secs:.0}s",
                     config.total_steps,
                     step_duration.as_secs_f64() * 1000.0,
@@ -849,6 +861,59 @@ fn apply_layer_grads_to_delta(
         }
         save_layer_delta(layer_idx, name, &delta, checkpoint_dir);
     }
+}
+
+/// レイヤーの projection 重みに FakeQuantize を適用（attn_norm/ffn_norm はスキップ）。
+/// 戻り値: (total_mae, total_cosine_sim, num_weights) — 統計用
+fn fake_quantize_layer_weights(lw: &mut LlamaLayerWeights, fq: &mut FakeQuantize) -> (f64, f64, usize) {
+    let mut total_mae = 0.0f64;
+    let mut total_cos = 0.0f64;
+    let mut count = 0usize;
+
+    let proj_fields: Vec<&mut Vec<f32>> = vec![
+        &mut lw.q_proj,
+        &mut lw.k_proj,
+        &mut lw.v_proj,
+        &mut lw.o_proj,
+        &mut lw.gate_proj,
+        &mut lw.up_proj,
+        &mut lw.down_proj,
+    ];
+
+    for weights in proj_fields {
+        if weights.is_empty() {
+            continue;
+        }
+        fq.calibrate_scale(weights);
+        let mut quantized = vec![0.0f32; weights.len()];
+        fq.fake_quantize_forward(weights, &mut quantized);
+
+        // 統計: MAE + cosine similarity
+        let mut sum_err = 0.0f64;
+        let mut dot_wq = 0.0f64;
+        let mut dot_ww = 0.0f64;
+        let mut dot_qq = 0.0f64;
+        for i in 0..weights.len() {
+            let w = weights[i] as f64;
+            let q = quantized[i] as f64;
+            sum_err += (w - q).abs();
+            dot_wq += w * q;
+            dot_ww += w * w;
+            dot_qq += q * q;
+        }
+        let n = weights.len() as f64;
+        total_mae += sum_err / n;
+        let denom = (dot_ww * dot_qq).sqrt();
+        if denom > 1e-10 {
+            total_cos += dot_wq / denom;
+        }
+        count += 1;
+
+        // 量子化済み重みで上書き
+        weights.copy_from_slice(&quantized);
+    }
+
+    (total_mae, total_cos, count)
 }
 
 /// delta をレイヤー重みに適用（forward用）。
