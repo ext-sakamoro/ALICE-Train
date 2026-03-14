@@ -351,6 +351,20 @@ pub struct QatTrainConfig {
     pub use_bf16: bool,
     /// レジュームするチェックポイントパス (None = 最初から)
     pub resume_from: Option<String>,
+    /// 全レイヤーを RAM にプリロードするか。
+    /// true: 全レイヤーを FP32 で RAM に保持（高速だが RAM 大量消費）。
+    /// false: mmap 経由で必要時にロード（70B 等の巨大モデル向け）。
+    #[serde(default = "default_preload")]
+    pub preload_all_layers: bool,
+    /// delta を BF16 で圧縮保持するか。
+    /// true: RAM 使用量を半減（70B: 272 GB → 136 GB）。精度は微減。
+    /// false: FP32 で保持（デフォルト）。
+    #[serde(default)]
+    pub bf16_delta: bool,
+}
+
+fn default_preload() -> bool {
+    true
 }
 
 impl Default for QatTrainConfig {
@@ -374,6 +388,8 @@ impl Default for QatTrainConfig {
             max_grad_norm: 1.0,
             use_bf16: true,
             resume_from: None,
+            preload_all_layers: true,
+            bf16_delta: false,
         }
     }
 }

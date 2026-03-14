@@ -141,6 +141,24 @@ case "$TARGET" in
     8b)
         run_qat "llama-8b" "configs/qat_8b_full.json" "models/meta-llama--Llama-3.1-8B-Instruct"
         ;;
+    70b)
+        echo "━━━ 70B QAT (mmap + BF16 delta モード) ━━━"
+        echo "  必要: GPU ≥ 40GB VRAM, RAM ≥ 200GB"
+        echo "  推奨: RunPod 2×A100 SXM 80GB (251GB RAM)"
+        echo ""
+        # RAM チェック
+        total_ram_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+        if [ -n "$total_ram_kb" ]; then
+            total_ram_gb=$((total_ram_kb / 1024 / 1024))
+            echo "  検出 RAM: ${total_ram_gb} GB"
+            if [ "$total_ram_gb" -lt 180 ]; then
+                echo "  警告: RAM が 180GB 未満です。OOM の可能性があります。"
+                echo "  続行しますか？ (Ctrl+C で中止)"
+                sleep 5
+            fi
+        fi
+        run_qat "llama-70b" "configs/qat_70b.json" "models/meta-llama--Llama-3-70B-Instruct"
+        ;;
     all)
         echo "全モデル順次実行: 1B → 3B → Qwen 7B → 8B"
         echo ""
@@ -150,13 +168,14 @@ case "$TARGET" in
         run_qat "llama-8b" "configs/qat_8b_full.json" "models/meta-llama--Llama-3.1-8B-Instruct"
         ;;
     *)
-        echo "使用法: $0 [1b|3b|qwen|8b|all]"
+        echo "使用法: $0 [1b|3b|qwen|8b|70b|all]"
         echo ""
         echo "  1b    — Llama-3.2 1B (reCamera 向け)"
         echo "  3b    — Llama-3.2 3B (reCamera 向け)"
         echo "  qwen  — Qwen2.5 7B (5B クラス)"
         echo "  8b    — Llama-3.1 8B full (RPi 5 向け)"
-        echo "  all   — 全モデル順次実行"
+        echo "  70b   — Llama-3 70B (要 200GB+ RAM)"
+        echo "  all   — 全モデル順次実行 (70B 除く)"
         exit 1
         ;;
 esac

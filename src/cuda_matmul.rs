@@ -11,12 +11,24 @@
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+use rayon::prelude::*;
 use std::sync::Arc;
+
+use std::cell::RefCell;
+
+/// GPU バッファ（1つ分）。自動拡張対応。
+struct GpuBuf {
+    buf: CudaSlice<f32>,
+    cap: usize,
+}
 
 /// CUDA matmul エンジン。
 pub struct CudaMatmul {
     stream: Arc<CudaStream>,
     blas: CudaBlas,
+    buf_a: RefCell<GpuBuf>,
+    buf_b: RefCell<GpuBuf>,
+    buf_c: RefCell<GpuBuf>,
 }
 
 impl CudaMatmul {
@@ -26,7 +38,28 @@ impl CudaMatmul {
         let ctx = CudaContext::new(0).expect("CUDA device 0 の初期化に失敗");
         let stream = ctx.default_stream();
         let blas = CudaBlas::new(stream.clone()).expect("cuBLAS 初期化に失敗");
-        Self { stream, blas }
+        // 初期バッファ: 16M 要素 (~64MB) — 必要に応じて自動拡張
+        let init_cap = 16 * 1024 * 1024;
+        let ba = GpuBuf { buf: stream.alloc_zeros(init_cap).expect("GPU buf_a 確保失敗"), cap: init_cap };
+        let bb = GpuBuf { buf: stream.alloc_zeros(init_cap).expect("GPU buf_b 確保失敗"), cap: init_cap };
+        let bc = GpuBuf { buf: stream.alloc_zeros(init_cap).expect("GPU buf_c 確保失敗"), cap: init_cap };
+        Self {
+            stream,
+            blas,
+            buf_a: RefCell::new(ba),
+            buf_b: RefCell::new(bb),
+            buf_c: RefCell::new(bc),
+        }
+    }
+
+    /// バッファを必要サイズに拡張。
+    fn ensure_buf(stream: &Arc<CudaStream>, buf: &RefCell<GpuBuf>, need: usize) {
+        let mut b = buf.borrow_mut();
+        if need > b.cap {
+            let new_cap = need.next_power_of_two();
+            b.buf = stream.alloc_zeros(new_cap).expect("GPU バッファ拡張失敗");
+            b.cap = new_cap;
+        }
     }
 
     /// C\[m×n\] = A\[m×k\] × B\[n×k\]^T  (row-major)
@@ -35,9 +68,19 @@ impl CudaMatmul {
     /// B_rm\[n×k\] → B_cm\[k×n\] (ld=k). Transpose → B\[n×k\]. transa=T, lda=k.
     /// A_rm\[m×k\] → A_cm\[k×m\] (ld=k). No transpose → A^T\[k×m\]. transb=N, ldb=k.
     pub fn matmul_bt(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
-        let d_a = self.stream.clone_htod(a).expect("A→GPU 転送失敗");
-        let d_b = self.stream.clone_htod(b).expect("B→GPU 転送失敗");
-        let mut d_c: CudaSlice<f32> = self.stream.alloc_zeros(m * n).expect("C 確保失敗");
+        Self::ensure_buf(&self.stream, &self.buf_a, m * k);
+        Self::ensure_buf(&self.stream, &self.buf_b, n * k);
+        Self::ensure_buf(&self.stream, &self.buf_c, m * n);
+
+        // H2D 転送
+        {
+            let mut ba = self.buf_a.borrow_mut();
+            self.stream.memcpy_htod(a, &mut ba.buf.slice_mut(..m * k)).expect("A→GPU 転送失敗");
+        }
+        {
+            let mut bb = self.buf_b.borrow_mut();
+            self.stream.memcpy_htod(b, &mut bb.buf.slice_mut(..n * k)).expect("B→GPU 転送失敗");
+        }
 
         let cfg = GemmConfig {
             transa: cublasOperation_t::CUBLAS_OP_T,
@@ -52,15 +95,22 @@ impl CudaMatmul {
             ldc: n as i32,
         };
 
-        unsafe {
-            self.blas
-                .gemm(cfg, &d_b, &d_a, &mut d_c)
-                .expect("cuBLAS sgemm (matmul_bt) 失敗");
+        // gemm: 3つの RefCell を同時に borrow
+        {
+            let ba = self.buf_a.borrow();
+            let bb = self.buf_b.borrow();
+            let mut bc = self.buf_c.borrow_mut();
+            unsafe {
+                self.blas
+                    .gemm(cfg, &bb.buf.slice(..n * k), &ba.buf.slice(..m * k), &mut bc.buf.slice_mut(..m * n))
+                    .expect("cuBLAS sgemm (matmul_bt) 失敗");
+            }
         }
 
         let mut result = vec![0.0f32; m * n];
+        let bc = self.buf_c.borrow();
         self.stream
-            .memcpy_dtoh(&d_c, &mut result)
+            .memcpy_dtoh(&bc.buf.slice(..m * n), &mut result)
             .expect("GPU→CPU 転送失敗");
         result
     }
@@ -71,9 +121,18 @@ impl CudaMatmul {
     /// B_rm\[k×n\] → B_cm\[n×k\] (ld=n). No transpose. transa=N, lda=n.
     /// A_rm\[m×k\] → A_cm\[k×m\] (ld=k). No transpose. transb=N, ldb=k.
     pub fn matmul_nn(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
-        let d_a = self.stream.clone_htod(a).expect("A→GPU 転送失敗");
-        let d_b = self.stream.clone_htod(b).expect("B→GPU 転送失敗");
-        let mut d_c: CudaSlice<f32> = self.stream.alloc_zeros(m * n).expect("C 確保失敗");
+        Self::ensure_buf(&self.stream, &self.buf_a, m * k);
+        Self::ensure_buf(&self.stream, &self.buf_b, k * n);
+        Self::ensure_buf(&self.stream, &self.buf_c, m * n);
+
+        {
+            let mut ba = self.buf_a.borrow_mut();
+            self.stream.memcpy_htod(a, &mut ba.buf.slice_mut(..m * k)).expect("A→GPU 転送失敗");
+        }
+        {
+            let mut bb = self.buf_b.borrow_mut();
+            self.stream.memcpy_htod(b, &mut bb.buf.slice_mut(..k * n)).expect("B→GPU 転送失敗");
+        }
 
         let cfg = GemmConfig {
             transa: cublasOperation_t::CUBLAS_OP_N,
@@ -88,17 +147,129 @@ impl CudaMatmul {
             ldc: n as i32,
         };
 
-        unsafe {
-            self.blas
-                .gemm(cfg, &d_b, &d_a, &mut d_c)
-                .expect("cuBLAS sgemm (matmul_nn) 失敗");
+        {
+            let ba = self.buf_a.borrow();
+            let bb = self.buf_b.borrow();
+            let mut bc = self.buf_c.borrow_mut();
+            unsafe {
+                self.blas
+                    .gemm(cfg, &bb.buf.slice(..k * n), &ba.buf.slice(..m * k), &mut bc.buf.slice_mut(..m * n))
+                    .expect("cuBLAS sgemm (matmul_nn) 失敗");
+            }
         }
 
         let mut result = vec![0.0f32; m * n];
+        let bc = self.buf_c.borrow();
         self.stream
-            .memcpy_dtoh(&d_c, &mut result)
+            .memcpy_dtoh(&bc.buf.slice(..m * n), &mut result)
             .expect("GPU→CPU 転送失敗");
         result
+    }
+
+    /// C\[m×n\] = A\[m×k\] × B\[n×k\]^T — アロケーションレス版。
+    /// 出力バッファ `c_out` を呼び出し側から受け取る。
+    pub fn matmul_bt_inplace(&self, a: &[f32], b: &[f32], c_out: &mut [f32], m: usize, n: usize, k: usize) {
+        Self::ensure_buf(&self.stream, &self.buf_a, m * k);
+        Self::ensure_buf(&self.stream, &self.buf_b, n * k);
+        Self::ensure_buf(&self.stream, &self.buf_c, m * n);
+
+        {
+            let mut ba = self.buf_a.borrow_mut();
+            self.stream.memcpy_htod(a, &mut ba.buf.slice_mut(..m * k)).expect("H2D a");
+        }
+        {
+            let mut bb = self.buf_b.borrow_mut();
+            self.stream.memcpy_htod(b, &mut bb.buf.slice_mut(..n * k)).expect("H2D b");
+        }
+
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_T,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32, n: m as i32, k: k as i32,
+            alpha: 1.0f32, lda: k as i32, ldb: k as i32, beta: 0.0f32, ldc: n as i32,
+        };
+
+        {
+            let ba = self.buf_a.borrow();
+            let bb = self.buf_b.borrow();
+            let mut bc = self.buf_c.borrow_mut();
+            unsafe {
+                self.blas.gemm(cfg, &bb.buf.slice(..n * k), &ba.buf.slice(..m * k), &mut bc.buf.slice_mut(..m * n)).unwrap();
+            }
+        }
+
+        let bc = self.buf_c.borrow();
+        self.stream.memcpy_dtoh(&bc.buf.slice(..m * n), c_out).expect("D2H c");
+    }
+
+    /// C\[m×n\] = A\[m×k\] × B\[k×n\] — アロケーションレス版。
+    pub fn matmul_nn_inplace(&self, a: &[f32], b: &[f32], c_out: &mut [f32], m: usize, n: usize, k: usize) {
+        Self::ensure_buf(&self.stream, &self.buf_a, m * k);
+        Self::ensure_buf(&self.stream, &self.buf_b, k * n);
+        Self::ensure_buf(&self.stream, &self.buf_c, m * n);
+
+        {
+            let mut ba = self.buf_a.borrow_mut();
+            self.stream.memcpy_htod(a, &mut ba.buf.slice_mut(..m * k)).expect("H2D a");
+        }
+        {
+            let mut bb = self.buf_b.borrow_mut();
+            self.stream.memcpy_htod(b, &mut bb.buf.slice_mut(..k * n)).expect("H2D b");
+        }
+
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_N,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32, n: m as i32, k: k as i32,
+            alpha: 1.0f32, lda: n as i32, ldb: k as i32, beta: 0.0f32, ldc: n as i32,
+        };
+
+        {
+            let ba = self.buf_a.borrow();
+            let bb = self.buf_b.borrow();
+            let mut bc = self.buf_c.borrow_mut();
+            unsafe {
+                self.blas.gemm(cfg, &bb.buf.slice(..k * n), &ba.buf.slice(..m * k), &mut bc.buf.slice_mut(..m * n)).unwrap();
+            }
+        }
+
+        let bc = self.buf_c.borrow();
+        self.stream.memcpy_dtoh(&bc.buf.slice(..m * n), c_out).expect("D2H c");
+    }
+
+    /// C\[k×n\] = A\[m×k\]^T × B\[m×n\] — アロケーションレス版。
+    pub fn matmul_tn_inplace(&self, a: &[f32], b: &[f32], c_out: &mut [f32], m: usize, n: usize, k: usize) {
+        Self::ensure_buf(&self.stream, &self.buf_a, m * k);
+        Self::ensure_buf(&self.stream, &self.buf_b, m * n);
+        Self::ensure_buf(&self.stream, &self.buf_c, k * n);
+
+        {
+            let mut ba = self.buf_a.borrow_mut();
+            self.stream.memcpy_htod(a, &mut ba.buf.slice_mut(..m * k)).expect("H2D a");
+        }
+        {
+            let mut bb = self.buf_b.borrow_mut();
+            self.stream.memcpy_htod(b, &mut bb.buf.slice_mut(..m * n)).expect("H2D b");
+        }
+
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_N,
+            transb: cublasOperation_t::CUBLAS_OP_T,
+            m: n as i32, n: k as i32, k: m as i32,
+            alpha: 1.0f32, lda: n as i32, ldb: k as i32, beta: 0.0f32, ldc: n as i32,
+        };
+
+        {
+            let ba = self.buf_a.borrow();
+            let bb = self.buf_b.borrow();
+            let mut bc = self.buf_c.borrow_mut();
+            unsafe {
+                self.blas.gemm(cfg, &bb.buf.slice(..m * n), &ba.buf.slice(..m * k), &mut bc.buf.slice_mut(..k * n)).unwrap();
+            }
+        }
+
+        let bc = self.buf_c.borrow();
+        self.stream.memcpy_dtoh(&bc.buf.slice(..k * n), c_out).expect("D2H c");
     }
 
     /// SwiGLU FFN を CUDA で実行。
@@ -121,15 +292,18 @@ impl CudaMatmul {
         let gate = self.matmul_bt(input, gate_proj, seq_len, intermediate_dim, hidden_dim);
         let up = self.matmul_bt(input, up_proj, seq_len, intermediate_dim, hidden_dim);
 
-        // SiLU(gate) ⊙ up (CPU)
+        // SiLU(gate) ⊙ up (CPU — rayon 並列)
         let total = seq_len * intermediate_dim;
         let mut gate_silu = vec![0.0f32; total];
         let mut intermediate = vec![0.0f32; total];
-        for i in 0..total {
-            let x = gate[i];
-            gate_silu[i] = x / (1.0 + (-x).exp());
-            intermediate[i] = gate_silu[i] * up[i];
-        }
+        gate_silu.par_iter_mut()
+            .zip(intermediate.par_iter_mut())
+            .zip(gate.par_iter().zip(up.par_iter()))
+            .for_each(|((gs, im), (&g, &u))| {
+                let s = g / (1.0 + (-g).exp());
+                *gs = s;
+                *im = s * u;
+            });
 
         let output = self.matmul_bt(&intermediate, down_proj, seq_len, hidden_dim, intermediate_dim);
         (output, gate, up, gate_silu)
@@ -143,13 +317,20 @@ impl CudaMatmul {
     /// A_rm[m×k] → A_cm[k×m] (ld=k). transb=T → [m×k], ldb=k.
     pub fn matmul_tn(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
         // A is [m×k], B is [m×n], output C is [k×n]
-        let d_a = self.stream.clone_htod(a).expect("A→GPU 転送失敗");
-        let d_b = self.stream.clone_htod(b).expect("B→GPU 転送失敗");
-        let mut d_c: CudaSlice<f32> = self.stream.alloc_zeros(k * n).expect("C 確保失敗");
+        Self::ensure_buf(&self.stream, &self.buf_a, m * k);
+        Self::ensure_buf(&self.stream, &self.buf_b, m * n);
+        Self::ensure_buf(&self.stream, &self.buf_c, k * n);
+
+        {
+            let mut ba = self.buf_a.borrow_mut();
+            self.stream.memcpy_htod(a, &mut ba.buf.slice_mut(..m * k)).expect("A→GPU 転送失敗");
+        }
+        {
+            let mut bb = self.buf_b.borrow_mut();
+            self.stream.memcpy_htod(b, &mut bb.buf.slice_mut(..m * n)).expect("B→GPU 転送失敗");
+        }
 
         // C_cm[n×k] = B_cm[n×m] × trans(A_cm[k×m])
-        // B_rm[m×n] → B_cm[n×m] (ld=n) → transa=N, lda=n
-        // A_rm[m×k] → A_cm[k×m] (ld=k) → transb=T, ldb=k
         let cfg = GemmConfig {
             transa: cublasOperation_t::CUBLAS_OP_N,
             transb: cublasOperation_t::CUBLAS_OP_T,
@@ -163,16 +344,22 @@ impl CudaMatmul {
             ldc: n as i32,
         };
 
-        unsafe {
-            self.blas
-                .gemm(cfg, &d_b, &d_a, &mut d_c)
-                .expect("cuBLAS sgemm (matmul_tn) 失敗");
+        {
+            let ba = self.buf_a.borrow();
+            let bb = self.buf_b.borrow();
+            let mut bc = self.buf_c.borrow_mut();
+            unsafe {
+                self.blas
+                    .gemm(cfg, &bb.buf.slice(..m * n), &ba.buf.slice(..m * k), &mut bc.buf.slice_mut(..k * n))
+                    .expect("cuBLAS sgemm (matmul_tn) 失敗");
+            }
         }
 
         // Result is C^T in col-major = C[k×n] in row-major
         let mut result = vec![0.0f32; k * n];
+        let bc = self.buf_c.borrow();
         self.stream
-            .memcpy_dtoh(&d_c, &mut result)
+            .memcpy_dtoh(&bc.buf.slice(..k * n), &mut result)
             .expect("GPU→CPU 転送失敗");
         result
     }
@@ -556,18 +743,21 @@ pub fn cuda_layer_backward(
     let d_intermediate =
         cuda.matmul_nn(d_output, &weights.down_proj, seq_len, intermediate_dim, hidden_dim);
 
-    // SwiGLU elementwise backward (CPU)
+    // SwiGLU elementwise backward (CPU — rayon 並列)
     let total = seq_len * intermediate_dim;
     let mut d_gate = vec![0.0f32; total];
     let mut d_up = vec![0.0f32; total];
-    for idx in 0..total {
-        let d_gate_silu = d_intermediate[idx] * cache.up[idx];
-        d_up[idx] = d_intermediate[idx] * cache.gate_silu[idx];
-        let x = cache.gate[idx];
-        let sig = 1.0 / (1.0 + (-x).exp());
-        let silu_grad = sig * (1.0 + x * (1.0 - sig));
-        d_gate[idx] = d_gate_silu * silu_grad;
-    }
+    d_gate.par_iter_mut()
+        .zip(d_up.par_iter_mut())
+        .enumerate()
+        .for_each(|(idx, (dg, du))| {
+            let d_gate_silu = d_intermediate[idx] * cache.up[idx];
+            *du = d_intermediate[idx] * cache.gate_silu[idx];
+            let x = cache.gate[idx];
+            let sig = 1.0 / (1.0 + (-x).exp());
+            let silu_grad = sig * (1.0 + x * (1.0 - sig));
+            *dg = d_gate_silu * silu_grad;
+        });
 
     // gate/up_proj backward: d_input
     let d_input_gate =

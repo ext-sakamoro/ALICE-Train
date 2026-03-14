@@ -48,6 +48,9 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 # CUDA (optional)
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "cublas", "dynamic-loading", "cuda-12000"], optional = true }
 
+# Parallelization
+rayon = "1.10"
+
 # QAT CLI (optional)
 safetensors = { version = "0.4", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
