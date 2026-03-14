@@ -24,7 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
 
-BINARY="./target/release/train_qat_70b"
+BINARY="./target/release/train-qat-70b"
 
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║  ALICE-Train — マルチモデル QAT 学習                     ║"
@@ -36,7 +36,7 @@ echo ""
 # --------------------------------------------------------------------------
 if [ ! -f "$BINARY" ]; then
     echo "バイナリが見つかりません。ビルドします..."
-    cargo build --release --bin train_qat_70b 2>&1 | tail -3
+    cargo build --release --bin train-qat-70b 2>&1 | tail -3
     echo ""
 fi
 
