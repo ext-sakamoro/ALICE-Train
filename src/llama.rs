@@ -175,6 +175,7 @@ impl LlamaConfig {
 ///
 /// 学習中はこの FP32 重みを保持し、forward 時に `FakeQuantize` で ternary 化する。
 /// backward 後は STE で FP32 重みに勾配を反映。
+#[derive(Clone)]
 pub struct LlamaLayerWeights {
     /// 入力 RMSNorm weight (FP32, 量子化しない)
     pub attn_norm: Vec<f32>,
