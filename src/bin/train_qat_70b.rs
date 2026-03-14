@@ -567,7 +567,7 @@ fn main() {
                 let token_ids: Vec<u32> = batch.input_ids[b * seq_len..(b + 1) * seq_len].to_vec();
                 let targets: Vec<u32> = batch.target_ids[b * seq_len..(b + 1) * seq_len].to_vec();
 
-                // --- Forward (ストリーミング) ---
+                // --- Forward (勾配チェックポインティング) ---
                 // Embedding lookup
                 let mut hidden = vec![0.0f32; seq_len * hidden_dim];
                 for (t, &tok) in token_ids.iter().enumerate() {
@@ -578,21 +578,18 @@ fn main() {
                     }
                 }
 
-                // Forward: 1レイヤーずつ読み込み → GPU forward → cache 保存 → 重み破棄
-
-                let mut caches: Vec<LayerCache> = Vec::with_capacity(num_layers);
+                // Forward: 各レイヤーの入力hiddenを保存（cache は保持しない — backward時に再計算）
+                let mut layer_inputs: Vec<Vec<f32>> = Vec::with_capacity(num_layers);
                 for i in 0..num_layers {
-
+                    layer_inputs.push(hidden.clone());
                     let lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
                         .unwrap_or_else(|| {
                             eprintln!("[ALICE-Train] レイヤー {i} の重み読み込み失敗");
                             std::process::exit(1);
                         });
-
-                    let cache = cuda_layer_forward(&cuda, &mut hidden, &lw, &config.model, seq_len);
-
-                    caches.push(cache);
-                    // lw はここで drop — メモリ解放
+                    // forward のみ — cache は捨てる
+                    let _cache = cuda_layer_forward(&cuda, &mut hidden, &lw, &config.model, seq_len);
+                    // lw + _cache はここで drop — メモリ解放
                 }
 
                 // Output RMSNorm + projection
@@ -656,8 +653,8 @@ fn main() {
                     output_norm[h] -= lr * (d_output_norm_w[h] * inv_tokens + config.weight_decay * output_norm[h]);
                 }
 
-                // Backward: 逆順ストリーミング — 1レイヤーずつ reload → CUDA backward → drop
-
+                // Backward: 逆順 — 勾配チェックポインティング
+                // 各レイヤーの入力hiddenからforward再計算してcache取得 → backward → drop
                 let mut d_layer_input = d_hidden;
                 for i in (0..num_layers).rev() {
                     let lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
@@ -666,15 +663,19 @@ fn main() {
                             std::process::exit(1);
                         });
 
+                    // forward 再計算で cache を取得
+                    let mut recompute_hidden = layer_inputs[i].clone();
+                    let cache = cuda_layer_forward(&cuda, &mut recompute_hidden, &lw, &config.model, seq_len);
+
                     d_layer_input = cuda_layer_backward(
                         &cuda,
                         &d_layer_input,
-                        &caches[i],
+                        &cache,
                         &lw,
                         &config.model,
                         seq_len,
                     );
-                    // lw + weight grads は drop — ストリーミングモード
+                    // lw + cache は drop — メモリ解放
                 }
 
                 // Embedding gradient update
@@ -689,8 +690,8 @@ fn main() {
                     }
                 }
 
-                // caches を明示的にドロップ
-                drop(caches);
+                // layer_inputs を明示的にドロップ
+                drop(layer_inputs);
             }
 
             let avg_loss = if token_count > 0 {
