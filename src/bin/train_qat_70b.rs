@@ -791,6 +791,7 @@ fn main() {
 }
 
 // ── Delta Weight 管理 ────────────────────────────────────────────────────
+use alice_train::llama::LlamaLayerWeights;
 
 /// レイヤーiの重み delta をファイルから読み込む。存在しなければゼロ初期化。
 fn load_layer_delta(layer_idx: usize, weight_name: &str, size: usize, checkpoint_dir: &str) -> Vec<f32> {
