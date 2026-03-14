@@ -993,6 +993,27 @@ fn apply_layer_grads_to_delta(
         }
         save_layer_delta(layer_idx, name, &delta, checkpoint_dir);
     }
+
+    // Bias 勾配（weight_decay なし）
+    let bias_names_and_grads: Vec<(&str, &[f32])> = [
+        ("q_bias", grads.q_bias.as_deref()),
+        ("k_bias", grads.k_bias.as_deref()),
+        ("v_bias", grads.v_bias.as_deref()),
+    ]
+    .iter()
+    .filter_map(|&(name, opt)| opt.map(|g| (name, g)))
+    .collect();
+
+    for (name, grad) in bias_names_and_grads {
+        let mut scaled_grad: Vec<f32> = grad.iter().map(|&g| g * inv_tokens).collect();
+        clip_grad(&mut scaled_grad, 1.0);
+
+        let mut delta = load_layer_delta(layer_idx, name, grad.len(), checkpoint_dir);
+        for j in 0..delta.len() {
+            delta[j] -= lr * scaled_grad[j]; // bias に weight_decay は適用しない
+        }
+        save_layer_delta(layer_idx, name, &delta, checkpoint_dir);
+    }
 }
 
 /// レイヤーの projection 重みに FakeQuantize を適用（attn_norm/ffn_norm はスキップ）。
@@ -1067,6 +1088,24 @@ fn apply_delta_to_weights(lw: &mut LlamaLayerWeights, layer_idx: usize, checkpoi
             if data.len() == weight.len() * 4 {
                 for i in 0..weight.len() {
                     weight[i] += f32::from_le_bytes([data[i*4], data[i*4+1], data[i*4+2], data[i*4+3]]);
+                }
+            }
+        }
+    }
+
+    // Bias delta の適用
+    for (name, bias_opt) in [
+        ("q_bias", &mut lw.q_bias),
+        ("k_bias", &mut lw.k_bias),
+        ("v_bias", &mut lw.v_bias),
+    ] {
+        if let Some(ref mut bias) = bias_opt {
+            let delta_path = format!("{}/delta_layer{layer_idx}_{name}.bin", checkpoint_dir);
+            if let Ok(data) = std::fs::read(&delta_path) {
+                if data.len() == bias.len() * 4 {
+                    for i in 0..bias.len() {
+                        bias[i] += f32::from_le_bytes([data[i*4], data[i*4+1], data[i*4+2], data[i*4+3]]);
+                    }
                 }
             }
         }

@@ -154,6 +154,45 @@ download_elyza() {
         "ELYZA Llama-3 JP 70B (日本語特化)"
 }
 
+# Llama-3.2-1B Instruct — reCamera / 小型デバイス向け QAT
+download_llama_1b() {
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Llama-3.2-1B Instruct (reCamera 向け)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    check_disk_space 3 || return 1
+    download_model \
+        "meta-llama/Llama-3.2-1B-Instruct" \
+        "meta-llama--Llama-3.2-1B-Instruct" \
+        "Meta Llama-3.2 1B Instruct (~2.5GB)"
+}
+
+# Llama-3.2-3B Instruct — reCamera / 中型デバイス向け QAT
+download_llama_3b() {
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Llama-3.2-3B Instruct (reCamera 向け)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    check_disk_space 7 || return 1
+    download_model \
+        "meta-llama/Llama-3.2-3B-Instruct" \
+        "meta-llama--Llama-3.2-3B-Instruct" \
+        "Meta Llama-3.2 3B Instruct (~6.4GB)"
+}
+
+# Qwen2.5-7B Instruct — reCamera MAX / 中型デバイス向け QAT
+download_qwen_7b() {
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Qwen2.5-7B Instruct (5B クラス, attention_bias=true)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    check_disk_space 16 || return 1
+    download_model \
+        "Qwen/Qwen2.5-7B-Instruct" \
+        "Qwen--Qwen2.5-7B-Instruct" \
+        "Qwen2.5 7B Instruct (~15GB)"
+}
+
 # --------------------------------------------------------------------------
 # メイン処理
 # --------------------------------------------------------------------------
@@ -169,6 +208,22 @@ case "$TARGET" in
         ;;
     elyza)
         download_elyza
+        ;;
+    1b)
+        download_llama_1b
+        ;;
+    3b)
+        download_llama_3b
+        ;;
+    qwen|7b)
+        download_qwen_7b
+        ;;
+    small)
+        echo "小型モデルをダウンロードします（1B + 3B + Qwen 7B, 合計 ~24GB）"
+        echo ""
+        download_llama_1b
+        download_llama_3b
+        download_qwen_7b
         ;;
     all)
         echo "全モデルをダウンロードします（合計 ~420GB）"
@@ -186,8 +241,12 @@ case "$TARGET" in
         download_elyza
         ;;
     *)
-        echo "使用法: $0 [llama|codellama|elyza|all]"
+        echo "使用法: $0 [1b|3b|qwen|small|llama|codellama|elyza|all]"
         echo ""
+        echo "  1b        — Llama-3.2 1B Instruct (~2.5GB)"
+        echo "  3b        — Llama-3.2 3B Instruct (~6.4GB)"
+        echo "  qwen      — Qwen2.5 7B Instruct (~15GB)"
+        echo "  small     — 1B + 3B + Qwen 7B (全小型モデル)"
         echo "  llama     — Meta Llama-3 70B Instruct"
         echo "  codellama — CodeLlama 70B Instruct"
         echo "  elyza     — ELYZA Llama-3 JP 70B"

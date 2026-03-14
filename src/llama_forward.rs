@@ -90,6 +90,16 @@ pub fn rmsnorm(x: &mut [f32], weight: &[f32], dim: usize, eps: f32) {
     }
 }
 
+/// Bias 加算: x (seq_len × dim) の各行に bias (dim,) を加算。
+pub fn add_bias(x: &mut [f32], bias: &[f32], seq_len: usize, dim: usize) {
+    for t in 0..seq_len {
+        let row = &mut x[t * dim..(t + 1) * dim];
+        for (v, &b) in row.iter_mut().zip(bias.iter()) {
+            *v += b;
+        }
+    }
+}
+
 // ── RoPE ────────────────────────────────────────────────────────────────────
 
 /// Rotary Position Embeddings を適用する。
@@ -279,6 +289,17 @@ pub fn layer_forward(
     matmul_bt(&normed, &weights.q_proj, &mut q, seq_len, num_heads * head_dim, hidden_dim);
     matmul_bt(&normed, &weights.k_proj, &mut k, seq_len, num_kv_heads * head_dim, hidden_dim);
     matmul_bt(&normed, &weights.v_proj, &mut v, seq_len, num_kv_heads * head_dim, hidden_dim);
+
+    // 2b. Attention bias (Qwen2.5 等)
+    if let Some(ref b) = weights.q_bias {
+        add_bias(&mut q, b, seq_len, num_heads * head_dim);
+    }
+    if let Some(ref b) = weights.k_bias {
+        add_bias(&mut k, b, seq_len, num_kv_heads * head_dim);
+    }
+    if let Some(ref b) = weights.v_bias {
+        add_bias(&mut v, b, seq_len, num_kv_heads * head_dim);
+    }
 
     // 3. RoPE
     apply_rope(&mut q, num_heads, head_dim, seq_len, config.rope_theta);

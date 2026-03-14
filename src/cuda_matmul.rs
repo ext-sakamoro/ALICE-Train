@@ -260,7 +260,18 @@ pub fn cuda_layer_forward(
     // 2. QKV projection (CUDA)
     let mut q = cuda.matmul_bt(&normed, &weights.q_proj, seq_len, num_heads * head_dim, hidden_dim);
     let mut k = cuda.matmul_bt(&normed, &weights.k_proj, seq_len, num_kv_heads * head_dim, hidden_dim);
-    let v = cuda.matmul_bt(&normed, &weights.v_proj, seq_len, num_kv_heads * head_dim, hidden_dim);
+    let mut v = cuda.matmul_bt(&normed, &weights.v_proj, seq_len, num_kv_heads * head_dim, hidden_dim);
+
+    // 2b. Attention bias (Qwen2.5 等)
+    if let Some(ref b) = weights.q_bias {
+        crate::llama_forward::add_bias(&mut q, b, seq_len, num_heads * head_dim);
+    }
+    if let Some(ref b) = weights.k_bias {
+        crate::llama_forward::add_bias(&mut k, b, seq_len, num_kv_heads * head_dim);
+    }
+    if let Some(ref b) = weights.v_bias {
+        crate::llama_forward::add_bias(&mut v, b, seq_len, num_kv_heads * head_dim);
+    }
 
     // 3. RoPE (CPU)
     apply_rope(&mut q, num_heads, head_dim, seq_len, config.rope_theta);
@@ -324,6 +335,12 @@ pub struct LayerWeightGrads {
     pub k_proj: Vec<f32>,
     pub v_proj: Vec<f32>,
     pub o_proj: Vec<f32>,
+    /// Q bias 勾配 (attention_bias=true の場合のみ Some)
+    pub q_bias: Option<Vec<f32>>,
+    /// K bias 勾配
+    pub k_bias: Option<Vec<f32>>,
+    /// V bias 勾配
+    pub v_bias: Option<Vec<f32>>,
     pub ffn_norm: Vec<f32>,
     pub gate_proj: Vec<f32>,
     pub up_proj: Vec<f32>,
@@ -556,12 +573,41 @@ pub fn cuda_layer_backward(
         d_input[i] += d_attn_output[i];
     }
 
+    // Bias 勾配: d_bias = sum(d_output, axis=0) — seq_len 軸で合計
+    let compute_bias_grad = |d_out: &[f32], dim: usize| -> Vec<f32> {
+        let mut d_bias = vec![0.0f32; dim];
+        for t in 0..seq_len {
+            for d in 0..dim {
+                d_bias[d] += d_out[t * dim + d];
+            }
+        }
+        d_bias
+    };
+    let d_q_bias = if weights.q_bias.is_some() {
+        Some(compute_bias_grad(&d_q, num_heads * head_dim))
+    } else {
+        None
+    };
+    let d_k_bias = if weights.k_bias.is_some() {
+        Some(compute_bias_grad(&d_k, num_kv_heads * head_dim))
+    } else {
+        None
+    };
+    let d_v_bias = if weights.v_bias.is_some() {
+        Some(compute_bias_grad(&d_v, num_kv_heads * head_dim))
+    } else {
+        None
+    };
+
     let grads = LayerWeightGrads {
         attn_norm: d_attn_norm_w,
         q_proj: d_q_proj,
         k_proj: d_k_proj,
         v_proj: d_v_proj,
         o_proj: d_o_proj,
+        q_bias: d_q_bias,
+        k_bias: d_k_bias,
+        v_bias: d_v_bias,
         ffn_norm: d_ffn_norm_w,
         gate_proj: d_gate_proj,
         up_proj: d_up_proj,

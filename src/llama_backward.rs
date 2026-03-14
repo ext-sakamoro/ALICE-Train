@@ -18,6 +18,12 @@ pub struct LayerWeightGrads {
     pub d_v_proj: Vec<f32>,
     /// O projection 勾配。
     pub d_o_proj: Vec<f32>,
+    /// Q bias 勾配 (attention_bias=true の場合のみ Some)。
+    pub d_q_bias: Option<Vec<f32>>,
+    /// K bias 勾配。
+    pub d_k_bias: Option<Vec<f32>>,
+    /// V bias 勾配。
+    pub d_v_bias: Option<Vec<f32>>,
     /// FFN norm 勾配。
     pub d_ffn_norm: Vec<f32>,
     /// gate projection 勾配。
@@ -35,12 +41,24 @@ impl LayerWeightGrads {
         let hidden = config.hidden_dim;
         let inter = config.intermediate_dim;
         let kv_dim = config.num_kv_heads * config.head_dim;
+        let (d_q_bias, d_k_bias, d_v_bias) = if config.attention_bias {
+            (
+                Some(vec![0.0; config.num_heads * config.head_dim]),
+                Some(vec![0.0; kv_dim]),
+                Some(vec![0.0; kv_dim]),
+            )
+        } else {
+            (None, None, None)
+        };
         Self {
             d_attn_norm: vec![0.0; hidden],
             d_q_proj: vec![0.0; hidden * hidden],
             d_k_proj: vec![0.0; kv_dim * hidden],
             d_v_proj: vec![0.0; kv_dim * hidden],
             d_o_proj: vec![0.0; hidden * hidden],
+            d_q_bias,
+            d_k_bias,
+            d_v_bias,
             d_ffn_norm: vec![0.0; hidden],
             d_gate_proj: vec![0.0; inter * hidden],
             d_up_proj: vec![0.0; inter * hidden],
@@ -59,6 +77,16 @@ impl LayerWeightGrads {
         sgd_update(&mut weights.gate_proj, &self.d_gate_proj, lr, weight_decay);
         sgd_update(&mut weights.up_proj, &self.d_up_proj, lr, weight_decay);
         sgd_update(&mut weights.down_proj, &self.d_down_proj, lr, weight_decay);
+        // Bias は weight_decay なしで更新（bias に正則化は不適用）
+        if let (Some(ref mut wb), Some(ref db)) = (&mut weights.q_bias, &self.d_q_bias) {
+            sgd_update(wb, db, lr, 0.0);
+        }
+        if let (Some(ref mut wb), Some(ref db)) = (&mut weights.k_bias, &self.d_k_bias) {
+            sgd_update(wb, db, lr, 0.0);
+        }
+        if let (Some(ref mut wb), Some(ref db)) = (&mut weights.v_bias, &self.d_v_bias) {
+            sgd_update(wb, db, lr, 0.0);
+        }
     }
 }
 
@@ -591,6 +619,7 @@ mod tests {
             head_dim: 4,
             rope_theta: 10000.0,
             norm_eps: 1e-5,
+            attention_bias: false,
         };
         let grads = LayerWeightGrads::zeros(&config);
         assert_eq!(grads.d_q_proj.len(), 8 * 8);

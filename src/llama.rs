@@ -35,6 +35,9 @@ pub struct LlamaConfig {
     pub rope_theta: f32,
     /// RMSNorm ε
     pub norm_eps: f32,
+    /// Attention projection にバイアスがあるか (Qwen2.5: true, Llama: false)
+    #[serde(default)]
+    pub attention_bias: bool,
 }
 
 impl LlamaConfig {
@@ -52,6 +55,43 @@ impl LlamaConfig {
             head_dim: 128,
             rope_theta: 500_000.0,
             norm_eps: 1e-5,
+            attention_bias: false,
+        }
+    }
+
+    /// Llama-3.2 1B のデフォルト設定。
+    #[must_use]
+    pub fn llama3_1b() -> Self {
+        Self {
+            vocab_size: 128_256,
+            hidden_dim: 2048,
+            intermediate_dim: 8192,
+            num_heads: 32,
+            num_kv_heads: 8,
+            num_layers: 16,
+            max_seq_len: 131_072,
+            head_dim: 64,
+            rope_theta: 500_000.0,
+            norm_eps: 1e-5,
+            attention_bias: false,
+        }
+    }
+
+    /// Llama-3.2 3B のデフォルト設定。
+    #[must_use]
+    pub fn llama3_3b() -> Self {
+        Self {
+            vocab_size: 128_256,
+            hidden_dim: 3072,
+            intermediate_dim: 8192,
+            num_heads: 24,
+            num_kv_heads: 8,
+            num_layers: 28,
+            max_seq_len: 131_072,
+            head_dim: 128,
+            rope_theta: 500_000.0,
+            norm_eps: 1e-5,
+            attention_bias: false,
         }
     }
 
@@ -69,6 +109,25 @@ impl LlamaConfig {
             head_dim: 128,
             rope_theta: 500_000.0,
             norm_eps: 1e-5,
+            attention_bias: false,
+        }
+    }
+
+    /// Qwen2.5-7B のデフォルト設定。
+    #[must_use]
+    pub fn qwen25_7b() -> Self {
+        Self {
+            vocab_size: 152_064,
+            hidden_dim: 3584,
+            intermediate_dim: 18_944,
+            num_heads: 28,
+            num_kv_heads: 4,
+            num_layers: 28,
+            max_seq_len: 131_072,
+            head_dim: 128,
+            rope_theta: 1_000_000.0,
+            norm_eps: 1e-6,
+            attention_bias: true,
         }
     }
 
@@ -127,6 +186,12 @@ pub struct LlamaLayerWeights {
     pub v_proj: Vec<f32>,
     /// O projection (hidden_dim × hidden_dim)
     pub o_proj: Vec<f32>,
+    /// Q bias (Qwen2.5: Some, Llama: None) — FP32, 量子化しない
+    pub q_bias: Option<Vec<f32>>,
+    /// K bias (Qwen2.5: Some, Llama: None) — FP32, 量子化しない
+    pub k_bias: Option<Vec<f32>>,
+    /// V bias (Qwen2.5: Some, Llama: None) — FP32, 量子化しない
+    pub v_bias: Option<Vec<f32>>,
     /// FFN RMSNorm weight (FP32, 量子化しない)
     pub ffn_norm: Vec<f32>,
     /// Gate projection (intermediate_dim × hidden_dim)
@@ -151,12 +216,31 @@ impl LlamaLayerWeights {
         // kv_dim は将来の重みバリデーションで使用予定
         let _ = config.num_kv_heads * config.head_dim;
 
+        let q_bias = if config.attention_bias {
+            Some(get_tensor(&format!("{prefix}.self_attn.q_proj.bias"))?)
+        } else {
+            None
+        };
+        let k_bias = if config.attention_bias {
+            Some(get_tensor(&format!("{prefix}.self_attn.k_proj.bias"))?)
+        } else {
+            None
+        };
+        let v_bias = if config.attention_bias {
+            Some(get_tensor(&format!("{prefix}.self_attn.v_proj.bias"))?)
+        } else {
+            None
+        };
+
         Some(Self {
             attn_norm: get_tensor(&format!("{prefix}.input_layernorm.weight"))?,
             q_proj: get_tensor(&format!("{prefix}.self_attn.q_proj.weight"))?,
             k_proj: get_tensor(&format!("{prefix}.self_attn.k_proj.weight"))?,
             v_proj: get_tensor(&format!("{prefix}.self_attn.v_proj.weight"))?,
             o_proj: get_tensor(&format!("{prefix}.self_attn.o_proj.weight"))?,
+            q_bias,
+            k_bias,
+            v_bias,
             ffn_norm: get_tensor(&format!("{prefix}.post_attention_layernorm.weight"))?,
             gate_proj: get_tensor(&format!("{prefix}.mlp.gate_proj.weight"))?,
             up_proj: get_tensor(&format!("{prefix}.mlp.up_proj.weight"))?,
@@ -188,6 +272,42 @@ impl LlamaLayerWeights {
             + self.gate_proj.len()
             + self.up_proj.len()
             + self.down_proj.len()
+    }
+
+    /// Attention bias への参照（Q, K, V 順）。bias がない場合は空。
+    pub fn attention_biases(&self) -> Vec<(&str, &[f32])> {
+        let mut out = Vec::new();
+        if let Some(ref b) = self.q_bias {
+            out.push(("q_bias", b.as_slice()));
+        }
+        if let Some(ref b) = self.k_bias {
+            out.push(("k_bias", b.as_slice()));
+        }
+        if let Some(ref b) = self.v_bias {
+            out.push(("v_bias", b.as_slice()));
+        }
+        out
+    }
+
+    /// Attention bias へのミュータブル参照（Q, K, V 順）。
+    pub fn attention_biases_mut(&mut self) -> Vec<(&str, &mut [f32])> {
+        let mut out = Vec::new();
+        if let Some(ref mut b) = self.q_bias {
+            out.push(("q_bias", b.as_mut_slice()));
+        }
+        if let Some(ref mut b) = self.k_bias {
+            out.push(("k_bias", b.as_mut_slice()));
+        }
+        if let Some(ref mut b) = self.v_bias {
+            out.push(("v_bias", b.as_mut_slice()));
+        }
+        out
+    }
+
+    /// Attention bias が存在するか。
+    #[must_use]
+    pub fn has_attention_bias(&self) -> bool {
+        self.q_bias.is_some()
     }
 }
 
