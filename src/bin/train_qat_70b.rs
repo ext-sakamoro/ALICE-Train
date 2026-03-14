@@ -24,6 +24,7 @@
 use clap::Parser;
 use rand::Rng;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
@@ -569,6 +570,7 @@ fn main() {
             "━━━ Phase 2 学習開始 (step {global_step}/{}) ━━━",
             config.total_steps
         );
+        let _ = std::io::stdout().flush();
         let train_start = Instant::now();
         let mut batch_idx = 0usize;
 
@@ -785,6 +787,7 @@ fn main() {
                     fq.temperature(),
                     step_duration.as_secs_f64() * 1000.0,
                 );
+                let _ = std::io::stdout().flush();
             }
 
             // Eval (eval_data_path が設定されている場合)
@@ -850,6 +853,7 @@ fn main() {
                 println!(
                     "    [eval] step {global_step} | eval_loss: {eval_loss:.4} | ppl: {eval_ppl:.1} | {eval_token_count} tokens"
                 );
+                let _ = std::io::stdout().flush();
             }
 
             // チェックポイント: step 番号 + delta 一覧を保存
