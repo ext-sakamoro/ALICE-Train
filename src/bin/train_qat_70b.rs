@@ -545,9 +545,8 @@ fn main() {
 
         let num_layers = config.model.num_layers;
 
-        // delta 適用: embedding / output_proj / output_norm
-        apply_global_delta(&mut embedding_table, "embedding", &config.checkpoint_dir);
-        apply_global_delta(&mut output_proj, "output_proj", &config.checkpoint_dir);
+        // delta 適用: output_norm（小さいので delta ファイル方式）
+        // embedding / output_proj は常駐メモリなので直接更新→チェックポイントで保存
         apply_global_delta(&mut output_norm, "output_norm", &config.checkpoint_dir);
 
         // CUDA 初期化
@@ -677,26 +676,23 @@ fn main() {
                     &d_logits_flat, &output_proj,
                     seq_len, hidden_dim, vocab_size,
                 );
-                // Output projection 勾配: d_output_proj = d_logits^T × hidden_normed
-                // CPU計算: [vocab × hidden] — seq_len が小さいので GPU 不要
-                let mut d_output_proj = vec![0.0f32; vocab_size * hidden_dim];
+                // Output projection 勾配: sparse update — 非ゼロ勾配のトークンのみ
+                // output_proj を直接更新（2GB の delta ファイル読み書きを回避）
                 for t in 0..seq_len {
                     if let Some(ref dl) = d_logits_per_token[t] {
                         let h_offset = t * hidden_dim;
                         for v in 0..vocab_size {
                             if dl[v].abs() < 1e-10 { continue; }
+                            let grad_v = dl[v] * inv_tokens;
                             let p_offset = v * hidden_dim;
                             for h in 0..hidden_dim {
-                                d_output_proj[p_offset + h] += dl[v] * hidden[h_offset + h];
+                                let grad = grad_v * hidden[h_offset + h];
+                                output_proj[p_offset + h] -=
+                                    effective_lr * (grad + config.weight_decay * output_proj[p_offset + h]);
                             }
                         }
                     }
                 }
-                // output_proj delta をファイルに蓄積
-                apply_global_grads_to_delta(
-                    "output_proj", &d_output_proj,
-                    effective_lr, inv_tokens, config.weight_decay, &config.checkpoint_dir,
-                );
 
                 // Output RMSNorm backward
                 let mut d_hidden = vec![0.0f32; seq_len * hidden_dim];
@@ -710,11 +706,11 @@ fn main() {
                     hidden_dim,
                     config.model.norm_eps,
                 );
-                // output_norm delta をファイルに蓄積
-                apply_global_grads_to_delta(
-                    "output_norm", &d_output_norm_w,
-                    effective_lr, inv_tokens, config.weight_decay, &config.checkpoint_dir,
-                );
+                // output_norm: 直接更新（16KB — メモリ問題なし）
+                for h in 0..hidden_dim {
+                    let grad = d_output_norm_w[h] * inv_tokens;
+                    output_norm[h] -= effective_lr * (grad + config.weight_decay * output_norm[h]);
+                }
 
                 // Backward: 逆順 — 勾配チェックポインティング + 重み更新
                 let mut d_layer_input = d_hidden;
@@ -756,20 +752,17 @@ fn main() {
                 }
 
                 // Embedding gradient: sparse update — 使用されたトークンのみ
-                // d_embedding[tok][h] = d_layer_input[t][h] for each token position t
-                let mut d_embedding = vec![0.0f32; vocab_size * hidden_dim];
+                // embedding_table を直接更新し、ステップ終了後にまとめて保存
                 for t in 0..seq_len {
                     let tok = token_ids[t] as usize;
                     if tok < vocab_size {
                         for h in 0..hidden_dim {
-                            d_embedding[tok * hidden_dim + h] += d_layer_input[t * hidden_dim + h];
+                            let grad = d_layer_input[t * hidden_dim + h] * inv_tokens;
+                            embedding_table[tok * hidden_dim + h] -=
+                                effective_lr * (grad + config.weight_decay * embedding_table[tok * hidden_dim + h]);
                         }
                     }
                 }
-                apply_global_grads_to_delta(
-                    "embedding", &d_embedding,
-                    effective_lr, inv_tokens, config.weight_decay, &config.checkpoint_dir,
-                );
 
                 // layer_inputs を明示的にドロップ
                 drop(layer_inputs);
@@ -900,7 +893,7 @@ fn main() {
                 };
                 let ckpt = CheckpointData {
                     meta,
-                    weights: vec![], // delta files に保存済み
+                    weights: embedding_table.clone(),
                     optimizer_state: vec![],
                 };
                 if let Err(e) =
