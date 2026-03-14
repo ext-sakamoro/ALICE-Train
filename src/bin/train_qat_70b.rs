@@ -200,6 +200,28 @@ fn main() {
         loader.num_samples(),
         num_batches
     );
+
+    // Eval データ読み込み（オプション）
+    let eval_dataset: Option<MmapDataset> = config
+        .eval_data_path
+        .as_ref()
+        .and_then(|p| {
+            if Path::new(p).exists() {
+                match MmapDataset::open(p) {
+                    Ok(ds) => {
+                        println!("  Eval: {} ({} トークン)", p, ds.len());
+                        Some(ds)
+                    }
+                    Err(e) => {
+                        eprintln!("  Eval データ読み込み失敗: {e}");
+                        None
+                    }
+                }
+            } else {
+                println!("  Eval: なし (eval_data_path 未設定 or 存在しない)");
+                None
+            }
+        });
     println!();
 
     // --- コンポーネント初期化 ---
@@ -523,6 +545,11 @@ fn main() {
 
         let num_layers = config.model.num_layers;
 
+        // delta 適用: embedding / output_proj / output_norm
+        apply_global_delta(&mut embedding_table, "embedding", &config.checkpoint_dir);
+        apply_global_delta(&mut output_proj, "output_proj", &config.checkpoint_dir);
+        apply_global_delta(&mut output_norm, "output_norm", &config.checkpoint_dir);
+
         // CUDA 初期化
         println!("  CUDA 初期化...");
         let cuda = CudaMatmul::new();
@@ -546,14 +573,24 @@ fn main() {
         let train_start = Instant::now();
         let mut batch_idx = 0usize;
 
+        let accum_steps = config.gradient_accumulation_steps.max(1);
+        let mut accum_loss = 0.0f32;
+        let mut accum_tokens = 0usize;
+        let mut micro_step = 0usize;
+
         while global_step < config.total_steps {
 
             let lr = scheduler.get_lr(global_step);
+            // 勾配累積: lr を accumulation_steps で分割
+            let effective_lr = lr / accum_steps as f32;
             let step_start = Instant::now();
 
             if batch_idx >= num_batches {
                 loader.shuffle_epoch();
                 batch_idx = 0;
+                // Epoch 境界で temperature annealing
+                fq.step_temperature();
+                println!("    [epoch boundary] temperature: {:.4}", fq.temperature());
             }
 
             let batch = loader.get_batch(batch_idx, &dataset);
@@ -640,8 +677,17 @@ fn main() {
                     &d_logits_flat, &output_proj,
                     seq_len, hidden_dim, vocab_size,
                 );
-                // output_proj weight update はスキップ（ストリーミングモードでは重み更新を別途保存）
-                // TODO: 定期的に差分を蓄積して safetensors に書き戻す
+                // Output projection 勾配: d_output_proj = d_logits^T × hidden_normed
+                // d_logits: [seq × vocab], hidden_normed: [seq × hidden] → d_proj: [vocab × hidden]
+                let d_output_proj = cuda.matmul_tn(
+                    &d_logits_flat, &hidden,
+                    seq_len, hidden_dim, vocab_size,
+                );
+                // output_proj delta をファイルに蓄積
+                apply_global_grads_to_delta(
+                    "output_proj", &d_output_proj,
+                    effective_lr, inv_tokens, config.weight_decay, &config.checkpoint_dir,
+                );
 
                 // Output RMSNorm backward
                 let mut d_hidden = vec![0.0f32; seq_len * hidden_dim];
@@ -655,9 +701,11 @@ fn main() {
                     hidden_dim,
                     config.model.norm_eps,
                 );
-                for h in 0..hidden_dim {
-                    output_norm[h] -= lr * (d_output_norm_w[h] * inv_tokens + config.weight_decay * output_norm[h]);
-                }
+                // output_norm delta をファイルに蓄積
+                apply_global_grads_to_delta(
+                    "output_norm", &d_output_norm_w,
+                    effective_lr, inv_tokens, config.weight_decay, &config.checkpoint_dir,
+                );
 
                 // Backward: 逆順 — 勾配チェックポインティング + 重み更新
                 let mut d_layer_input = d_hidden;
@@ -692,23 +740,27 @@ fn main() {
 
                     // 重み更新: delta ファイルにSGDで蓄積
                     apply_layer_grads_to_delta(
-                        i, &grads, lr, inv_tokens, config.weight_decay,
+                        i, &grads, effective_lr, inv_tokens, config.weight_decay,
                         &config.checkpoint_dir,
                     );
                     // lw + cache + grads は drop — メモリ解放
                 }
 
-                // Embedding gradient update
-
+                // Embedding gradient: sparse update — 使用されたトークンのみ
+                // d_embedding[tok][h] = d_layer_input[t][h] for each token position t
+                let mut d_embedding = vec![0.0f32; vocab_size * hidden_dim];
                 for t in 0..seq_len {
                     let tok = token_ids[t] as usize;
                     if tok < vocab_size {
                         for h in 0..hidden_dim {
-                            embedding_table[tok * hidden_dim + h] -=
-                                lr * d_layer_input[t * hidden_dim + h] * inv_tokens;
+                            d_embedding[tok * hidden_dim + h] += d_layer_input[t * hidden_dim + h];
                         }
                     }
                 }
+                apply_global_grads_to_delta(
+                    "embedding", &d_embedding,
+                    effective_lr, inv_tokens, config.weight_decay, &config.checkpoint_dir,
+                );
 
                 // layer_inputs を明示的にドロップ
                 drop(layer_inputs);
@@ -721,7 +773,21 @@ fn main() {
             };
             let step_duration = step_start.elapsed();
 
-            log.append(LogEntry::new(0, global_step, avg_loss, lr, 0.0));
+            // 勾配累積カウント
+            accum_loss += avg_loss;
+            accum_tokens += token_count;
+            micro_step += 1;
+
+            // accumulation_steps に達したら global_step を進める
+            if micro_step < accum_steps {
+                continue;
+            }
+            let accumulated_loss = accum_loss / accum_steps as f32;
+            accum_loss = 0.0;
+            accum_tokens = 0;
+            micro_step = 0;
+
+            log.append(LogEntry::new(0, global_step, accumulated_loss, lr, 0.0));
 
             if global_step % 10 == 0 || global_step == config.total_steps - 1 {
                 let elapsed = train_start.elapsed();
@@ -736,15 +802,81 @@ fn main() {
                     0.0
                 };
                 println!(
-                    "  step {global_step:>5}/{} | loss: {avg_loss:.4} | lr: {lr:.2e} | \
-                     qat_mae: {step_mae:.4} | cos: {step_cos:.4} | \
+                    "  step {global_step:>5}/{} | loss: {accumulated_loss:.4} | lr: {lr:.2e} | \
+                     qat_mae: {step_mae:.4} | cos: {step_cos:.4} | temp: {:.3} | \
                      {:.1}ms/step | {steps_per_sec:.1} steps/s | ETA: {eta_secs:.0}s",
                     config.total_steps,
+                    fq.temperature(),
                     step_duration.as_secs_f64() * 1000.0,
                 );
             }
 
-            // チェックポイント
+            // Eval (eval_data_path が設定されている場合)
+            if config.eval_interval > 0
+                && global_step % config.eval_interval == 0
+                && eval_dataset.is_some()
+            {
+                let eval_ds = eval_dataset.as_ref().unwrap();
+                let eval_dl_config = DataLoaderConfig::new()
+                    .with_seq_len(config.seq_len)
+                    .with_batch_size(config.batch_size)
+                    .with_shuffle(false);
+                let eval_loader = DataLoader::new(eval_ds, eval_dl_config);
+                let eval_batches = eval_loader.num_batches().min(50); // 最大50バッチ
+
+                let mut eval_loss_sum = 0.0f32;
+                let mut eval_token_count = 0usize;
+
+                for eb in 0..eval_batches {
+                    let eval_batch = eval_loader.get_batch(eb, eval_ds);
+                    for b in 0..eval_batch.actual_batch_size {
+                        let token_ids: Vec<u32> = eval_batch.input_ids
+                            [b * seq_len..(b + 1) * seq_len].to_vec();
+                        let targets: Vec<u32> = eval_batch.target_ids
+                            [b * seq_len..(b + 1) * seq_len].to_vec();
+
+                        // Forward only (no backward)
+                        let mut hidden = vec![0.0f32; seq_len * hidden_dim];
+                        for (t, &tok) in token_ids.iter().enumerate() {
+                            let tok = tok as usize;
+                            if tok < vocab_size {
+                                hidden[t * hidden_dim..(t + 1) * hidden_dim]
+                                    .copy_from_slice(&embedding_table[tok * hidden_dim..(tok + 1) * hidden_dim]);
+                            }
+                        }
+                        for i in 0..num_layers {
+                            let mut lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
+                                .unwrap_or_else(|| { std::process::exit(1); });
+                            apply_delta_to_weights(&mut lw, i, &config.checkpoint_dir);
+                            fake_quantize_layer_weights(&mut lw, &mut fq);
+                            let _cache = cuda_layer_forward(&cuda, &mut hidden, &lw, &config.model, seq_len);
+                        }
+                        rmsnorm(&mut hidden, &output_norm, hidden_dim, config.model.norm_eps);
+                        let logits = cuda.matmul_bt(&hidden, &output_proj, seq_len, vocab_size, hidden_dim);
+                        for t in 0..seq_len {
+                            let target = targets[t] as usize;
+                            if target < vocab_size {
+                                let logits_t = &logits[t * vocab_size..(t + 1) * vocab_size];
+                                let (loss, _) = cross_entropy_loss(logits_t, target);
+                                eval_loss_sum += loss;
+                                eval_token_count += 1;
+                            }
+                        }
+                    }
+                }
+
+                let eval_loss = if eval_token_count > 0 {
+                    eval_loss_sum / eval_token_count as f32
+                } else {
+                    0.0
+                };
+                let eval_ppl = eval_loss.exp();
+                println!(
+                    "    [eval] step {global_step} | eval_loss: {eval_loss:.4} | ppl: {eval_ppl:.1} | {eval_token_count} tokens"
+                );
+            }
+
+            // チェックポイント: step 番号 + delta 一覧を保存
             if global_step > 0 && global_step % config.checkpoint_interval == 0 {
                 let ckpt_path = format!("{}/step_{global_step}.bin", config.checkpoint_dir);
                 println!("  チェックポイント保存: {ckpt_path}");
@@ -752,14 +884,14 @@ fn main() {
                     version: 1,
                     epoch: 0,
                     step: global_step,
-                    loss: avg_loss,
+                    loss: accumulated_loss,
                     learning_rate: lr,
                     weight_count: embedding_table.len(),
                     optimizer_state_count: 0,
                 };
                 let ckpt = CheckpointData {
                     meta,
-                    weights: embedding_table.clone(),
+                    weights: vec![], // delta files に保存済み
                     optimizer_state: vec![],
                 };
                 if let Err(e) =
@@ -832,6 +964,27 @@ fn save_layer_delta(layer_idx: usize, weight_name: &str, delta: &[f32], checkpoi
     }
 }
 
+/// 勾配ベクトルの L2 ノルムを計算。
+fn grad_l2_norm(grad: &[f32]) -> f32 {
+    let mut sum = 0.0f64;
+    for &g in grad {
+        sum += (g as f64) * (g as f64);
+    }
+    (sum.sqrt()) as f32
+}
+
+/// 勾配をクリップ（max_norm 以下にスケーリング）。
+fn clip_grad(grad: &mut [f32], max_norm: f32) -> f32 {
+    let norm = grad_l2_norm(grad);
+    if norm > max_norm && norm > 1e-10 {
+        let scale = max_norm / norm;
+        for g in grad.iter_mut() {
+            *g *= scale;
+        }
+    }
+    norm
+}
+
 /// レイヤーの勾配を delta ファイルにSGD更新で蓄積。
 fn apply_layer_grads_to_delta(
     layer_idx: usize,
@@ -854,10 +1007,13 @@ fn apply_layer_grads_to_delta(
     ];
 
     for &(name, grad) in names_and_grads {
+        // gradient norm clipping per weight tensor
+        let mut scaled_grad: Vec<f32> = grad.iter().map(|&g| g * inv_tokens).collect();
+        clip_grad(&mut scaled_grad, 1.0);
+
         let mut delta = load_layer_delta(layer_idx, name, grad.len(), checkpoint_dir);
         for j in 0..delta.len() {
-            // SGD with weight decay: delta -= lr * (grad * inv_tokens + weight_decay * delta)
-            delta[j] -= lr * (grad[j] * inv_tokens + weight_decay * delta[j]);
+            delta[j] -= lr * (scaled_grad[j] + weight_decay * delta[j]);
         }
         save_layer_delta(layer_idx, name, &delta, checkpoint_dir);
     }
@@ -937,6 +1093,38 @@ fn apply_delta_to_weights(lw: &mut LlamaLayerWeights, layer_idx: usize, checkpoi
                     weight[i] += f32::from_le_bytes([data[i*4], data[i*4+1], data[i*4+2], data[i*4+3]]);
                 }
             }
+        }
+    }
+}
+
+/// グローバル重み（embedding / output_proj / output_norm）の勾配を delta ファイルに蓄積。
+fn apply_global_grads_to_delta(
+    name: &str,
+    grad: &[f32],
+    lr: f32,
+    inv_tokens: f32,
+    weight_decay: f32,
+    checkpoint_dir: &str,
+) {
+    let mut scaled_grad: Vec<f32> = grad.iter().map(|&g| g * inv_tokens).collect();
+    clip_grad(&mut scaled_grad, 1.0);
+
+    let mut delta = load_layer_delta(0, &format!("global_{name}"), grad.len(), checkpoint_dir);
+    for j in 0..delta.len() {
+        delta[j] -= lr * (scaled_grad[j] + weight_decay * delta[j]);
+    }
+    save_layer_delta(0, &format!("global_{name}"), &delta, checkpoint_dir);
+}
+
+/// グローバル delta をモデル重みに適用（起動時に呼ぶ）。
+fn apply_global_delta(weights: &mut [f32], name: &str, checkpoint_dir: &str) {
+    let delta_path = format!("{}/delta_layer0_global_{name}.bin", checkpoint_dir);
+    if let Ok(data) = std::fs::read(&delta_path) {
+        if data.len() == weights.len() * 4 {
+            for i in 0..weights.len() {
+                weights[i] += f32::from_le_bytes([data[i*4], data[i*4+1], data[i*4+2], data[i*4+3]]);
+            }
+            println!("    {name} delta 適用済み ({:.1} MB)", data.len() as f64 / 1024.0 / 1024.0);
         }
     }
 }
