@@ -141,4 +141,4 @@ pub use gpu_matmul::GpuMatmul;
 
 // CUDA re-exports
 #[cfg(feature = "cuda")]
-pub use cuda_matmul::CudaMatmul;
+pub use cuda_matmul::{CudaMatmul, LayerWeightGrads};

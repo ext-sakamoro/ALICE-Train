@@ -135,6 +135,46 @@ impl CudaMatmul {
         (output, gate, up, gate_silu)
     }
 
+    /// C[m×n] = A[m×k]^T × B[m×n]  (row-major)
+    ///
+    /// 実際は C[k×n] = A^T[k×m] × B[m×n] — 重み勾配計算用。
+    /// cuBLAS: C^T[n×k] = B^T[n×m] × A[m×k]
+    pub fn matmul_tn(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+        // A is [m×k], B is [m×n], output C is [k×n]
+        let d_a = self.stream.clone_htod(a).expect("A→GPU 転送失敗");
+        let d_b = self.stream.clone_htod(b).expect("B→GPU 転送失敗");
+        let mut d_c: CudaSlice<f32> = self.stream.alloc_zeros(k * n).expect("C 確保失敗");
+
+        // C^T[n×k] = B^T[n×m] × A[m×k]
+        // B_rm[m×n] → B_cm[n×m] (ld=n) → B^T is [n×m], transa=N, lda=n → already transposed
+        // A_rm[m×k] → A_cm[k×m] (ld=k) → transb=N, ldb=k
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_N,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: k as i32,
+            k: m as i32,
+            alpha: 1.0f32,
+            lda: n as i32,
+            ldb: k as i32,
+            beta: 0.0f32,
+            ldc: n as i32,
+        };
+
+        unsafe {
+            self.blas
+                .gemm(cfg, &d_b, &d_a, &mut d_c)
+                .expect("cuBLAS sgemm (matmul_tn) 失敗");
+        }
+
+        // Result is C^T in col-major = C[k×n] in row-major
+        let mut result = vec![0.0f32; k * n];
+        self.stream
+            .memcpy_dtoh(&d_c, &mut result)
+            .expect("GPU→CPU 転送失敗");
+        result
+    }
+
     /// SwiGLU FFN backward (CUDA 加速)。
     ///
     /// d_input を返す。weight grads は現時点では計算しない（ストリーミングモード）。
@@ -277,9 +317,22 @@ pub fn cuda_layer_forward(
     }
 }
 
+/// レイヤー重みの勾配。
+pub struct LayerWeightGrads {
+    pub attn_norm: Vec<f32>,
+    pub q_proj: Vec<f32>,
+    pub k_proj: Vec<f32>,
+    pub v_proj: Vec<f32>,
+    pub o_proj: Vec<f32>,
+    pub ffn_norm: Vec<f32>,
+    pub gate_proj: Vec<f32>,
+    pub up_proj: Vec<f32>,
+    pub down_proj: Vec<f32>,
+}
+
 /// CUDA 加速版 Transformer レイヤー backward。
 ///
-/// d_input のみ返す（weight grads は現時点ではスキップ — ストリーミングモード）。
+/// (d_input, LayerWeightGrads) を返す。
 /// Projection backward の matmul を cuBLAS で実行。
 /// RMSNorm, RoPE, Attention backward は CPU。
 pub fn cuda_layer_backward(
@@ -289,7 +342,7 @@ pub fn cuda_layer_backward(
     weights: &LlamaLayerWeights,
     config: &LlamaConfig,
     seq_len: usize,
-) -> Vec<f32> {
+) -> (Vec<f32>, LayerWeightGrads) {
     let hidden_dim = config.hidden_dim;
     let num_heads = config.num_heads;
     let num_kv_heads = config.num_kv_heads;
@@ -299,28 +352,55 @@ pub fn cuda_layer_backward(
     // ── FFN Backward ──
 
     // 1. SwiGLU FFN backward (CUDA matmul + CPU elementwise)
-    let d_pre_ffn = cuda.swiglu_ffn_backward(
-        d_output,
-        &cache.gate,
-        &cache.up,
-        &cache.gate_silu,
-        &weights.gate_proj,
-        &weights.up_proj,
-        &weights.down_proj,
-        seq_len,
-        hidden_dim,
-        intermediate_dim,
-    );
+    //    down_proj backward: d_intermediate = d_output × down_proj (matmul_nn)
+    let d_intermediate =
+        cuda.matmul_nn(d_output, &weights.down_proj, seq_len, intermediate_dim, hidden_dim);
+
+    // SwiGLU elementwise backward (CPU)
+    let total = seq_len * intermediate_dim;
+    let mut d_gate = vec![0.0f32; total];
+    let mut d_up = vec![0.0f32; total];
+    for idx in 0..total {
+        let d_gate_silu = d_intermediate[idx] * cache.up[idx];
+        d_up[idx] = d_intermediate[idx] * cache.gate_silu[idx];
+        let x = cache.gate[idx];
+        let sig = 1.0 / (1.0 + (-x).exp());
+        let silu_grad = sig * (1.0 + x * (1.0 - sig));
+        d_gate[idx] = d_gate_silu * silu_grad;
+    }
+
+    // gate/up_proj backward: d_input
+    let d_input_gate =
+        cuda.matmul_nn(&d_gate, &weights.gate_proj, seq_len, hidden_dim, intermediate_dim);
+    let d_input_up = cuda.matmul_nn(&d_up, &weights.up_proj, seq_len, hidden_dim, intermediate_dim);
+    let mut d_pre_ffn = d_input_gate;
+    for idx in 0..d_pre_ffn.len() {
+        d_pre_ffn[idx] += d_input_up[idx];
+    }
+
+    // SwiGLU intermediate for down_proj grad: silu(gate) ⊙ up
+    let mut swiglu_out = vec![0.0f32; total];
+    for idx in 0..total {
+        swiglu_out[idx] = cache.gate_silu[idx] * cache.up[idx];
+    }
+
+    // FFN weight grads (matmul_tn: X^T × dY)
+    // down_proj: [hidden×intermediate] ← d_output^T × swiglu_out
+    let d_down_proj = cuda.matmul_tn(d_output, &swiglu_out, seq_len, intermediate_dim, hidden_dim);
+    // gate_proj: [intermediate×hidden] ← d_gate^T × normed_ffn
+    let d_gate_proj = cuda.matmul_tn(&d_gate, &cache.normed_ffn, seq_len, hidden_dim, intermediate_dim);
+    // up_proj: [intermediate×hidden] ← d_up^T × normed_ffn
+    let d_up_proj = cuda.matmul_tn(&d_up, &cache.normed_ffn, seq_len, hidden_dim, intermediate_dim);
 
     // 2. FFN RMSNorm backward (CPU)
     let mut d_pre_ffn_residual = vec![0.0f32; seq_len * hidden_dim];
-    let mut _d_ffn_norm_w = vec![0.0f32; hidden_dim];
+    let mut d_ffn_norm_w = vec![0.0f32; hidden_dim];
     crate::llama_backward::rmsnorm_backward(
         &d_pre_ffn,
         &cache.residual_ffn,
         &weights.ffn_norm,
         &mut d_pre_ffn_residual,
-        &mut _d_ffn_norm_w,
+        &mut d_ffn_norm_w,
         hidden_dim,
         config.norm_eps,
     );
@@ -406,28 +486,15 @@ pub fn cuda_layer_backward(
         config.rope_theta,
     );
 
-    // 7. QKV projection backward (CUDA)
-    //    d_normed = d_q × q_proj + d_k × k_proj + d_v × v_proj
+    // 7. QKV projection backward (CUDA) — d_input + weight grads
     let d_normed_q = cuda.matmul_nn(
-        &d_q,
-        &weights.q_proj,
-        seq_len,
-        hidden_dim,
-        num_heads * head_dim,
+        &d_q, &weights.q_proj, seq_len, hidden_dim, num_heads * head_dim,
     );
     let d_normed_k = cuda.matmul_nn(
-        &d_k,
-        &weights.k_proj,
-        seq_len,
-        hidden_dim,
-        num_kv_heads * head_dim,
+        &d_k, &weights.k_proj, seq_len, hidden_dim, num_kv_heads * head_dim,
     );
     let d_normed_v = cuda.matmul_nn(
-        &d_v,
-        &weights.v_proj,
-        seq_len,
-        hidden_dim,
-        num_kv_heads * head_dim,
+        &d_v, &weights.v_proj, seq_len, hidden_dim, num_kv_heads * head_dim,
     );
 
     let mut d_normed = d_normed_q;
@@ -435,15 +502,51 @@ pub fn cuda_layer_backward(
         d_normed[i] += d_normed_k[i] + d_normed_v[i];
     }
 
+    // O projection weight grad: o_proj[hidden×(heads*head_dim)] ← d_attn_output^T × attn_out_raw
+    // attn_out はcacheに保存されているが attn_out_raw (= o_proj適用前) は保存されていない
+    // cache.attn_out は o_proj 適用後なので、attn_out_raw を再計算する必要がある
+    // ただし RoPE 適用後の Q,K,V + attention weights から復元可能
+    // ここでは近似として cache の q,k,v,attn_weights から再計算
+    let mut attn_out_raw = vec![0.0f32; seq_len * num_heads * head_dim];
+    let kv_group_size2 = num_heads / num_kv_heads;
+    for h in 0..num_heads {
+        let kv_h = h / kv_group_size2;
+        for t in 0..seq_len {
+            for d in 0..head_dim {
+                let mut val = 0.0f32;
+                for s in 0..=t {
+                    let aw = cache.attn_weights[h * seq_len * seq_len + t * seq_len + s];
+                    let v_idx = s * num_kv_heads * head_dim + kv_h * head_dim + d;
+                    val += aw * cache.v[v_idx];
+                }
+                attn_out_raw[t * num_heads * head_dim + h * head_dim + d] = val;
+            }
+        }
+    }
+    let d_o_proj = cuda.matmul_tn(
+        &d_attn_output, &attn_out_raw, seq_len, num_heads * head_dim, hidden_dim,
+    );
+
+    // QKV weight grads: W[out×in] ← d_out^T × normed_attn
+    let d_q_proj = cuda.matmul_tn(
+        &d_q, &cache.normed_attn, seq_len, hidden_dim, num_heads * head_dim,
+    );
+    let d_k_proj = cuda.matmul_tn(
+        &d_k, &cache.normed_attn, seq_len, hidden_dim, num_kv_heads * head_dim,
+    );
+    let d_v_proj = cuda.matmul_tn(
+        &d_v, &cache.normed_attn, seq_len, hidden_dim, num_kv_heads * head_dim,
+    );
+
     // 8. Attention RMSNorm backward (CPU)
     let mut d_input = vec![0.0f32; seq_len * hidden_dim];
-    let mut _d_attn_norm_w = vec![0.0f32; hidden_dim];
+    let mut d_attn_norm_w = vec![0.0f32; hidden_dim];
     crate::llama_backward::rmsnorm_backward(
         &d_normed,
         &cache.residual_attn,
         &weights.attn_norm,
         &mut d_input,
-        &mut _d_attn_norm_w,
+        &mut d_attn_norm_w,
         hidden_dim,
         config.norm_eps,
     );
@@ -453,7 +556,19 @@ pub fn cuda_layer_backward(
         d_input[i] += d_attn_output[i];
     }
 
-    d_input
+    let grads = LayerWeightGrads {
+        attn_norm: d_attn_norm_w,
+        q_proj: d_q_proj,
+        k_proj: d_k_proj,
+        v_proj: d_v_proj,
+        o_proj: d_o_proj,
+        ffn_norm: d_ffn_norm_w,
+        gate_proj: d_gate_proj,
+        up_proj: d_up_proj,
+        down_proj: d_down_proj,
+    };
+
+    (d_input, grads)
 }
 
 #[cfg(test)]

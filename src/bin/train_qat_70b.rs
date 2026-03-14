@@ -29,9 +29,9 @@ use std::time::Instant;
 
 use alice_train::llama::QatTrainConfig;
 use alice_train::{
-    CheckpointData, CudaMatmul, DataLoader, DataLoaderConfig, FakeQuantize, LogEntry,
-    LossScaler, LrScheduler, MixedPrecisionConfig, MmapDataset, OffloadConfig, QatConfig, TrainLog,
-    WarmupCosineScheduler,
+    CheckpointData, CudaMatmul, DataLoader, DataLoaderConfig, FakeQuantize, LayerWeightGrads,
+    LogEntry, LossScaler, LrScheduler, MixedPrecisionConfig, MmapDataset, OffloadConfig,
+    QatConfig, TrainLog, WarmupCosineScheduler,
 };
 
 /// ALICE-Train QAT: Llama-3 → 1.1-bit Sparse Ternary
@@ -582,11 +582,13 @@ fn main() {
                 let mut layer_inputs: Vec<Vec<f32>> = Vec::with_capacity(num_layers);
                 for i in 0..num_layers {
                     layer_inputs.push(hidden.clone());
-                    let lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
+                    let mut lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
                         .unwrap_or_else(|| {
                             eprintln!("[ALICE-Train] レイヤー {i} の重み読み込み失敗");
                             std::process::exit(1);
                         });
+                    // 学習済み delta を適用
+                    apply_delta_to_weights(&mut lw, i, &config.checkpoint_dir);
                     // forward のみ — cache は捨てる
                     let _cache = cuda_layer_forward(&cuda, &mut hidden, &lw, &config.model, seq_len);
                     // lw + _cache はここで drop — メモリ解放
@@ -653,21 +655,21 @@ fn main() {
                     output_norm[h] -= lr * (d_output_norm_w[h] * inv_tokens + config.weight_decay * output_norm[h]);
                 }
 
-                // Backward: 逆順 — 勾配チェックポインティング
-                // 各レイヤーの入力hiddenからforward再計算してcache取得 → backward → drop
+                // Backward: 逆順 — 勾配チェックポインティング + 重み更新
                 let mut d_layer_input = d_hidden;
                 for i in (0..num_layers).rev() {
-                    let lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
+                    let mut lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
                         .unwrap_or_else(|| {
                             eprintln!("[ALICE-Train] レイヤー {i} backward: 重み読み込み失敗");
                             std::process::exit(1);
                         });
+                    apply_delta_to_weights(&mut lw, i, &config.checkpoint_dir);
 
                     // forward 再計算で cache を取得
                     let mut recompute_hidden = layer_inputs[i].clone();
                     let cache = cuda_layer_forward(&cuda, &mut recompute_hidden, &lw, &config.model, seq_len);
 
-                    d_layer_input = cuda_layer_backward(
+                    let (d_input, grads) = cuda_layer_backward(
                         &cuda,
                         &d_layer_input,
                         &cache,
@@ -675,7 +677,14 @@ fn main() {
                         &config.model,
                         seq_len,
                     );
-                    // lw + cache は drop — メモリ解放
+                    d_layer_input = d_input;
+
+                    // 重み更新: delta ファイルにSGDで蓄積
+                    apply_layer_grads_to_delta(
+                        i, &grads, lr, inv_tokens, config.weight_decay,
+                        &config.checkpoint_dir,
+                    );
+                    // lw + cache + grads は drop — メモリ解放
                 }
 
                 // Embedding gradient update
@@ -776,6 +785,91 @@ fn main() {
                     last.loss,
                     first.loss - last.loss
                 );
+            }
+        }
+    }
+}
+
+// ── Delta Weight 管理 ────────────────────────────────────────────────────
+
+/// レイヤーiの重み delta をファイルから読み込む。存在しなければゼロ初期化。
+fn load_layer_delta(layer_idx: usize, weight_name: &str, size: usize, checkpoint_dir: &str) -> Vec<f32> {
+    let path = format!("{}/delta_layer{layer_idx}_{weight_name}.bin", checkpoint_dir);
+    if let Ok(data) = std::fs::read(&path) {
+        if data.len() == size * 4 {
+            let mut out = vec![0.0f32; size];
+            for i in 0..size {
+                out[i] = f32::from_le_bytes([data[i*4], data[i*4+1], data[i*4+2], data[i*4+3]]);
+            }
+            return out;
+        }
+    }
+    vec![0.0f32; size]
+}
+
+/// レイヤーiの重み delta をファイルに保存。
+fn save_layer_delta(layer_idx: usize, weight_name: &str, delta: &[f32], checkpoint_dir: &str) {
+    let path = format!("{}/delta_layer{layer_idx}_{weight_name}.bin", checkpoint_dir);
+    let mut data = Vec::with_capacity(delta.len() * 4);
+    for &v in delta {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    if let Err(e) = std::fs::write(&path, &data) {
+        eprintln!("  delta保存失敗 layer{layer_idx}/{weight_name}: {e}");
+    }
+}
+
+/// レイヤーの勾配を delta ファイルにSGD更新で蓄積。
+fn apply_layer_grads_to_delta(
+    layer_idx: usize,
+    grads: &LayerWeightGrads,
+    lr: f32,
+    inv_tokens: f32,
+    weight_decay: f32,
+    checkpoint_dir: &str,
+) {
+    let names_and_grads: &[(&str, &[f32])] = &[
+        ("attn_norm", &grads.attn_norm),
+        ("q_proj", &grads.q_proj),
+        ("k_proj", &grads.k_proj),
+        ("v_proj", &grads.v_proj),
+        ("o_proj", &grads.o_proj),
+        ("ffn_norm", &grads.ffn_norm),
+        ("gate_proj", &grads.gate_proj),
+        ("up_proj", &grads.up_proj),
+        ("down_proj", &grads.down_proj),
+    ];
+
+    for &(name, grad) in names_and_grads {
+        let mut delta = load_layer_delta(layer_idx, name, grad.len(), checkpoint_dir);
+        for j in 0..delta.len() {
+            // SGD with weight decay: delta -= lr * (grad * inv_tokens + weight_decay * delta)
+            delta[j] -= lr * (grad[j] * inv_tokens + weight_decay * delta[j]);
+        }
+        save_layer_delta(layer_idx, name, &delta, checkpoint_dir);
+    }
+}
+
+/// delta をレイヤー重みに適用（forward用）。
+fn apply_delta_to_weights(lw: &mut LlamaLayerWeights, layer_idx: usize, checkpoint_dir: &str) {
+    let fields: &mut [(&str, &mut Vec<f32>)] = &mut [
+        ("attn_norm", &mut lw.attn_norm),
+        ("q_proj", &mut lw.q_proj),
+        ("k_proj", &mut lw.k_proj),
+        ("v_proj", &mut lw.v_proj),
+        ("o_proj", &mut lw.o_proj),
+        ("ffn_norm", &mut lw.ffn_norm),
+        ("gate_proj", &mut lw.gate_proj),
+        ("up_proj", &mut lw.up_proj),
+        ("down_proj", &mut lw.down_proj),
+    ];
+    for (name, weight) in fields.iter_mut() {
+        let delta_path = format!("{}/delta_layer{layer_idx}_{name}.bin", checkpoint_dir);
+        if let Ok(data) = std::fs::read(&delta_path) {
+            if data.len() == weight.len() * 4 {
+                for i in 0..weight.len() {
+                    weight[i] += f32::from_le_bytes([data[i*4], data[i*4+1], data[i*4+2], data[i*4+3]]);
+                }
             }
         }
     }
