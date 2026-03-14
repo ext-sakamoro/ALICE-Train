@@ -585,12 +585,18 @@ fn main() {
                 std::io::stderr().flush().ok();
                 let mut caches: Vec<LayerCache> = Vec::with_capacity(num_layers);
                 for i in 0..num_layers {
+                    eprintln!("[DEBUG] forward layer {i}/{num_layers}");
+                    std::io::stderr().flush().ok();
                     let lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
                         .unwrap_or_else(|| {
                             eprintln!("[ALICE-Train] レイヤー {i} の重み読み込み失敗");
                             std::process::exit(1);
                         });
+                    eprintln!("[DEBUG] forward layer {i} weights loaded");
+                    std::io::stderr().flush().ok();
                     let cache = cuda_layer_forward(&cuda, &mut hidden, &lw, &config.model, seq_len);
+                    eprintln!("[DEBUG] forward layer {i} done");
+                    std::io::stderr().flush().ok();
                     caches.push(cache);
                     // lw はここで drop — メモリ解放
                 }
