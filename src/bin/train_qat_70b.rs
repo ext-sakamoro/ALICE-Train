@@ -678,11 +678,20 @@ fn main() {
                     seq_len, hidden_dim, vocab_size,
                 );
                 // Output projection 勾配: d_output_proj = d_logits^T × hidden_normed
-                // d_logits: [seq × vocab], hidden_normed: [seq × hidden] → d_proj: [vocab × hidden]
-                let d_output_proj = cuda.matmul_tn(
-                    &d_logits_flat, &hidden,
-                    seq_len, hidden_dim, vocab_size,
-                );
+                // CPU計算: [vocab × hidden] — seq_len が小さいので GPU 不要
+                let mut d_output_proj = vec![0.0f32; vocab_size * hidden_dim];
+                for t in 0..seq_len {
+                    if let Some(ref dl) = d_logits_per_token[t] {
+                        let h_offset = t * hidden_dim;
+                        for v in 0..vocab_size {
+                            if dl[v].abs() < 1e-10 { continue; }
+                            let p_offset = v * hidden_dim;
+                            for h in 0..hidden_dim {
+                                d_output_proj[p_offset + h] += dl[v] * hidden[h_offset + h];
+                            }
+                        }
+                    }
+                }
                 // output_proj delta をファイルに蓄積
                 apply_global_grads_to_delta(
                     "output_proj", &d_output_proj,
