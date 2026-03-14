@@ -44,7 +44,7 @@ def main():
     # Dataset
     print("Loading dataset...")
     from datasets import load_dataset
-    ds = load_dataset(args.dataset, args.dataset_config, split=args.split, trust_remote_code=True)
+    ds = load_dataset(args.dataset, args.dataset_config, split=args.split)
     print(f"  Samples: {len(ds)}")
     print()
 
