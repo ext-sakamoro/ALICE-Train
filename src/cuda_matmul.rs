@@ -138,19 +138,21 @@ impl CudaMatmul {
     /// C[m×n] = A[m×k]^T × B[m×n]  (row-major)
     ///
     /// 実際は C[k×n] = A^T[k×m] × B[m×n] — 重み勾配計算用。
-    /// cuBLAS: C^T[n×k] = B^T[n×m] × A[m×k]
+    /// cuBLAS: C^T[n×k] = B_cm[n×m] × trans(A_cm[k×m])
+    /// B_rm[m×n] → B_cm[n×m] (ld=n). transa=N, lda=n.
+    /// A_rm[m×k] → A_cm[k×m] (ld=k). transb=T → [m×k], ldb=k.
     pub fn matmul_tn(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
         // A is [m×k], B is [m×n], output C is [k×n]
         let d_a = self.stream.clone_htod(a).expect("A→GPU 転送失敗");
         let d_b = self.stream.clone_htod(b).expect("B→GPU 転送失敗");
         let mut d_c: CudaSlice<f32> = self.stream.alloc_zeros(k * n).expect("C 確保失敗");
 
-        // C^T[n×k] = B^T[n×m] × A[m×k]
-        // B_rm[m×n] → B_cm[n×m] (ld=n) → B^T is [n×m], transa=N, lda=n → already transposed
-        // A_rm[m×k] → A_cm[k×m] (ld=k) → transb=N, ldb=k
+        // C_cm[n×k] = B_cm[n×m] × trans(A_cm[k×m])
+        // B_rm[m×n] → B_cm[n×m] (ld=n) → transa=N, lda=n
+        // A_rm[m×k] → A_cm[k×m] (ld=k) → transb=T, ldb=k
         let cfg = GemmConfig {
             transa: cublasOperation_t::CUBLAS_OP_N,
-            transb: cublasOperation_t::CUBLAS_OP_N,
+            transb: cublasOperation_t::CUBLAS_OP_T,
             m: n as i32,
             n: k as i32,
             k: m as i32,
