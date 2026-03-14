@@ -547,6 +547,9 @@ fn main() {
         let mut batch_idx = 0usize;
 
         while global_step < config.total_steps {
+            eprintln!("[DEBUG] step {} 開始 — batch_idx={}", global_step, batch_idx);
+            use std::io::Write;
+            std::io::stderr().flush().ok();
             let lr = scheduler.get_lr(global_step);
             let step_start = Instant::now();
 
@@ -578,6 +581,8 @@ fn main() {
                 }
 
                 // Forward: 1レイヤーずつ読み込み → GPU forward → cache 保存 → 重み破棄
+                eprintln!("[DEBUG] step {} forward開始", global_step);
+                std::io::stderr().flush().ok();
                 let mut caches: Vec<LayerCache> = Vec::with_capacity(num_layers);
                 for i in 0..num_layers {
                     let lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
@@ -591,6 +596,8 @@ fn main() {
                 }
 
                 // Output RMSNorm + projection
+                eprintln!("[DEBUG] step {} forward完了 — logits計算", global_step);
+                std::io::stderr().flush().ok();
                 let hidden_pre_norm = hidden.clone();
                 rmsnorm(&mut hidden, &output_norm, hidden_dim, config.model.norm_eps);
 
@@ -614,6 +621,8 @@ fn main() {
                 }
 
                 // --- Backward ---
+                eprintln!("[DEBUG] step {} backward開始", global_step);
+                std::io::stderr().flush().ok();
                 let inv_tokens = 1.0 / token_count.max(1) as f32;
 
                 // Output projection backward — CUDA matmul_nn で d_hidden を計算
@@ -650,6 +659,8 @@ fn main() {
                 }
 
                 // Backward: 逆順ストリーミング — 1レイヤーずつ reload → CUDA backward → drop
+                eprintln!("[DEBUG] step {} layer backward開始", global_step);
+                std::io::stderr().flush().ok();
                 let mut d_layer_input = d_hidden;
                 for i in (0..num_layers).rev() {
                     let lw = LlamaLayerWeights::from_tensors(i, &get_tensor, &config.model)
@@ -670,6 +681,8 @@ fn main() {
                 }
 
                 // Embedding gradient update
+                eprintln!("[DEBUG] step {} embedding更新", global_step);
+                std::io::stderr().flush().ok();
                 for t in 0..seq_len {
                     let tok = token_ids[t] as usize;
                     if tok < vocab_size {
