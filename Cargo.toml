@@ -46,7 +46,10 @@ pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 
 # CUDA (optional)
-cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "cublas", "dynamic-loading", "cuda-12000"], optional = true }
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "cublas", "nvrtc", "dynamic-loading", "cuda-12000"], optional = true }
+
+# madvise for mmap page cache control
+libc = "0.2"
 
 # Parallelization
 rayon = "1.10"

@@ -4,6 +4,7 @@
 //! backward 用に中間活性化を `LayerCache` に保存する。
 
 use crate::llama::{LlamaConfig, LlamaLayerWeights};
+use rayon::prelude::*;
 
 /// 1レイヤーの forward 中間活性化（backward 用）。
 pub struct LayerCache {
@@ -75,19 +76,13 @@ pub fn matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize)
 /// `x`: (seq_len × dim) in-place 更新。
 /// `weight`: (dim,)
 pub fn rmsnorm(x: &mut [f32], weight: &[f32], dim: usize, eps: f32) {
-    let seq_len = x.len() / dim;
-    for t in 0..seq_len {
-        let row = &mut x[t * dim..(t + 1) * dim];
-        let mut ss = 0.0f32;
-        for &v in row.iter() {
-            ss = v.mul_add(v, ss);
-        }
-        let rms = (ss / dim as f32 + eps).sqrt();
-        let inv_rms = 1.0 / rms;
-        for (v, &w) in row.iter_mut().zip(weight.iter()) {
+    x.par_chunks_exact_mut(dim).for_each(|row| {
+        let ss: f64 = row.iter().map(|&v| (v as f64) * (v as f64)).sum();
+        let inv_rms = 1.0 / (ss / dim as f64 + eps as f64).sqrt() as f32;
+        row.iter_mut().zip(weight.iter()).for_each(|(v, &w)| {
             *v *= inv_rms * w;
-        }
-    }
+        });
+    });
 }
 
 /// Bias 加算: x (seq_len × dim) の各行に bias (dim,) を加算。
@@ -110,24 +105,25 @@ pub fn apply_rope(
     x: &mut [f32],
     n_heads: usize,
     head_dim: usize,
-    seq_len: usize,
+    _seq_len: usize,
     theta: f32,
 ) {
-    for t in 0..seq_len {
+    let stride = n_heads * head_dim;
+    x.par_chunks_exact_mut(stride).enumerate().for_each(|(t, token)| {
         for h in 0..n_heads {
-            let base = t * n_heads * head_dim + h * head_dim;
+            let base = h * head_dim;
             for d in (0..head_dim).step_by(2) {
                 let freq = 1.0 / theta.powf(d as f32 / head_dim as f32);
                 let angle = t as f32 * freq;
                 let cos_a = angle.cos();
                 let sin_a = angle.sin();
-                let x0 = x[base + d];
-                let x1 = x[base + d + 1];
-                x[base + d] = x0.mul_add(cos_a, -(x1 * sin_a));
-                x[base + d + 1] = x0.mul_add(sin_a, x1 * cos_a);
+                let x0 = token[base + d];
+                let x1 = token[base + d + 1];
+                token[base + d] = x0.mul_add(cos_a, -(x1 * sin_a));
+                token[base + d + 1] = x0.mul_add(sin_a, x1 * cos_a);
             }
         }
-    }
+    });
 }
 
 // ── GQA Attention ──────────────────────────────────────────────────────────

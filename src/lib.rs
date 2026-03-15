@@ -84,6 +84,7 @@
 
 pub mod activation;
 pub mod backward;
+pub mod fast_math;
 pub mod checkpoint;
 pub mod dataloader;
 pub mod distill;
@@ -141,4 +142,4 @@ pub use gpu_matmul::GpuMatmul;
 
 // CUDA re-exports
 #[cfg(feature = "cuda")]
-pub use cuda_matmul::{CudaMatmul, LayerWeightGrads};
+pub use cuda_matmul::{CudaMatmul, CudaLayerWorkspace, LayerWeightGrads, VramLayerWeights};

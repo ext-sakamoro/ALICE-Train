@@ -3,6 +3,7 @@
 //! 各関数は DPS パターン: `(input, grad_output, grad_input)` で勾配を書き込む。
 
 use std::f32::consts::FRAC_2_SQRT_PI;
+use rayon::prelude::*;
 
 /// `ReLU` の逆伝播。
 ///
@@ -15,9 +16,12 @@ pub fn relu_backward(input: &[f32], grad_output: &[f32], grad_input: &mut [f32])
     assert_eq!(input.len(), grad_output.len());
     assert_eq!(input.len(), grad_input.len());
 
-    for i in 0..input.len() {
-        grad_input[i] = if input[i] > 0.0 { grad_output[i] } else { 0.0 };
-    }
+    input.par_iter()
+        .zip(grad_output.par_iter())
+        .zip(grad_input.par_iter_mut())
+        .for_each(|((&x, &go), gi)| {
+            *gi = if x > 0.0 { go } else { 0.0 };
+        });
 }
 
 /// `SiLU` (Swish) の逆伝播。
@@ -32,12 +36,14 @@ pub fn silu_backward(input: &[f32], grad_output: &[f32], grad_input: &mut [f32])
     assert_eq!(input.len(), grad_output.len());
     assert_eq!(input.len(), grad_input.len());
 
-    for i in 0..input.len() {
-        let x = input[i];
-        let sig = 1.0 / (1.0 + (-x).exp());
-        let dsilu = sig * x.mul_add(1.0 - sig, 1.0);
-        grad_input[i] = grad_output[i] * dsilu;
-    }
+    input.par_iter()
+        .zip(grad_output.par_iter())
+        .zip(grad_input.par_iter_mut())
+        .for_each(|((&x, &go), gi)| {
+            let sig = 1.0 / (1.0 + (-x).exp());
+            let dsilu = sig * x.mul_add(1.0 - sig, 1.0);
+            *gi = go * dsilu;
+        });
 }
 
 /// GELU の逆伝播（tanh 近似版）。
@@ -54,16 +60,17 @@ pub fn gelu_backward(input: &[f32], grad_output: &[f32], grad_input: &mut [f32])
     let sqrt_2_over_pi = FRAC_2_SQRT_PI * std::f32::consts::FRAC_1_SQRT_2;
     let c = 0.044_715_f32;
 
-    for i in 0..input.len() {
-        let x = input[i];
-        let arg = sqrt_2_over_pi * (c * x * x).mul_add(x, x);
-        let tanh_val = arg.tanh();
-        let sech2 = tanh_val.mul_add(-tanh_val, 1.0);
-        let d_inner = sqrt_2_over_pi * 3.0_f32.mul_add(c * x * x, 1.0);
-
-        let dgelu = 0.5_f32.mul_add(1.0 + tanh_val, 0.5 * x * sech2 * d_inner);
-        grad_input[i] = grad_output[i] * dgelu;
-    }
+    input.par_iter()
+        .zip(grad_output.par_iter())
+        .zip(grad_input.par_iter_mut())
+        .for_each(|((&x, &go), gi)| {
+            let arg = sqrt_2_over_pi * (c * x * x).mul_add(x, x);
+            let tanh_val = arg.tanh();
+            let sech2 = tanh_val.mul_add(-tanh_val, 1.0);
+            let d_inner = sqrt_2_over_pi * 3.0_f32.mul_add(c * x * x, 1.0);
+            let dgelu = 0.5_f32.mul_add(1.0 + tanh_val, 0.5 * x * sech2 * d_inner);
+            *gi = go * dgelu;
+        });
 }
 
 // ============================================================================

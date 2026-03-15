@@ -57,10 +57,12 @@ def main():
             continue
 
         tokens = tokenizer.encode(text, add_special_tokens=False)
-        # BOS + tokens + EOS
-        all_tokens.append(tokenizer.bos_token_id)
+        # BOS + tokens + EOS (skip if token_id is None)
+        if tokenizer.bos_token_id is not None:
+            all_tokens.append(tokenizer.bos_token_id)
         all_tokens.extend(tokens)
-        all_tokens.append(tokenizer.eos_token_id)
+        if tokenizer.eos_token_id is not None:
+            all_tokens.append(tokenizer.eos_token_id)
 
         if len(all_tokens) >= args.max_tokens:
             all_tokens = all_tokens[:args.max_tokens]
@@ -76,7 +78,7 @@ def main():
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "wb") as f:
         for tok in all_tokens:
-            f.write(struct.pack("<I", tok))
+            f.write(struct.pack("<I", int(tok)))
 
     file_size = os.path.getsize(args.output)
     print(f"Saved: {args.output} ({file_size:,} bytes, {file_size/1024/1024:.1f} MB)")

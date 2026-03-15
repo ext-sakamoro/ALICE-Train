@@ -147,6 +147,41 @@ impl ShardedModel {
         let tensor = st.tensor(name).ok()?;
         Some(tensor.shape().to_vec())
     }
+
+    /// 指定シャードのページキャッシュを解放するようOSにヒントを送る。
+    /// mmap データ自体は有効なまま（次回アクセス時にディスクから再読込）。
+    #[cfg(unix)]
+    pub fn advise_dontneed(&self, shard_name: &str) {
+        if let Some(mmap) = self.shards.get(shard_name) {
+            unsafe {
+                libc::madvise(
+                    mmap.as_ptr() as *mut libc::c_void,
+                    mmap.len(),
+                    libc::MADV_DONTNEED,
+                );
+            }
+        }
+    }
+
+    /// 全シャードのページキャッシュを解放するようOSにヒントを送る。
+    #[cfg(unix)]
+    pub fn advise_dontneed_all(&self) {
+        for (_, mmap) in &self.shards {
+            unsafe {
+                libc::madvise(
+                    mmap.as_ptr() as *mut libc::c_void,
+                    mmap.len(),
+                    libc::MADV_DONTNEED,
+                );
+            }
+        }
+    }
+
+    /// テンソル名からシャードファイル名を取得する。
+    #[must_use]
+    pub fn shard_for_tensor(&self, name: &str) -> Option<&str> {
+        self.weight_map.get(name).map(String::as_str)
+    }
 }
 
 /// BF16 バイト列 → FP32 Vec。

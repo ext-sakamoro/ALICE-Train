@@ -5,6 +5,7 @@
 
 use crate::llama::{LlamaConfig, LlamaLayerWeights};
 use crate::llama_forward::LayerCache;
+use rayon::prelude::*;
 
 /// 1レイヤーの重み勾配。
 pub struct LayerWeightGrads {
@@ -155,37 +156,56 @@ pub fn rmsnorm_backward(
     eps: f32,
 ) {
     let seq_len = input.len() / dim;
-    for t in 0..seq_len {
-        let off = t * dim;
-        let x = &input[off..off + dim];
-        let dy = &d_output[off..off + dim];
 
-        // rms = sqrt(mean(x^2) + eps)
-        let mut ss = 0.0f32;
-        for &v in x {
-            ss = v.mul_add(v, ss);
-        }
-        let rms = (ss / dim as f32 + eps).sqrt();
-        let inv_rms = 1.0 / rms;
+    // d_input: トークンごとに独立 → 並列化
+    d_input
+        .par_chunks_exact_mut(dim)
+        .enumerate()
+        .for_each(|(t, d_in_row)| {
+            let off = t * dim;
+            let x = &input[off..off + dim];
+            let dy = &d_output[off..off + dim];
 
-        // d_weight 累積: d_weight[d] += dy[d] * x[d] / rms
-        for d in 0..dim {
-            d_weight[d] += dy[d] * x[d] * inv_rms;
-        }
+            let ss: f64 = x.iter().map(|&v| (v as f64) * (v as f64)).sum();
+            let inv_rms = (1.0 / (ss / dim as f64 + eps as f64).sqrt()) as f32;
+            let inv_rms3 = inv_rms * inv_rms * inv_rms;
 
-        // d_input: 標準的な RMSNorm backward
-        // normed = x * inv_rms
-        // d_rms_inv = sum(dy * w * x)
-        let mut d_rms_sum = 0.0f32;
-        for d in 0..dim {
-            d_rms_sum += dy[d] * weight[d] * x[d];
-        }
-        let inv_rms3 = inv_rms * inv_rms * inv_rms;
+            let d_rms_sum: f32 = (0..dim).map(|d| dy[d] * weight[d] * x[d]).sum();
 
-        for d in 0..dim {
-            let d_norm = dy[d] * weight[d];
-            d_input[off + d] += d_norm * inv_rms - d_rms_sum * x[d] * inv_rms3 / dim as f32;
-        }
+            for d in 0..dim {
+                let d_norm = dy[d] * weight[d];
+                d_in_row[d] += d_norm * inv_rms - d_rms_sum * x[d] * inv_rms3 / dim as f32;
+            }
+        });
+
+    // d_weight: 全トークンから累積 — par_chunks → thread-local 集約
+    let partial: Vec<f32> = (0..seq_len)
+        .into_par_iter()
+        .fold(
+            || vec![0.0f32; dim],
+            |mut acc, t| {
+                let off = t * dim;
+                let x = &input[off..off + dim];
+                let dy = &d_output[off..off + dim];
+                let ss: f64 = x.iter().map(|&v| (v as f64) * (v as f64)).sum();
+                let inv_rms = (1.0 / (ss / dim as f64 + eps as f64).sqrt()) as f32;
+                for d in 0..dim {
+                    acc[d] += dy[d] * x[d] * inv_rms;
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![0.0f32; dim],
+            |mut a, b| {
+                for d in 0..dim {
+                    a[d] += b[d];
+                }
+                a
+            },
+        );
+    for d in 0..dim {
+        d_weight[d] += partial[d];
     }
 }
 
@@ -196,25 +216,25 @@ pub fn rope_backward(
     d_x: &mut [f32],
     n_heads: usize,
     head_dim: usize,
-    seq_len: usize,
+    _seq_len: usize,
     theta: f32,
 ) {
-    for t in 0..seq_len {
+    let stride = n_heads * head_dim;
+    d_x.par_chunks_exact_mut(stride).enumerate().for_each(|(t, token)| {
         for h in 0..n_heads {
-            let base = t * n_heads * head_dim + h * head_dim;
+            let base = h * head_dim;
             for d in (0..head_dim).step_by(2) {
                 let freq = 1.0 / theta.powf(d as f32 / head_dim as f32);
                 let angle = t as f32 * freq;
                 let cos_a = angle.cos();
                 let sin_a = angle.sin();
-                // 逆回転: cos, +sin → cos, -sin (転置)
-                let d0 = d_x[base + d];
-                let d1 = d_x[base + d + 1];
-                d_x[base + d] = d0.mul_add(cos_a, d1 * sin_a);
-                d_x[base + d + 1] = (-d0).mul_add(sin_a, d1 * cos_a);
+                let d0 = token[base + d];
+                let d1 = token[base + d + 1];
+                token[base + d] = d0.mul_add(cos_a, d1 * sin_a);
+                token[base + d + 1] = (-d0).mul_add(sin_a, d1 * cos_a);
             }
         }
-    }
+    });
 }
 
 // ── Attention backward ─────────────────────────────────────────────────────

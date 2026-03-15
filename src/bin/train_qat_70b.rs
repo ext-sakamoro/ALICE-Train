@@ -35,6 +35,39 @@ use alice_train::{
     QatConfig, TrainLog, WarmupCosineScheduler,
 };
 
+/// プロセスの RSS (Resident Set Size) を MB 単位で表示する。
+fn print_rss(label: &str) {
+    #[cfg(unix)]
+    {
+        // /proc/self/statm (Linux) から RSS を取得
+        if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+            let fields: Vec<&str> = statm.split_whitespace().collect();
+            if fields.len() >= 2 {
+                if let Ok(rss_pages) = fields[1].parse::<u64>() {
+                    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+                    let rss_mb = rss_pages * page_size / 1024 / 1024;
+                    println!("  [RSS] {label}: {rss_mb} MB");
+                    return;
+                }
+            }
+        }
+        // macOS fallback: rusage
+        unsafe {
+            let mut usage: libc::rusage = std::mem::zeroed();
+            if libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0 {
+                // macOS: ru_maxrss は bytes、Linux: KB
+                #[cfg(target_os = "macos")]
+                let rss_mb = usage.ru_maxrss as u64 / 1024 / 1024;
+                #[cfg(not(target_os = "macos"))]
+                let rss_mb = usage.ru_maxrss as u64 / 1024;
+                println!("  [RSS] {label}: {rss_mb} MB (peak)");
+                return;
+            }
+        }
+    }
+    let _ = label;
+}
+
 /// ALICE-Train QAT: Llama-3 → 1.1-bit Sparse Ternary
 #[derive(Parser, Debug)]
 #[command(author = "Moroya Sakamoto")]
@@ -508,7 +541,7 @@ fn main() {
         use alice_train::llama::LlamaLayerWeights;
         use alice_train::llama_backward::rmsnorm_backward_output;
         use alice_train::llama_forward::rmsnorm;
-        use alice_train::cuda_matmul::{cuda_layer_forward, cuda_layer_backward};
+        use alice_train::cuda_matmul::{cuda_layer_forward_eval_ws, cuda_layer_forward_eval_ws_vram, cuda_layer_forward_ws_vram, cuda_layer_backward_ws_vram, CudaLayerWorkspace, VramLayerWeights};
         use alice_train::safetensors_loader::ShardedModel;
 
         let model = ShardedModel::open(&config.model_path).unwrap_or_else(|e| {
@@ -600,21 +633,24 @@ fn main() {
 
         // Delta をRAMにキャッシュ（ファイルI/O排除）
         // bf16_delta=true の場合は BF16 圧縮して RAM 半減
+        // ★ 1層ずつ変換してピークメモリを抑制（旧: 全層FP32→全層BF16 で2倍ピーク）
         let mut delta_cache: Vec<LayerDeltaCache>;
         let mut bf16_delta_store: Vec<Bf16DeltaStore>;
         if config.bf16_delta {
-            let f32_caches: Vec<LayerDeltaCache> = (0..num_layers)
-                .map(|i| LayerDeltaCache::load_from_disk(i, &config.model, &config.checkpoint_dir))
-                .collect();
-            bf16_delta_store = f32_caches.iter().map(Bf16DeltaStore::from_f32).collect();
-            delta_cache = Vec::new(); // BF16 モードでは使わない
+            bf16_delta_store = Vec::with_capacity(num_layers);
+            for i in 0..num_layers {
+                let f32_cache = LayerDeltaCache::load_from_disk(i, &config.model, &config.checkpoint_dir);
+                bf16_delta_store.push(Bf16DeltaStore::from_f32(&f32_cache));
+                // f32_cache は即 drop — 1層分のFP32しかピークに載らない
+            }
+            delta_cache = Vec::new();
             println!("    delta キャッシュ初期化完了 (BF16 圧縮: {:.1} GB)",
                 (num_layers * layer_bytes / 2) as f64 / 1024.0 / 1024.0 / 1024.0);
         } else {
             delta_cache = (0..num_layers)
                 .map(|i| LayerDeltaCache::load_from_disk(i, &config.model, &config.checkpoint_dir))
                 .collect();
-            bf16_delta_store = Vec::new(); // FP32 モードでは使わない
+            bf16_delta_store = Vec::new();
             println!("    delta キャッシュ初期化完了 (FP32: {:.1} GB)",
                 (num_layers * layer_bytes) as f64 / 1024.0 / 1024.0 / 1024.0);
         }
@@ -623,6 +659,11 @@ fn main() {
         println!("  CUDA 初期化...");
         let cuda = CudaMatmul::new();
         println!("    CUDA ready: cuBLAS sgemm 初期化完了");
+
+        // CudaLayerWorkspace: 全レイヤー共通バッファ（起動時1回だけ確保）
+        let mut cuda_ws = CudaLayerWorkspace::new(&config.model, config.seq_len);
+        let ws_mb = cuda_ws.size_bytes() as f64 / 1024.0 / 1024.0;
+        println!("    CudaLayerWorkspace: {:.1} MB (forward+backward共通バッファ)", ws_mb);
 
         // メモリ見積もり
         let embed_mb = (embedding_table.len() + output_proj.len() + output_norm.len()) as f64 * 4.0 / 1024.0 / 1024.0;
@@ -644,6 +685,15 @@ fn main() {
             println!("    ピーク: {:.1} GB + activations",
                 (embed_mb + delta_mb) / 1024.0);
         }
+        // RSS 実測値表示
+        print_rss("初期化完了");
+
+        // mmap モードでは初期化後にページキャッシュを解放
+        #[cfg(unix)]
+        if !config.preload_all_layers {
+            model.advise_dontneed_all();
+            println!("  mmap ページキャッシュ解放ヒント送信済み");
+        }
         println!();
 
         // --- Phase 2 学習ループ ---
@@ -656,8 +706,6 @@ fn main() {
         let mut batch_idx = 0usize;
 
         let accum_steps = config.gradient_accumulation_steps.max(1);
-        let mut accum_loss = 0.0f32;
-        let mut micro_step = 0usize;
 
         // ゼロアロケーション用ワークスペース（ループ外で1回だけ確保）
         let mut workspace_lw = get_base_layer(&base_weights, 0, &get_tensor, &config.model);
@@ -674,6 +722,11 @@ fn main() {
         };
         let use_bf16_delta = config.bf16_delta;
 
+        // 究極チューン2: 真の勾配累積 — micro-batch間で勾配を加算し、最後に1回だけ apply_grads
+        let mut accumulated_grads: Vec<LayerWeightGrads> = (0..num_layers)
+            .map(|_| LayerWeightGrads::zeros(&config.model))
+            .collect();
+
         while global_step < config.total_steps {
 
             let lr = scheduler.get_lr(global_step);
@@ -681,92 +734,128 @@ fn main() {
             let effective_lr = lr / accum_steps as f32;
             let step_start = Instant::now();
 
-            if batch_idx >= num_batches {
-                loader.shuffle_epoch();
-                batch_idx = 0;
-                // Epoch 境界で temperature annealing
-                fq.step_temperature();
-                println!("    [epoch boundary] temperature: {:.4}", fq.temperature());
-            }
-
-            let batch = loader.get_batch(batch_idx, &dataset);
-            batch_idx += 1;
-
             let seq_len = config.seq_len;
             let mut total_loss = 0.0f32;
             let mut token_count = 0usize;
             let mut step_mae = 0.0f64;
             let mut step_cos = 0.0f64;
 
-            for b in 0..batch.actual_batch_size {
-                let token_ids: Vec<u32> = batch.input_ids[b * seq_len..(b + 1) * seq_len].to_vec();
-                let targets: Vec<u32> = batch.target_ids[b * seq_len..(b + 1) * seq_len].to_vec();
+            // ===== 究極チューン8: 全 micro-batch 一括 Layer-first =====
+            // 全 accum_steps 分のデータを一括ロードし、expand+quantize を
+            // Forward/Backward 各28回 = 計56回のみ実行（従来: 56×accum_steps 回）。
 
-                // --- Forward (勾配チェックポインティング) ---
-                // Embedding lookup
-                let mut hidden = vec![0.0f32; seq_len * hidden_dim];
-                for (t, &tok) in token_ids.iter().enumerate() {
-                    let tok = tok as usize;
-                    if tok < vocab_size {
-                        hidden[t * hidden_dim..(t + 1) * hidden_dim]
-                            .copy_from_slice(&embedding_table[tok * hidden_dim..(tok + 1) * hidden_dim]);
-                    }
+            // Phase A: 全 micro-batch × 全バッチの Embedding を一括ロード
+            let mut all_hiddens: Vec<Vec<f32>> = Vec::new();
+            let mut all_token_ids: Vec<Vec<u32>> = Vec::new();
+            let mut all_targets: Vec<Vec<u32>> = Vec::new();
+            let mut total_samples = 0usize;
+
+            for _mb in 0..accum_steps {
+                if batch_idx >= num_batches {
+                    loader.shuffle_epoch();
+                    batch_idx = 0;
+                    fq.step_temperature();
+                    println!("    [epoch boundary] temperature: {:.4}", fq.temperature());
                 }
 
-                // Forward: 各レイヤーの入力hiddenを保存（cache は保持しない — backward時に再計算）
-                let mut layer_inputs: Vec<Vec<f32>> = Vec::with_capacity(num_layers);
-                for i in 0..num_layers {
-                    layer_inputs.push(hidden.clone());
-                    let base_lw = get_base_layer(&base_weights, i, &get_tensor, &config.model);
-                    if use_bf16_delta {
-                        let wd = working_delta.as_mut().unwrap();
-                        bf16_delta_store[i].expand_into(wd);
-                        wd.fused_merge_and_quantize(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf);
-                    } else {
-                        delta_cache[i].fused_merge_and_quantize(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf);
+                let batch = loader.get_batch(batch_idx, &dataset);
+                batch_idx += 1;
+
+                for b in 0..batch.actual_batch_size {
+                    let token_ids: Vec<u32> = batch.input_ids[b * seq_len..(b + 1) * seq_len].to_vec();
+                    let targets: Vec<u32> = batch.target_ids[b * seq_len..(b + 1) * seq_len].to_vec();
+                    let mut hidden = vec![0.0f32; seq_len * hidden_dim];
+                    for (t, &tok) in token_ids.iter().enumerate() {
+                        let tok = tok as usize;
+                        if tok < vocab_size {
+                            hidden[t * hidden_dim..(t + 1) * hidden_dim]
+                                .copy_from_slice(&embedding_table[tok * hidden_dim..(tok + 1) * hidden_dim]);
+                        }
                     }
-                    let _cache = cuda_layer_forward(&cuda, &mut hidden, &workspace_lw, &config.model, seq_len);
+                    all_hiddens.push(hidden);
+                    all_token_ids.push(token_ids);
+                    all_targets.push(targets);
+                    total_samples += 1;
+                }
+            }
+
+            // Phase B: Forward (Layer-first) — expand+quantize は全 micro-batch で共有
+            let phase_b_start = Instant::now();
+            let mut fwd_expand_ms = 0u128;
+            let mut fwd_quantize_ms = 0u128;
+            let mut fwd_forward_ms = 0u128;
+            let mut fwd_mmap_ms = 0u128;
+            let mut all_layer_inputs: Vec<Vec<Vec<f32>>> = Vec::with_capacity(num_layers);
+            for i in 0..num_layers {
+                // 全サンプルの現在の hidden を保存（backward の forward 再計算用）
+                let inputs: Vec<Vec<f32>> = all_hiddens.iter().map(|h| h.clone()).collect();
+                all_layer_inputs.push(inputs);
+
+                // ★ expand + quantize は全 micro-batch で1回だけ
+                let t0 = Instant::now();
+                let base_lw = get_base_layer(&base_weights, i, &get_tensor, &config.model);
+                if use_bf16_delta {
+                    let wd = working_delta.as_mut().unwrap();
+                    bf16_delta_store[i].expand_into(wd);
+                    fwd_expand_ms += t0.elapsed().as_millis();
+                    let t1 = Instant::now();
+                    wd.fused_merge_and_quantize(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf);
+                    fwd_quantize_ms += t1.elapsed().as_millis();
+                } else {
+                    fwd_expand_ms += t0.elapsed().as_millis();
+                    let t1 = Instant::now();
+                    delta_cache[i].fused_merge_and_quantize(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf);
+                    fwd_quantize_ms += t1.elapsed().as_millis();
                 }
 
+                // 全サンプルを同じ量子化済み重みで forward
+                let t2 = Instant::now();
+                for b in 0..total_samples {
+                    cuda_layer_forward_eval_ws(&cuda, &mut all_hiddens[b], &workspace_lw, &config.model, seq_len, &mut cuda_ws);
+                }
+                fwd_forward_ms += t2.elapsed().as_millis();
+
+                // mmap page cache 解放
+                let t3 = Instant::now();
+                #[cfg(unix)]
+                if !config.preload_all_layers {
+                    model.advise_dontneed_all();
+                }
+                fwd_mmap_ms += t3.elapsed().as_millis();
+            }
+            println!("    [TIMING] Phase B Forward: expand={fwd_expand_ms}ms quantize={fwd_quantize_ms}ms forward={fwd_forward_ms}ms mmap={fwd_mmap_ms}ms total={}ms (samples={total_samples})", phase_b_start.elapsed().as_millis());
+
+            // Phase C: Loss + Output backward (全サンプル一括)
+            let phase_c_start = Instant::now();
+            let mut all_d_hiddens: Vec<Vec<f32>> = Vec::with_capacity(total_samples);
+            let mut d_output_norm_w_accum = vec![0.0f32; hidden_dim];
+            for b in 0..total_samples {
                 // Output RMSNorm + projection
+                let hidden_pre_norm = all_hiddens[b].clone();
+                rmsnorm(&mut all_hiddens[b], &output_norm, hidden_dim, config.model.norm_eps);
 
-                let hidden_pre_norm = hidden.clone();
-                rmsnorm(&mut hidden, &output_norm, hidden_dim, config.model.norm_eps);
+                // logits — CUDA cuBLAS
+                cuda.matmul_bt_inplace(&all_hiddens[b], &output_proj, &mut logits_workspace, seq_len, vocab_size, hidden_dim);
 
-                // logits 計算 — CUDA cuBLAS sgemm: hidden (seq×hidden) × output_proj^T → logits (seq×vocab)
-                cuda.matmul_bt_inplace(&hidden, &output_proj, &mut logits_workspace, seq_len, vocab_size, hidden_dim);
-
-                // Loss + 勾配計算 (CPU — softmax は軽い)
-                // d_logits_flat をゼロクリア（ループ外で確保済み）
+                // Loss + 勾配計算
                 d_logits_flat.iter_mut().for_each(|x| *x = 0.0);
-
                 for t in 0..seq_len {
-                    let target = targets[t] as usize;
+                    let target = all_targets[b][t] as usize;
                     if target >= vocab_size {
                         continue;
                     }
-
                     let logits_t = &logits_workspace[t * vocab_size..(t + 1) * vocab_size];
                     let (loss, grad) = cross_entropy_loss(logits_t, target);
                     total_loss += loss;
                     token_count += 1;
-                    d_logits_flat[t * vocab_size..(t + 1) * vocab_size]
-                        .copy_from_slice(&grad);
+                    d_logits_flat[t * vocab_size..(t + 1) * vocab_size].copy_from_slice(&grad);
                 }
 
-                // --- Backward ---
-
-                let inv_tokens = 1.0 / token_count.max(1) as f32;
-
-                // Output projection backward — CUDA matmul_nn で d_hidden を計算
-                // d_hidden_normed = d_logits × output_proj
-                // d_logits: [seq × vocab], output_proj: [vocab × hidden] → d_hidden: [seq × hidden]
+                // Output projection backward
                 cuda.matmul_nn_inplace(
                     &d_logits_flat, &output_proj, &mut d_hidden_normed_buf,
                     seq_len, hidden_dim, vocab_size,
                 );
-                // Output projection: QAT では凍結（BitNet 標準 — embedding/lm_head は FP32 保持）
-                // 量子化対象はトランスフォーマーレイヤーのみ
 
                 // Output RMSNorm backward
                 let mut d_hidden = vec![0.0f32; seq_len * hidden_dim];
@@ -780,79 +869,123 @@ fn main() {
                     hidden_dim,
                     config.model.norm_eps,
                 );
-                // output_norm: 直接更新（16KB — メモリ問題なし）
+
+                // output_norm 勾配を累積
                 for h in 0..hidden_dim {
-                    let grad = d_output_norm_w[h] * inv_tokens;
+                    d_output_norm_w_accum[h] += d_output_norm_w[h];
+                }
+
+                all_d_hiddens.push(d_hidden);
+            }
+            // output_norm: 全 micro-batch 完了後に一括更新
+            {
+                let inv_tokens = 1.0 / token_count.max(1) as f32;
+                for h in 0..hidden_dim {
+                    let grad = d_output_norm_w_accum[h] * inv_tokens;
                     output_norm[h] -= effective_lr * (grad + config.weight_decay * output_norm[h]);
                 }
+            }
+            drop(all_hiddens);
+            drop(all_token_ids);
+            drop(all_targets);
+            println!("    [TIMING] Phase C Loss+OutBwd: {}ms", phase_c_start.elapsed().as_millis());
 
-                // Backward: 逆順 — 勾配チェックポインティング + 重み更新
-                let mut d_layer_input = d_hidden;
-                for i in (0..num_layers).rev() {
-                    let base_lw = get_base_layer(&base_weights, i, &get_tensor, &config.model);
-                    if use_bf16_delta {
-                        let wd = working_delta.as_mut().unwrap();
-                        bf16_delta_store[i].expand_into(wd);
-                        let (mae, cos, cnt) = wd.fused_merge_and_quantize(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf);
-                        if i == 0 {
-                            step_mae = mae / cnt.max(1) as f64;
-                            step_cos = cos / cnt.max(1) as f64;
-                        }
-                    } else {
-                        let (mae, cos, cnt) = delta_cache[i].fused_merge_and_quantize(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf);
-                        if i == 0 {
-                            step_mae = mae / cnt.max(1) as f64;
-                            step_cos = cos / cnt.max(1) as f64;
-                        }
+            // Phase D: Backward (Layer-first 逆順) — expand+quantize は全 micro-batch で共有
+            let phase_d_start = Instant::now();
+            let mut bwd_expand_ms = 0u128;
+            let mut bwd_quantize_ms = 0u128;
+            let mut bwd_vram_ms = 0u128;
+            let mut bwd_backward_ms = 0u128;
+            let mut bwd_mmap_ms = 0u128;
+            for i in (0..num_layers).rev() {
+                let base_lw = get_base_layer(&base_weights, i, &get_tensor, &config.model);
+                let t0 = Instant::now();
+                if use_bf16_delta {
+                    let wd = working_delta.as_mut().unwrap();
+                    bf16_delta_store[i].expand_into(wd);
+                    bwd_expand_ms += t0.elapsed().as_millis();
+                    let t1 = Instant::now();
+                    let (mae, cos, cnt) = wd.fused_merge_and_quantize(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf);
+                    bwd_quantize_ms += t1.elapsed().as_millis();
+                    if i == 0 {
+                        step_mae = mae / cnt.max(1) as f64;
+                        step_cos = cos / cnt.max(1) as f64;
                     }
-
-                    let mut recompute_hidden = layer_inputs[i].clone();
-                    let cache = cuda_layer_forward(&cuda, &mut recompute_hidden, &workspace_lw, &config.model, seq_len);
-
-                    let (d_input, grads) = cuda_layer_backward(
-                        &cuda,
-                        &d_layer_input,
-                        &cache,
-                        &workspace_lw,
-                        &config.model,
-                        seq_len,
-                    );
-                    d_layer_input = d_input;
-
-                    // 重み更新: delta RAMキャッシュにSGDで蓄積
-                    if use_bf16_delta {
-                        let wd = working_delta.as_mut().unwrap();
-                        wd.apply_grads(&grads, effective_lr, inv_tokens, config.weight_decay);
-                        bf16_delta_store[i].update_from_f32(wd);
-                    } else {
-                        delta_cache[i].apply_grads(&grads, effective_lr, inv_tokens, config.weight_decay);
+                } else {
+                    bwd_expand_ms += t0.elapsed().as_millis();
+                    let t1 = Instant::now();
+                    let (mae, cos, cnt) = delta_cache[i].fused_merge_and_quantize(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf);
+                    bwd_quantize_ms += t1.elapsed().as_millis();
+                    if i == 0 {
+                        step_mae = mae / cnt.max(1) as f64;
+                        step_cos = cos / cnt.max(1) as f64;
                     }
                 }
 
-                // Embedding: QAT では凍結（BitNet 標準 — embedding/lm_head は FP32 保持）
+                // VRAM常駐 — 全サンプルで使い回し
+                let t2 = Instant::now();
+                let vram_w = VramLayerWeights::upload(&cuda, &workspace_lw);
+                bwd_vram_ms += t2.elapsed().as_millis();
 
-                // layer_inputs を明示的にドロップ
-                drop(layer_inputs);
+                // 全サンプルの backward を同じ重みで計算
+                let t3 = Instant::now();
+                for b in 0..total_samples {
+                    let mut recompute_hidden = std::mem::take(&mut all_layer_inputs[i][b]);
+                    let cache = cuda_layer_forward_ws_vram(&cuda, &mut recompute_hidden, &workspace_lw, &vram_w, &config.model, seq_len, &mut cuda_ws);
+
+                    let (d_input, grads) = cuda_layer_backward_ws_vram(
+                        &cuda,
+                        &all_d_hiddens[b],
+                        &cache,
+                        &workspace_lw,
+                        &vram_w,
+                        &config.model,
+                        seq_len,
+                        &mut cuda_ws,
+                    );
+                    all_d_hiddens[b] = d_input;
+
+                    // 勾配累積
+                    accumulated_grads[i].accumulate(&grads);
+                }
+                bwd_backward_ms += t3.elapsed().as_millis();
+
+                // mmap page cache 解放（OOM 防止）
+                let t4 = Instant::now();
+                #[cfg(unix)]
+                if !config.preload_all_layers {
+                    model.advise_dontneed_all();
+                }
+                bwd_mmap_ms += t4.elapsed().as_millis();
             }
+            println!("    [TIMING] Phase D Backward: expand={bwd_expand_ms}ms quantize={bwd_quantize_ms}ms vram={bwd_vram_ms}ms backward={bwd_backward_ms}ms mmap={bwd_mmap_ms}ms total={}ms", phase_d_start.elapsed().as_millis());
 
-            let avg_loss = if token_count > 0 {
+            // メモリ解放
+            drop(all_layer_inputs);
+            drop(all_d_hiddens);
+
+            // 全 micro-batch 完了後に一括で重み更新
+            let apply_start = Instant::now();
+            let inv_tokens_final = 1.0 / token_count.max(1) as f32;
+            for i in 0..num_layers {
+                if use_bf16_delta {
+                    let wd = working_delta.as_mut().unwrap();
+                    bf16_delta_store[i].expand_into(wd);
+                    wd.apply_grads(&accumulated_grads[i], effective_lr, inv_tokens_final, config.weight_decay);
+                    bf16_delta_store[i].update_from_f32(wd);
+                } else {
+                    delta_cache[i].apply_grads(&accumulated_grads[i], effective_lr, inv_tokens_final, config.weight_decay);
+                }
+                accumulated_grads[i].zero_out();
+            }
+            println!("    [TIMING] Apply grads: {}ms", apply_start.elapsed().as_millis());
+
+            let accumulated_loss = if token_count > 0 {
                 total_loss / token_count as f32
             } else {
                 0.0
             };
             let step_duration = step_start.elapsed();
-
-            // 勾配累積カウント
-            accum_loss += avg_loss;
-            micro_step += 1;
-
-            // accumulation_steps に達したら global_step を進める
-            if micro_step < accum_steps {
-                continue;
-            }
-            let accumulated_loss = accum_loss / accum_steps as f32;
-            accum_loss = 0.0;
-            micro_step = 0;
 
             log.append(LogEntry::new(0, global_step, accumulated_loss, lr, 0.0));
 
@@ -876,63 +1009,88 @@ fn main() {
                     fq.temperature(),
                     step_duration.as_secs_f64() * 1000.0,
                 );
+                // 最初の5ステップとその後100ステップごとにRSSを表示
+                if global_step < 5 || global_step % 100 == 0 {
+                    print_rss(&format!("step {global_step}"));
+                }
                 let _ = std::io::stdout().flush();
             }
 
             // Eval (eval_data_path が設定されている場合)
+            // ★ Layer-first Streaming: 量子化を28回に削減（従来: バッチ数×28回）
             if config.eval_interval > 0
                 && global_step % config.eval_interval == 0
                 && eval_dataset.is_some()
             {
+                println!("    [eval] 評価開始 (Layer-first Streaming)...");
+                let _ = std::io::stdout().flush();
+                let eval_start = Instant::now();
+
                 let eval_ds = eval_dataset.as_ref().unwrap();
                 let eval_dl_config = DataLoaderConfig::new()
                     .with_seq_len(config.seq_len)
                     .with_batch_size(config.batch_size)
                     .with_shuffle(false);
                 let eval_loader = DataLoader::new(eval_ds, eval_dl_config);
-                let eval_batches = eval_loader.num_batches().min(50); // 最大50バッチ
+                let eval_batches = eval_loader.num_batches().min(50);
 
+                // Phase 1: 全バッチの embedding → hidden 状態とターゲットをメモリに保持
+                let mut all_hiddens: Vec<Vec<f32>> = Vec::with_capacity(eval_batches);
+                let mut all_targets: Vec<Vec<u32>> = Vec::with_capacity(eval_batches);
+
+                for eb in 0..eval_batches {
+                    let eval_batch = eval_loader.get_batch(eb, eval_ds);
+                    let token_ids = &eval_batch.input_ids[0..seq_len];
+                    let targets: Vec<u32> = eval_batch.target_ids[0..seq_len].to_vec();
+
+                    let mut hidden_b = vec![0.0f32; seq_len * hidden_dim];
+                    for (t, &tok) in token_ids.iter().enumerate() {
+                        let tok = tok as usize;
+                        if tok < vocab_size {
+                            hidden_b[t * hidden_dim..(t + 1) * hidden_dim]
+                                .copy_from_slice(&embedding_table[tok * hidden_dim..(tok + 1) * hidden_dim]);
+                        }
+                    }
+                    all_hiddens.push(hidden_b);
+                    all_targets.push(targets);
+                }
+
+                // Phase 2: レイヤー・ファースト + VRAM常駐（量子化1回 + 重みH2D転送1回/レイヤー）
+                for i in 0..num_layers {
+                    let base_lw = get_base_layer(&base_weights, i, &get_tensor, &config.model);
+                    if use_bf16_delta {
+                        let wd = working_delta.as_mut().unwrap();
+                        bf16_delta_store[i].expand_into(wd);
+                        wd.fused_merge_and_quantize(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf);
+                    } else {
+                        delta_cache[i].fused_merge_and_quantize(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf);
+                    }
+
+                    // 量子化済み重みを1回だけ VRAM に転送
+                    let vram_w = VramLayerWeights::upload(&cuda, &workspace_lw);
+
+                    // 全バッチで VRAM 上の重みを直接参照（重みの H2D 転送ゼロ）
+                    for eb in 0..eval_batches {
+                        cuda_layer_forward_eval_ws_vram(&cuda, &mut all_hiddens[eb], &workspace_lw, &vram_w, &config.model, seq_len, &mut cuda_ws);
+                    }
+                    // vram_w はスコープ抜けで自動解放 → 次レイヤーの VRAM に再利用
+                }
+
+                // Phase 3: Output Norm & Logits → Loss 計算
                 let mut eval_loss_sum = 0.0f32;
                 let mut eval_token_count = 0usize;
 
                 for eb in 0..eval_batches {
-                    let eval_batch = eval_loader.get_batch(eb, eval_ds);
-                    for b in 0..eval_batch.actual_batch_size {
-                        let token_ids: Vec<u32> = eval_batch.input_ids
-                            [b * seq_len..(b + 1) * seq_len].to_vec();
-                        let targets: Vec<u32> = eval_batch.target_ids
-                            [b * seq_len..(b + 1) * seq_len].to_vec();
-
-                        // Forward only (no backward)
-                        let mut hidden = vec![0.0f32; seq_len * hidden_dim];
-                        for (t, &tok) in token_ids.iter().enumerate() {
-                            let tok = tok as usize;
-                            if tok < vocab_size {
-                                hidden[t * hidden_dim..(t + 1) * hidden_dim]
-                                    .copy_from_slice(&embedding_table[tok * hidden_dim..(tok + 1) * hidden_dim]);
-                            }
-                        }
-                        for i in 0..num_layers {
-                            let base_lw = get_base_layer(&base_weights, i, &get_tensor, &config.model);
-                            if use_bf16_delta {
-                                let wd = working_delta.as_mut().unwrap();
-                                bf16_delta_store[i].expand_into(wd);
-                                wd.fused_merge_and_quantize(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf);
-                            } else {
-                                delta_cache[i].fused_merge_and_quantize(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf);
-                            }
-                            let _cache = cuda_layer_forward(&cuda, &mut hidden, &workspace_lw, &config.model, seq_len);
-                        }
-                        rmsnorm(&mut hidden, &output_norm, hidden_dim, config.model.norm_eps);
-                        let logits = cuda.matmul_bt(&hidden, &output_proj, seq_len, vocab_size, hidden_dim);
-                        for t in 0..seq_len {
-                            let target = targets[t] as usize;
-                            if target < vocab_size {
-                                let logits_t = &logits[t * vocab_size..(t + 1) * vocab_size];
-                                let (loss, _) = cross_entropy_loss(logits_t, target);
-                                eval_loss_sum += loss;
-                                eval_token_count += 1;
-                            }
+                    let hidden = &mut all_hiddens[eb];
+                    rmsnorm(hidden, &output_norm, hidden_dim, config.model.norm_eps);
+                    cuda.matmul_bt_inplace(hidden, &output_proj, &mut logits_workspace, seq_len, vocab_size, hidden_dim);
+                    for t in 0..seq_len {
+                        let target = all_targets[eb][t] as usize;
+                        if target < vocab_size {
+                            let logits_t = &logits_workspace[t * vocab_size..(t + 1) * vocab_size];
+                            let (loss, _) = cross_entropy_loss(logits_t, target);
+                            eval_loss_sum += loss;
+                            eval_token_count += 1;
                         }
                     }
                 }
@@ -943,8 +1101,9 @@ fn main() {
                     0.0
                 };
                 let eval_ppl = eval_loss.exp();
+                let eval_elapsed = eval_start.elapsed().as_secs_f32();
                 println!(
-                    "    [eval] step {global_step} | eval_loss: {eval_loss:.4} | ppl: {eval_ppl:.1} | {eval_token_count} tokens"
+                    "    [eval] step {global_step} | eval_loss: {eval_loss:.4} | ppl: {eval_ppl:.1} | {eval_token_count} tokens | {eval_elapsed:.1}s"
                 );
                 let _ = std::io::stdout().flush();
             }
@@ -1096,7 +1255,7 @@ impl LayerDeltaCache {
         base: &LlamaLayerWeights,
         workspace: &mut LlamaLayerWeights,
         fq: &mut FakeQuantize,
-        quantize_buf: &mut Vec<f32>,
+        _quantize_buf: &mut Vec<f32>,
     ) -> (f64, f64, usize) {
         use rayon::prelude::*;
 
@@ -1115,36 +1274,49 @@ impl LayerDeltaCache {
             (&base.down_proj, &self.down_proj, workspace.down_proj.as_mut_slice()),
         ];
 
+        let temp = fq.temperature().max(1e-10);
+        let inv_temp = 1.0 / temp;
+
         for (b, d, w) in pairs {
             if b.is_empty() { continue; }
 
-            // 1. rayon 並列: base + delta → workspace
-            w.par_iter_mut().zip(b.par_iter().zip(d.par_iter())).for_each(|(out, (&bv, &dv))| {
-                *out = bv + dv;
-            });
+            // パス1 (Rayon並列): base+delta → workspace + sum(|w|) を同時計算
+            let sum_abs: f64 = w.par_iter_mut()
+                .zip(b.par_iter().zip(d.par_iter()))
+                .map(|(out, (&bv, &dv))| {
+                    let val = bv + dv;
+                    *out = val;
+                    val.abs() as f64
+                })
+                .sum();
 
-            // 2. Quantization
-            fq.calibrate_scale(w);
-            // quantize_buf を必要サイズに拡張（初期確保後は再確保なし）
-            if quantize_buf.len() < w.len() {
-                quantize_buf.resize(w.len(), 0.0);
-            }
-            let qbuf = &mut quantize_buf[..w.len()];
-            fq.fake_quantize_forward(w, qbuf);
+            // calibrate_scale: γ = mean(|w|)
+            let scale = (sum_abs / w.len() as f64).max(1e-10) as f32;
+            fq.set_scale(scale);
+            let inv_scale = 1.0 / scale;
 
-            // 3. MAE / Cosine similarity 統計
-            let mut sum_err = 0.0f64;
-            let mut dot_wq = 0.0f64;
-            let mut dot_ww = 0.0f64;
-            let mut dot_qq = 0.0f64;
-            for i in 0..w.len() {
-                let wv = w[i] as f64;
-                let qv = qbuf[i] as f64;
-                sum_err += (wv - qv).abs();
-                dot_wq += wv * qv;
-                dot_ww += wv * wv;
-                dot_qq += qv * qv;
-            }
+            // パス2 (Rayon並列): 量子化 + 統計 + 上書き を完全融合
+            let (sum_err, dot_wq, dot_ww, dot_qq) = w.par_iter_mut()
+                .map(|wv_mut| {
+                    let wv = *wv_mut;
+                    // Ternary fake quantize: round(w/γ/temp) → clamp(-1,1) → ×γ
+                    let scaled = wv * inv_scale * inv_temp;
+                    let qv = scaled.round().clamp(-1.0, 1.0) * scale;
+
+                    // 統計計算
+                    let wv_f64 = wv as f64;
+                    let qv_f64 = qv as f64;
+
+                    // 量子化済みで上書き
+                    *wv_mut = qv;
+
+                    ((wv_f64 - qv_f64).abs(), wv_f64 * qv_f64, wv_f64 * wv_f64, qv_f64 * qv_f64)
+                })
+                .reduce(
+                    || (0.0f64, 0.0f64, 0.0f64, 0.0f64),
+                    |(a, b, c, d), (e, f, g, h)| (a + e, b + f, c + g, d + h),
+                );
+
             let n = w.len() as f64;
             total_mae += sum_err / n;
             let denom = (dot_ww * dot_qq).sqrt();
@@ -1152,9 +1324,6 @@ impl LayerDeltaCache {
                 total_cos += dot_wq / denom;
             }
             count += 1;
-
-            // 4. 量子化済み重みで上書き
-            w.copy_from_slice(qbuf);
         }
 
         // Norm / Bias は量子化しない — 単なる加算（rayon 並列）
@@ -1182,11 +1351,11 @@ impl LayerDeltaCache {
         use rayon::prelude::*;
 
         let update = |delta: &mut [f32], grad: &[f32], wd: f32| {
-            let mut scaled: Vec<f32> = grad.iter().map(|&g| g * inv_tokens).collect();
+            let mut scaled: Vec<f32> = grad.par_iter().map(|&g| g * inv_tokens).collect();
             clip_grad(&mut scaled, 1.0);
-            for j in 0..delta.len() {
-                delta[j] -= lr * (scaled[j] + wd * delta[j]);
-            }
+            delta.par_iter_mut().zip(scaled.par_iter()).for_each(|(d, &s)| {
+                *d -= lr * (s + wd * *d);
+            });
         };
 
         // 大きい projection テンソルを rayon で並列更新
@@ -1201,11 +1370,11 @@ impl LayerDeltaCache {
             (self.down_proj.as_mut_slice(), grads.down_proj.as_slice()),
         ];
         pairs.into_par_iter().for_each(|(delta, grad)| {
-            let mut scaled: Vec<f32> = grad.iter().map(|&g| g * inv_tokens).collect();
+            let mut scaled: Vec<f32> = grad.par_iter().map(|&g| g * inv_tokens).collect();
             clip_grad(&mut scaled, 1.0);
-            for j in 0..delta.len() {
-                delta[j] -= lr * (scaled[j] + wd * delta[j]);
-            }
+            delta.par_iter_mut().zip(scaled.par_iter()).for_each(|(d, &s)| {
+                *d -= lr * (s + wd * *d);
+            });
         });
 
         // norm は小さいのでシーケンシャル
@@ -1324,12 +1493,11 @@ impl Bf16DeltaStore {
         }
     }
 
-    /// FP32 delta キャッシュの内容で BF16 ストアを更新（再アロケーションなし）。
+    /// FP32 delta キャッシュの内容で BF16 ストアを更新（再アロケーションなし）。Rayon並列。
     fn update_from_f32(&mut self, cache: &LayerDeltaCache) {
+        use rayon::prelude::*;
         let compress = |dst: &mut [u16], src: &[f32]| {
-            for (d, &s) in dst.iter_mut().zip(src.iter()) {
-                *d = f32_to_bf16(s);
-            }
+            dst.par_iter_mut().zip(src.par_iter()).for_each(|(d, s)| *d = f32_to_bf16(*s));
         };
         compress(&mut self.attn_norm, &cache.attn_norm);
         compress(&mut self.q_proj, &cache.q_proj);
@@ -1356,12 +1524,11 @@ impl Bf16DeltaStore {
         self.to_f32().save_to_disk(layer_idx, checkpoint_dir);
     }
 
-    /// FP32 delta キャッシュの内容で BF16 ストアをリロード（展開先バッファに書き込み）。
+    /// FP32 delta キャッシュの内容で BF16 ストアをリロード（展開先バッファに書き込み）。Rayon並列。
     fn expand_into(&self, dst: &mut LayerDeltaCache) {
+        use rayon::prelude::*;
         let expand = |dst: &mut [f32], src: &[u16]| {
-            for (d, &s) in dst.iter_mut().zip(src.iter()) {
-                *d = bf16_to_f32(s);
-            }
+            dst.par_iter_mut().zip(src.par_iter()).for_each(|(d, s)| *d = bf16_to_f32(*s));
         };
         expand(&mut dst.attn_norm, &self.attn_norm);
         expand(&mut dst.q_proj, &self.q_proj);
@@ -1416,21 +1583,18 @@ fn save_layer_delta(layer_idx: usize, weight_name: &str, delta: &[f32], checkpoi
 
 /// 勾配ベクトルの L2 ノルムを計算。
 fn grad_l2_norm(grad: &[f32]) -> f32 {
-    let mut sum = 0.0f64;
-    for &g in grad {
-        sum += (g as f64) * (g as f64);
-    }
-    (sum.sqrt()) as f32
+    use rayon::prelude::*;
+    let sum: f64 = grad.par_iter().map(|&g| (g as f64) * (g as f64)).sum();
+    sum.sqrt() as f32
 }
 
 /// 勾配をクリップ（max_norm 以下にスケーリング）。
 fn clip_grad(grad: &mut [f32], max_norm: f32) -> f32 {
+    use rayon::prelude::*;
     let norm = grad_l2_norm(grad);
     if norm > max_norm && norm > 1e-10 {
         let scale = max_norm / norm;
-        for g in grad.iter_mut() {
-            *g *= scale;
-        }
+        grad.par_iter_mut().for_each(|g| *g *= scale);
     }
     norm
 }
