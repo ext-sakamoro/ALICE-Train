@@ -24,6 +24,11 @@ path = "src/bin/train_qat_70b.rs"
 required-features = ["qat-cuda"]
 
 [[bin]]
+name = "train-qat-qwen35"
+path = "src/bin/train_qat_qwen35.rs"
+required-features = ["qat-cli"]
+
+[[bin]]
 name = "train-debug"
 path = "src/bin/train_debug.rs"
 required-features = ["qat-cli"]
@@ -53,6 +58,9 @@ libc = "0.2"
 
 # Parallelization
 rayon = "1.10"
+
+# High-performance allocator (CPU並列のmalloc競合を解消)
+mimalloc = "0.1"
 
 # QAT CLI (optional)
 safetensors = { version = "0.4", optional = true }

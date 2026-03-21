@@ -84,14 +84,20 @@
 
 pub mod activation;
 pub mod backward;
+pub mod blas;
 pub mod fast_math;
 pub mod checkpoint;
 pub mod dataloader;
 pub mod distill;
 pub mod evaluator;
+pub mod deltanet;
+pub mod fp32_cache;
 pub mod llama;
 pub mod llama_backward;
 pub mod llama_forward;
+pub mod qwen35;
+pub mod qwen35_backward;
+pub mod qwen35_forward;
 pub mod logger;
 pub mod mixed_precision;
 pub mod offload;
@@ -142,4 +148,4 @@ pub use gpu_matmul::GpuMatmul;
 
 // CUDA re-exports
 #[cfg(feature = "cuda")]
-pub use cuda_matmul::{CudaMatmul, CudaLayerWorkspace, LayerWeightGrads, VramLayerWeights};
+pub use cuda_matmul::{CudaMatmul, CudaLayerWorkspace, LayerWeightGrads, VramLayerWeights, cuda_deltanet_recurrence};
