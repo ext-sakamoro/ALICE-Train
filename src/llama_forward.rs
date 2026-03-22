@@ -109,18 +109,19 @@ pub fn apply_rope(
     theta: f32,
 ) {
     let stride = n_heads * head_dim;
+    let half = head_dim / 2;
     x.par_chunks_exact_mut(stride).enumerate().for_each(|(t, token)| {
         for h in 0..n_heads {
             let base = h * head_dim;
-            for d in (0..head_dim).step_by(2) {
-                let freq = 1.0 / theta.powf(d as f32 / head_dim as f32);
+            for d in 0..half {
+                let freq = 1.0 / theta.powf((2 * d) as f32 / head_dim as f32);
                 let angle = t as f32 * freq;
                 let cos_a = angle.cos();
                 let sin_a = angle.sin();
                 let x0 = token[base + d];
-                let x1 = token[base + d + 1];
+                let x1 = token[base + d + half];
                 token[base + d] = x0.mul_add(cos_a, -(x1 * sin_a));
-                token[base + d + 1] = x0.mul_add(sin_a, x1 * cos_a);
+                token[base + d + half] = x0.mul_add(sin_a, x1 * cos_a);
             }
         }
     });
@@ -366,6 +367,7 @@ pub fn layer_forward(
 ///
 /// 入力: token IDs (seq_len)
 /// 出力: logits (seq_len × vocab_size), Vec<LayerCache>
+#[must_use] 
 pub fn model_forward(
     token_ids: &[u32],
     embedding_table: &[f32],

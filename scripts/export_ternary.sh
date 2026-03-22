@@ -18,7 +18,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-STORAGE_BASE="${ALICE_TRAIN_STORAGE:-/storage/alice-train}"
+# RunPod: /workspace/alice-train, Paperspace: /storage/alice-train
+if [ -d "/workspace/alice-train" ]; then
+    DEFAULT_STORAGE="/workspace/alice-train"
+elif [ -d "/storage/alice-train" ]; then
+    DEFAULT_STORAGE="/storage/alice-train"
+else
+    DEFAULT_STORAGE="/storage/alice-train"
+fi
+STORAGE_BASE="${ALICE_TRAIN_STORAGE:-$DEFAULT_STORAGE}"
 EXPORT_BASE="$STORAGE_BASE/exports"
 
 # ドメイン一覧

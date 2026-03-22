@@ -276,6 +276,7 @@ impl LlamaLayerWeights {
     }
 
     /// Attention bias への参照（Q, K, V 順）。bias がない場合は空。
+    #[must_use] 
     pub fn attention_biases(&self) -> Vec<(&str, &[f32])> {
         let mut out = Vec::new();
         if let Some(ref b) = self.q_bias {

@@ -21,11 +21,15 @@
 //!     --config configs/qat_8b_general.json
 //! ```
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::Parser;
 use rand::Rng;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use alice_train::llama::{LlamaConfig, QatTrainConfig};
@@ -284,13 +288,26 @@ fn main() {
     let mut log = TrainLog::new();
     let mut global_step: usize = 0;
 
-    // レジューム
-    if let Some(ref resume_path) = config.resume_from {
+    // レジューム: resume_state.json から step を復元（delta + AdamW は load_from_disk で自動復元）
+    let resume_state_path = format!("{}/resume_state.json", config.checkpoint_dir);
+    if Path::new(&resume_state_path).exists() {
+        if let Ok(json_str) = std::fs::read_to_string(&resume_state_path) {
+            // 簡易JSONパース: {"step":123,"loss":2.5,"lr":1e-5}
+            if let Some(step_str) = json_str.split("\"step\":").nth(1) {
+                if let Some(step_val) = step_str.split([',', '}']).next() {
+                    if let Ok(step) = step_val.trim().parse::<usize>() {
+                        global_step = step;
+                        println!("  resume_state.json からレジューム: step {global_step}");
+                    }
+                }
+            }
+        }
+    } else if let Some(ref resume_path) = config.resume_from {
         if Path::new(resume_path).exists() {
             println!("  チェックポイントからレジューム: {resume_path}");
             match std::fs::File::open(resume_path).and_then(|mut f| CheckpointData::load(&mut f)) {
                 Ok(ckpt) => {
-                    global_step = ckpt.meta.epoch;
+                    global_step = ckpt.meta.step;
                     println!("  レジューム成功: step {global_step}");
                 }
                 Err(e) => {
@@ -696,6 +713,18 @@ fn main() {
         }
         println!();
 
+        // --- シグナルハンドラ (SIGTERM/SIGINT → graceful shutdown) ---
+        #[cfg(unix)]
+        {
+            unsafe {
+                // SIGTERM (Paperspace 停止時)
+                libc::signal(libc::SIGTERM, signal_handler as *const () as libc::sighandler_t);
+                // SIGINT (Ctrl+C)
+                libc::signal(libc::SIGINT, signal_handler as *const () as libc::sighandler_t);
+            }
+            println!("  SIGTERM/SIGINT ハンドラ登録済み（graceful shutdown 有効）");
+        }
+
         // --- Phase 2 学習ループ ---
         println!(
             "━━━ Phase 2 学習開始 (step {global_step}/{}) ━━━",
@@ -722,16 +751,41 @@ fn main() {
         };
         let use_bf16_delta = config.bf16_delta;
 
-        // 究極チューン2: 真の勾配累積 — micro-batch間で勾配を加算し、最後に1回だけ apply_grads
+        // 究極チューン2: 真の勾配累積 — micro-batch間で勾配を加算し、最後に1回だけ apply_adam
         let mut accumulated_grads: Vec<LayerWeightGrads> = (0..num_layers)
             .map(|_| LayerWeightGrads::zeros(&config.model))
             .collect();
 
+        // AdamW オプティマイザ状態 (m, v) — 全レイヤー分を RAM に保持
+        // resume時はディスクから復元（存在しなければゼロ初期化）
+        let mut adam_states: Vec<LayerAdamState> = (0..num_layers)
+            .map(|i| {
+                if global_step > 0 {
+                    LayerAdamState::load_from_disk(i, &config.model, &config.checkpoint_dir)
+                } else {
+                    LayerAdamState::zeros(&config.model)
+                }
+            })
+            .collect();
+        // output_norm 用 AdamW 状態
+        let mut output_norm_adam_m = vec![0.0f32; hidden_dim];
+        let mut output_norm_adam_v = vec![0.0f32; hidden_dim];
+
+        let adam_mem_per_layer = adam_states[0].memory_bytes();
+        let adam_mem_total = adam_mem_per_layer * num_layers + hidden_dim * 4 * 2;
+        println!("  AdamW 状態: {:.1} MB/layer × {} layers = {:.1} MB",
+            adam_mem_per_layer as f64 / 1024.0 / 1024.0,
+            num_layers,
+            adam_mem_total as f64 / 1024.0 / 1024.0,
+        );
+        print_rss("AdamW 初期化後");
+        println!();
+
         while global_step < config.total_steps {
 
             let lr = scheduler.get_lr(global_step);
-            // 勾配累積: lr を accumulation_steps で分割
-            let effective_lr = lr / accum_steps as f32;
+            // d_logits で既に accum_steps で割っているので、lr はそのまま使用
+            let effective_lr = lr;
             let step_start = Instant::now();
 
             let seq_len = config.seq_len;
@@ -739,6 +793,18 @@ fn main() {
             let mut token_count = 0usize;
             let mut step_mae = 0.0f64;
             let mut step_cos = 0.0f64;
+
+            // Soft-to-Hard Quantization: alpha = 0→1 (sigmoid schedule)
+            // total_steps の 75% 地点で α≈1.0 に到達し、残り 25% を α=1.0 で安定化
+            let quant_warmup_steps = (config.total_steps as f32 * 0.75) as usize;
+            let alpha = if global_step >= quant_warmup_steps {
+                1.0f32
+            } else {
+                // Sigmoid schedule: 中盤で急上昇、初期と末期はなだらか
+                let t = global_step as f32 / quant_warmup_steps as f32;
+                let sigmoid_input = 12.0 * (t - 0.5); // -6..+6 の範囲
+                1.0 / (1.0 + (-sigmoid_input).exp())
+            };
 
             // ===== 究極チューン8: 全 micro-batch 一括 Layer-first =====
             // 全 accum_steps 分のデータを一括ロードし、expand+quantize を
@@ -799,13 +865,54 @@ fn main() {
                     bf16_delta_store[i].expand_into(wd);
                     fwd_expand_ms += t0.elapsed().as_millis();
                     let t1 = Instant::now();
-                    wd.fused_merge_and_quantize(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf);
+                    wd.fused_merge_and_quantize_alpha(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf, alpha);
                     fwd_quantize_ms += t1.elapsed().as_millis();
                 } else {
                     fwd_expand_ms += t0.elapsed().as_millis();
                     let t1 = Instant::now();
-                    delta_cache[i].fused_merge_and_quantize(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf);
+                    delta_cache[i].fused_merge_and_quantize_alpha(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf, alpha);
                     fwd_quantize_ms += t1.elapsed().as_millis();
+                }
+
+                // [DEBUG] 全レイヤーの重み診断（step 0のみ）
+                if global_step == 0 {
+                    let mut any_nan = false;
+                    let mut any_inf = false;
+                    for (name, w) in [
+                        ("q_proj", &workspace_lw.q_proj),
+                        ("k_proj", &workspace_lw.k_proj),
+                        ("v_proj", &workspace_lw.v_proj),
+                        ("o_proj", &workspace_lw.o_proj),
+                        ("gate", &workspace_lw.gate_proj),
+                        ("up", &workspace_lw.up_proj),
+                        ("down", &workspace_lw.down_proj),
+                        ("attn_n", &workspace_lw.attn_norm),
+                        ("ffn_n", &workspace_lw.ffn_norm),
+                    ] {
+                        let has_nan = w.iter().any(|x| x.is_nan());
+                        let has_inf = w.iter().any(|x| x.is_infinite());
+                        if has_nan || has_inf {
+                            let w_min = w.iter().cloned().fold(f32::INFINITY, f32::min);
+                            let w_max = w.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                            println!("    [DEBUG] L{i} {name}: min={w_min:.4} max={w_max:.4} NaN={has_nan} Inf={has_inf} len={}", w.len());
+                            any_nan |= has_nan;
+                            any_inf |= has_inf;
+                        }
+                    }
+                    if any_nan || any_inf {
+                        println!("    [DEBUG] *** L{i} に NaN/Inf 重みあり! ***");
+                    } else if i == 0 || i == 25 || i == 26 || i == 27 {
+                        // 注目レイヤーは正常でも出力
+                        let w_min = workspace_lw.q_proj.iter().cloned().fold(f32::INFINITY, f32::min);
+                        let w_max = workspace_lw.q_proj.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        println!("    [DEBUG] L{i} weights OK (q_proj: {w_min:.4}..{w_max:.4})");
+                    }
+                    if i == 0 {
+                        let h_min = all_hiddens[0].iter().cloned().fold(f32::INFINITY, f32::min);
+                        let h_max = all_hiddens[0].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let h_nan = all_hiddens[0].iter().any(|x| x.is_nan());
+                        println!("    [DEBUG] hidden pre-L0: min={h_min:.6} max={h_max:.6} nan={h_nan}");
+                    }
                 }
 
                 // 全サンプルを同じ量子化済み重みで forward
@@ -814,6 +921,15 @@ fn main() {
                     cuda_layer_forward_eval_ws(&cuda, &mut all_hiddens[b], &workspace_lw, &config.model, seq_len, &mut cuda_ws);
                 }
                 fwd_forward_ms += t2.elapsed().as_millis();
+
+                // [DEBUG] forward後のhidden診断（各レイヤー後、最初のステップのみ）
+                if global_step == 0 {
+                    let h_min = all_hiddens[0].iter().cloned().fold(f32::INFINITY, f32::min);
+                    let h_max = all_hiddens[0].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let h_nan = all_hiddens[0].iter().any(|x| x.is_nan());
+                    let h_inf = all_hiddens[0].iter().any(|x| x.is_infinite());
+                    println!("    [DEBUG] hidden post-L{i}: min={h_min:.6} max={h_max:.6} nan={h_nan} inf={h_inf}");
+                }
 
                 // mmap page cache 解放
                 let t3 = Instant::now();
@@ -839,6 +955,27 @@ fn main() {
 
                 // Loss + 勾配計算
                 d_logits_flat.iter_mut().for_each(|x| *x = 0.0);
+
+                // [DEBUG] logits 診断（最初のサンプル・最初のステップのみ）
+                if b == 0 && global_step == 0 {
+                    let logits_t0 = &logits_workspace[0..vocab_size];
+                    let l_min = logits_t0.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let l_max = logits_t0.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let l_nan = logits_t0.iter().any(|x| x.is_nan());
+                    let l_inf = logits_t0.iter().any(|x| x.is_infinite());
+                    println!("    [DEBUG] logits[0]: min={l_min:.4} max={l_max:.4} nan={l_nan} inf={l_inf}");
+
+                    // softmax して正解トークンの確率を確認
+                    let target0 = all_targets[b][0] as usize;
+                    if target0 < vocab_size {
+                        let max_l = l_max;
+                        let sum_exp: f64 = logits_t0.iter().map(|&x| ((x - max_l) as f64).exp()).sum();
+                        let p_target = ((logits_t0[target0] - max_l) as f64).exp() / sum_exp;
+                        println!("    [DEBUG] target[0]={target0} p(target)={p_target:.10e} -ln(p)={:.4}", -(p_target.max(1e-30)).ln());
+                    }
+                }
+
+                let mut tokens_this_batch = 0usize;
                 for t in 0..seq_len {
                     let target = all_targets[b][t] as usize;
                     if target >= vocab_size {
@@ -848,7 +985,22 @@ fn main() {
                     let (loss, grad) = cross_entropy_loss(logits_t, target);
                     total_loss += loss;
                     token_count += 1;
+                    tokens_this_batch += 1;
                     d_logits_flat[t * vocab_size..(t + 1) * vocab_size].copy_from_slice(&grad);
+                }
+
+                // Mean化: d_logits を有効トークン数 × 勾配累積ステップ数で正規化
+                // これにより backward 全体のスケールが適正化され、grad_norm が数十〜数百に収まる
+                let d_scale = 1.0 / (tokens_this_batch.max(1) * accum_steps) as f32;
+                for v in d_logits_flat.iter_mut() {
+                    *v *= d_scale;
+                }
+
+                // [DEBUG] d_logits ノルム（最初のサンプル・最初のステップのみ）
+                if b == 0 && global_step == 0 {
+                    let d_logits_norm: f64 = d_logits_flat.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+                    let d_logits_max = d_logits_flat.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs()));
+                    println!("    [DEBUG] d_logits: L2={d_logits_norm:.6e} max_abs={d_logits_max:.6e}");
                 }
 
                 // Output projection backward
@@ -877,12 +1029,22 @@ fn main() {
 
                 all_d_hiddens.push(d_hidden);
             }
-            // output_norm: 全 micro-batch 完了後に一括更新
+            // output_norm: 全 micro-batch 完了後に AdamW 更新
+            // d_logits で既に Mean 化済みなので inv_tokens 不要
             {
-                let inv_tokens = 1.0 / token_count.max(1) as f32;
+                let beta1: f32 = 0.9;
+                let beta2: f32 = 0.999;
+                let eps: f32 = 1e-8;
+                let adam_t = (global_step + 1) as f32;
+                let bc1 = 1.0 - beta1.powf(adam_t);
+                let bc2 = 1.0 - beta2.powf(adam_t);
                 for h in 0..hidden_dim {
-                    let grad = d_output_norm_w_accum[h] * inv_tokens;
-                    output_norm[h] -= effective_lr * (grad + config.weight_decay * output_norm[h]);
+                    let g = d_output_norm_w_accum[h];
+                    output_norm_adam_m[h] = beta1 * output_norm_adam_m[h] + (1.0 - beta1) * g;
+                    output_norm_adam_v[h] = beta2 * output_norm_adam_v[h] + (1.0 - beta2) * g * g;
+                    let m_hat = output_norm_adam_m[h] / bc1;
+                    let v_hat = output_norm_adam_v[h] / bc2;
+                    output_norm[h] -= effective_lr * (m_hat / (v_hat.sqrt() + eps) + config.weight_decay * output_norm[h]);
                 }
             }
             drop(all_hiddens);
@@ -905,7 +1067,7 @@ fn main() {
                     bf16_delta_store[i].expand_into(wd);
                     bwd_expand_ms += t0.elapsed().as_millis();
                     let t1 = Instant::now();
-                    let (mae, cos, cnt) = wd.fused_merge_and_quantize(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf);
+                    let (mae, cos, cnt) = wd.fused_merge_and_quantize_alpha(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf, alpha);
                     bwd_quantize_ms += t1.elapsed().as_millis();
                     if i == 0 {
                         step_mae = mae / cnt.max(1) as f64;
@@ -914,7 +1076,7 @@ fn main() {
                 } else {
                     bwd_expand_ms += t0.elapsed().as_millis();
                     let t1 = Instant::now();
-                    let (mae, cos, cnt) = delta_cache[i].fused_merge_and_quantize(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf);
+                    let (mae, cos, cnt) = delta_cache[i].fused_merge_and_quantize_alpha(&base_lw, &mut workspace_lw, &mut fq, &mut quantize_buf, alpha);
                     bwd_quantize_ms += t1.elapsed().as_millis();
                     if i == 0 {
                         step_mae = mae / cnt.max(1) as f64;
@@ -929,10 +1091,17 @@ fn main() {
 
                 // 全サンプルの backward を同じ重みで計算
                 let t3 = Instant::now();
+                let mut _fwd_recomp_us = 0u128;
+                let mut _bwd_core_us = 0u128;
+                let mut _clip_us = 0u128;
+                let mut _accum_us = 0u128;
                 for b in 0..total_samples {
+                    let _tb0 = Instant::now();
                     let mut recompute_hidden = std::mem::take(&mut all_layer_inputs[i][b]);
                     let cache = cuda_layer_forward_ws_vram(&cuda, &mut recompute_hidden, &workspace_lw, &vram_w, &config.model, seq_len, &mut cuda_ws);
+                    _fwd_recomp_us += _tb0.elapsed().as_micros();
 
+                    let _tb1 = Instant::now();
                     let (d_input, grads) = cuda_layer_backward_ws_vram(
                         &cuda,
                         &all_d_hiddens[b],
@@ -944,11 +1113,36 @@ fn main() {
                         &mut cuda_ws,
                     );
                     all_d_hiddens[b] = d_input;
+                    _bwd_core_us += _tb1.elapsed().as_micros();
+
+                    // d_hidden clipping: 各レイヤー後にL2ノルムを制限
+                    let _tb2 = Instant::now();
+                    let dh = &mut all_d_hiddens[b];
+                    let dh_norm: f64 = dh.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+                    let max_dh_norm = 100.0f64;
+                    if dh_norm > max_dh_norm {
+                        let scale = (max_dh_norm / dh_norm) as f32;
+                        for v in dh.iter_mut() { *v *= scale; }
+                    }
+                    // NaN/Inf ガード
+                    for v in dh.iter_mut() {
+                        if v.is_nan() || v.is_infinite() { *v = 0.0; }
+                    }
+                    _clip_us += _tb2.elapsed().as_micros();
 
                     // 勾配累積
+                    let _tb3 = Instant::now();
                     accumulated_grads[i].accumulate(&grads);
+                    _accum_us += _tb3.elapsed().as_micros();
                 }
                 bwd_backward_ms += t3.elapsed().as_millis();
+                // 最初のステップの最初の3レイヤーだけ詳細出力
+                if global_step == 0 && i >= num_layers - 3 {
+                    eprintln!("    [BWD-LOOP L{i}] fwd_recomp={:.1}ms bwd_core={:.1}ms clip={:.1}ms accum={:.1}ms total={:.1}ms",
+                        _fwd_recomp_us as f64 / 1000.0, _bwd_core_us as f64 / 1000.0,
+                        _clip_us as f64 / 1000.0, _accum_us as f64 / 1000.0,
+                        t3.elapsed().as_secs_f64() * 1000.0);
+                }
 
                 // mmap page cache 解放（OOM 防止）
                 let t4 = Instant::now();
@@ -960,25 +1154,141 @@ fn main() {
             }
             println!("    [TIMING] Phase D Backward: expand={bwd_expand_ms}ms quantize={bwd_quantize_ms}ms vram={bwd_vram_ms}ms backward={bwd_backward_ms}ms mmap={bwd_mmap_ms}ms total={}ms", phase_d_start.elapsed().as_millis());
 
+            // 勾配NaN検出 + ガード（全ステップ）
+            let mut grad_has_nan = false;
+            let mut grad_nan_layers = Vec::new();
+            for i in 0..num_layers {
+                let g = &mut accumulated_grads[i];
+                let sanitize = |s: &mut [f32]| -> usize {
+                    let mut cnt = 0usize;
+                    for v in s.iter_mut() {
+                        if v.is_nan() || v.is_infinite() {
+                            *v = 0.0;
+                            cnt += 1;
+                        }
+                    }
+                    cnt
+                };
+                let mut layer_nan_count = 0usize;
+                layer_nan_count += sanitize(&mut g.attn_norm);
+                layer_nan_count += sanitize(&mut g.q_proj);
+                layer_nan_count += sanitize(&mut g.k_proj);
+                layer_nan_count += sanitize(&mut g.v_proj);
+                layer_nan_count += sanitize(&mut g.o_proj);
+                layer_nan_count += sanitize(&mut g.ffn_norm);
+                layer_nan_count += sanitize(&mut g.gate_proj);
+                layer_nan_count += sanitize(&mut g.up_proj);
+                layer_nan_count += sanitize(&mut g.down_proj);
+                if let Some(ref mut b) = g.q_bias { layer_nan_count += sanitize(b); }
+                if let Some(ref mut b) = g.k_bias { layer_nan_count += sanitize(b); }
+                if let Some(ref mut b) = g.v_bias { layer_nan_count += sanitize(b); }
+                if layer_nan_count > 0 {
+                    grad_has_nan = true;
+                    grad_nan_layers.push((i, layer_nan_count));
+                }
+            }
+            if grad_has_nan {
+                println!("    [WARN] NaN/Inf勾配検出! layers: {grad_nan_layers:?} → ゼロ置換済み");
+            }
+
+            // [DEBUG] 勾配診断（最初の5ステップ + 100ステップごと）
+            if global_step < 5 || global_step % 100 == 0 {
+                let g = &accumulated_grads[0];
+                let q_norm: f64 = g.q_proj.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+                let gate_norm: f64 = g.gate_proj.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+                let g27 = &accumulated_grads[num_layers - 1];
+                let q27_norm: f64 = g27.q_proj.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+                println!("    [DEBUG] grads: L0 q={q_norm:.4e} gate={gate_norm:.4e} | L27 q={q27_norm:.4e}");
+            }
+
             // メモリ解放
             drop(all_layer_inputs);
             drop(all_d_hiddens);
 
             // 全 micro-batch 完了後に一括で重み更新
+            // Gradient Clipping: 全レイヤーの勾配を結合してグローバル L2 Norm を計算し、
+            // max_grad_norm (1.0) を超えていたら全体をスケーリング
+            let max_grad_norm = config.max_grad_norm;
+            let mut global_grad_sq_sum: f64 = 0.0;
+            for i in 0..num_layers {
+                let g = &accumulated_grads[i];
+                for field in [&g.attn_norm, &g.q_proj, &g.k_proj, &g.v_proj, &g.o_proj,
+                              &g.ffn_norm, &g.gate_proj, &g.up_proj, &g.down_proj] {
+                    global_grad_sq_sum += field.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+                }
+            }
+            let global_grad_norm = global_grad_sq_sum.sqrt();
+            let clip_scale = if global_grad_norm > max_grad_norm as f64 && global_grad_norm > 1e-10 {
+                (max_grad_norm as f64) / global_grad_norm
+            } else {
+                1.0
+            };
+            if global_step < 5 || global_step % 100 == 0 {
+                println!("    [DEBUG] global_grad_norm={global_grad_norm:.4e} clip_scale={clip_scale:.6e}");
+            }
+            if clip_scale < 1.0 {
+                let s = clip_scale as f32;
+                for i in 0..num_layers {
+                    let g = &mut accumulated_grads[i];
+                    for v in g.attn_norm.iter_mut() { *v *= s; }
+                    for v in g.q_proj.iter_mut() { *v *= s; }
+                    for v in g.k_proj.iter_mut() { *v *= s; }
+                    for v in g.v_proj.iter_mut() { *v *= s; }
+                    for v in g.o_proj.iter_mut() { *v *= s; }
+                    for v in g.ffn_norm.iter_mut() { *v *= s; }
+                    for v in g.gate_proj.iter_mut() { *v *= s; }
+                    for v in g.up_proj.iter_mut() { *v *= s; }
+                    for v in g.down_proj.iter_mut() { *v *= s; }
+                }
+            }
+
             let apply_start = Instant::now();
-            let inv_tokens_final = 1.0 / token_count.max(1) as f32;
+            let adam_step = global_step + 1; // bias correction は 1-indexed
+            let mut _adam_expand_us = 0u128;
+            let mut _adam_step_us = 0u128;
+            let mut _adam_compress_us = 0u128;
+            let mut _adam_zero_us = 0u128;
             for i in 0..num_layers {
                 if use_bf16_delta {
                     let wd = working_delta.as_mut().unwrap();
+                    let _ta0 = Instant::now();
                     bf16_delta_store[i].expand_into(wd);
-                    wd.apply_grads(&accumulated_grads[i], effective_lr, inv_tokens_final, config.weight_decay);
+                    _adam_expand_us += _ta0.elapsed().as_micros();
+                    let _ta1 = Instant::now();
+                    wd.apply_adam(&accumulated_grads[i], &mut adam_states[i], effective_lr, config.weight_decay, adam_step);
+                    _adam_step_us += _ta1.elapsed().as_micros();
+                    // apply_adam 後の delta NaN チェック
+                    let delta_nan = wd.q_proj.iter().any(|x| x.is_nan());
+                    if delta_nan && (global_step < 5 || i == 0 || i == 26) {
+                        println!("    [WARN] delta L{i} にNaN検出 (apply_adam後)");
+                    }
+                    let _ta2 = Instant::now();
                     bf16_delta_store[i].update_from_f32(wd);
+                    _adam_compress_us += _ta2.elapsed().as_micros();
                 } else {
-                    delta_cache[i].apply_grads(&accumulated_grads[i], effective_lr, inv_tokens_final, config.weight_decay);
+                    let _ta1 = Instant::now();
+                    delta_cache[i].apply_adam(&accumulated_grads[i], &mut adam_states[i], effective_lr, config.weight_decay, adam_step);
+                    _adam_step_us += _ta1.elapsed().as_micros();
                 }
+                let _ta3 = Instant::now();
                 accumulated_grads[i].zero_out();
+                _adam_zero_us += _ta3.elapsed().as_micros();
             }
-            println!("    [TIMING] Apply grads: {}ms", apply_start.elapsed().as_millis());
+            println!("    [TIMING] Apply AdamW: {}ms (expand={:.1}ms adam={:.1}ms compress={:.1}ms zero={:.1}ms)",
+                apply_start.elapsed().as_millis(),
+                _adam_expand_us as f64 / 1000.0, _adam_step_us as f64 / 1000.0,
+                _adam_compress_us as f64 / 1000.0, _adam_zero_us as f64 / 1000.0);
+
+            // [DEBUG] delta 変化量（最初のステップのみ）
+            if global_step == 0 {
+                if use_bf16_delta {
+                    let wd = working_delta.as_mut().unwrap();
+                    bf16_delta_store[0].expand_into(wd);
+                    let delta_norm: f64 = wd.q_proj.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+                    let delta_max = wd.q_proj.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs()));
+                    println!("    [DEBUG] delta L0 q_proj after update: L2={delta_norm:.4e} max={delta_max:.4e}");
+                }
+            }
 
             let accumulated_loss = if token_count > 0 {
                 total_loss / token_count as f32
@@ -1003,7 +1313,7 @@ fn main() {
                 };
                 println!(
                     "  step {global_step:>5}/{} | loss: {accumulated_loss:.4} | lr: {lr:.2e} | \
-                     qat_mae: {step_mae:.4} | cos: {step_cos:.4} | temp: {:.3} | \
+                     alpha: {alpha:.3} | qat_mae: {step_mae:.4} | cos: {step_cos:.4} | temp: {:.3} | \
                      {:.1}ms/step | {steps_per_sec:.1} steps/s | ETA: {eta_secs:.0}s",
                     config.total_steps,
                     fq.temperature(),
@@ -1108,8 +1418,9 @@ fn main() {
                 let _ = std::io::stdout().flush();
             }
 
-            // チェックポイント: step 番号 + delta 一覧を保存（delta をディスクにフラッシュ）
+            // チェックポイント: step 番号 + delta + AdamW state を保存
             if global_step > 0 && global_step % config.checkpoint_interval == 0 {
+                let ckpt_start = Instant::now();
                 // Delta キャッシュをディスクにフラッシュ
                 if use_bf16_delta {
                     for (i, store) in bf16_delta_store.iter().enumerate() {
@@ -1120,8 +1431,11 @@ fn main() {
                         dc.save_to_disk(i, &config.checkpoint_dir);
                     }
                 }
+                // AdamW 状態をディスクにフラッシュ
+                for (i, adam) in adam_states.iter().enumerate() {
+                    adam.save_to_disk(i, &config.checkpoint_dir);
+                }
                 let ckpt_path = format!("{}/step_{global_step}.bin", config.checkpoint_dir);
-                println!("  チェックポイント保存: {ckpt_path}");
                 let meta = alice_train::CheckpointMeta {
                     version: 1,
                     epoch: 0,
@@ -1141,12 +1455,68 @@ fn main() {
                 {
                     eprintln!("  チェックポイント保存失敗: {e}");
                 }
+                // resume_state.json: 再起動時に step/loss を自動復元
+                let resume_json = format!(
+                    "{{\"step\":{global_step},\"loss\":{accumulated_loss:.6},\"lr\":{lr:.2e}}}",
+                );
+                let resume_path = format!("{}/resume_state.json", config.checkpoint_dir);
+                let _ = std::fs::write(&resume_path, &resume_json);
+                println!("  チェックポイント保存: {ckpt_path} (delta+adam+resume {:.1}s)", ckpt_start.elapsed().as_secs_f32());
             }
 
             global_step += 1;
+
+            // Graceful shutdown: SIGTERM/SIGINT を受信したらチェックポイント保存して終了
+            #[cfg(unix)]
+            if SHUTDOWN_FLAG.load(Ordering::SeqCst) {
+                println!("\n━━━ Graceful Shutdown (step {global_step}) ━━━");
+                println!("  Delta + AdamW をディスクにフラッシュ中...");
+                if use_bf16_delta {
+                    for (i, store) in bf16_delta_store.iter().enumerate() {
+                        store.save_to_disk(i, &config.checkpoint_dir);
+                    }
+                } else {
+                    for (i, dc) in delta_cache.iter().enumerate() {
+                        dc.save_to_disk(i, &config.checkpoint_dir);
+                    }
+                }
+                for (i, adam) in adam_states.iter().enumerate() {
+                    adam.save_to_disk(i, &config.checkpoint_dir);
+                }
+                let ckpt_path = format!("{}/step_{global_step}.bin", config.checkpoint_dir);
+                let meta = alice_train::CheckpointMeta {
+                    version: 1,
+                    epoch: 0,
+                    step: global_step,
+                    loss: accumulated_loss,
+                    learning_rate: lr,
+                    weight_count: embedding_table.len(),
+                    optimizer_state_count: 0,
+                };
+                let ckpt = CheckpointData {
+                    meta,
+                    weights: embedding_table.clone(),
+                    optimizer_state: vec![],
+                };
+                if let Err(e) =
+                    std::fs::File::create(&ckpt_path).and_then(|mut f| ckpt.save(&mut f))
+                {
+                    eprintln!("  チェックポイント保存失敗: {e}");
+                } else {
+                    println!("  チェックポイント保存完了: {ckpt_path}");
+                }
+                let resume_json = format!(
+                    "{{\"step\":{global_step},\"loss\":{accumulated_loss:.6},\"lr\":{lr:.2e}}}",
+                );
+                let resume_path = format!("{}/resume_state.json", config.checkpoint_dir);
+                let _ = std::fs::write(&resume_path, &resume_json);
+                println!("━━━ 学習中断（再開可能） ━━━");
+                let _ = std::io::stdout().flush();
+                break;
+            }
         }
 
-        // 学習終了時に delta をディスクにフラッシュ
+        // 学習終了時に delta + AdamW 状態をディスクにフラッシュ
         if use_bf16_delta {
             for (i, store) in bf16_delta_store.iter().enumerate() {
                 store.save_to_disk(i, &config.checkpoint_dir);
@@ -1156,6 +1526,17 @@ fn main() {
                 dc.save_to_disk(i, &config.checkpoint_dir);
             }
         }
+        for (i, adam) in adam_states.iter().enumerate() {
+            adam.save_to_disk(i, &config.checkpoint_dir);
+        }
+        // resume_state.json: 再起動時に step/loss を自動復元
+        let final_lr = scheduler.get_lr(global_step);
+        let final_loss = log.entries().last().map_or(0.0, |e| e.loss);
+        let resume_json = format!(
+            "{{\"step\":{global_step},\"loss\":{final_loss:.6},\"lr\":{final_lr:.2e}}}",
+        );
+        let resume_path = format!("{}/resume_state.json", config.checkpoint_dir);
+        let _ = std::fs::write(&resume_path, &resume_json);
 
         let total_duration = train_start.elapsed();
         println!();
@@ -1184,6 +1565,168 @@ fn main() {
                 );
             }
         }
+    }
+}
+
+// ── AdamW オプティマイザ状態 ──────────────────────────────────────────────
+
+/// レイヤーごとの AdamW m (1次モーメント) / v (2次モーメント) 状態。
+/// LayerDeltaCache と同じフィールド構成。
+struct LayerAdamState {
+    attn_norm_m: Vec<f32>,
+    attn_norm_v: Vec<f32>,
+    q_proj_m: Vec<f32>,
+    q_proj_v: Vec<f32>,
+    k_proj_m: Vec<f32>,
+    k_proj_v: Vec<f32>,
+    v_proj_m: Vec<f32>,
+    v_proj_v: Vec<f32>,
+    o_proj_m: Vec<f32>,
+    o_proj_v: Vec<f32>,
+    ffn_norm_m: Vec<f32>,
+    ffn_norm_v: Vec<f32>,
+    gate_proj_m: Vec<f32>,
+    gate_proj_v: Vec<f32>,
+    up_proj_m: Vec<f32>,
+    up_proj_v: Vec<f32>,
+    down_proj_m: Vec<f32>,
+    down_proj_v: Vec<f32>,
+    q_bias_m: Option<Vec<f32>>,
+    q_bias_v: Option<Vec<f32>>,
+    k_bias_m: Option<Vec<f32>>,
+    k_bias_v: Option<Vec<f32>>,
+    v_bias_m: Option<Vec<f32>>,
+    v_bias_v: Option<Vec<f32>>,
+}
+
+impl LayerAdamState {
+    /// ゼロ初期化。LayerDeltaCache と同じサイズ。
+    fn zeros(config: &LlamaConfig) -> Self {
+        let hidden = config.hidden_dim;
+        let num_heads = config.num_heads;
+        let num_kv_heads = config.num_kv_heads;
+        let head_dim = config.head_dim;
+        let inter = config.intermediate_dim;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        let (q_bias_m, q_bias_v, k_bias_m, k_bias_v, v_bias_m, v_bias_v) = if config.attention_bias {
+            (
+                Some(vec![0.0f32; q_dim]), Some(vec![0.0f32; q_dim]),
+                Some(vec![0.0f32; kv_dim]), Some(vec![0.0f32; kv_dim]),
+                Some(vec![0.0f32; kv_dim]), Some(vec![0.0f32; kv_dim]),
+            )
+        } else {
+            (None, None, None, None, None, None)
+        };
+
+        Self {
+            attn_norm_m: vec![0.0; hidden], attn_norm_v: vec![0.0; hidden],
+            q_proj_m: vec![0.0; q_dim * hidden], q_proj_v: vec![0.0; q_dim * hidden],
+            k_proj_m: vec![0.0; kv_dim * hidden], k_proj_v: vec![0.0; kv_dim * hidden],
+            v_proj_m: vec![0.0; kv_dim * hidden], v_proj_v: vec![0.0; kv_dim * hidden],
+            o_proj_m: vec![0.0; hidden * q_dim], o_proj_v: vec![0.0; hidden * q_dim],
+            ffn_norm_m: vec![0.0; hidden], ffn_norm_v: vec![0.0; hidden],
+            gate_proj_m: vec![0.0; inter * hidden], gate_proj_v: vec![0.0; inter * hidden],
+            up_proj_m: vec![0.0; inter * hidden], up_proj_v: vec![0.0; inter * hidden],
+            down_proj_m: vec![0.0; hidden * inter], down_proj_v: vec![0.0; hidden * inter],
+            q_bias_m, q_bias_v, k_bias_m, k_bias_v, v_bias_m, v_bias_v,
+        }
+    }
+
+    /// AdamW 状態をディスクに保存。
+    fn save_to_disk(&self, layer_idx: usize, checkpoint_dir: &str) {
+        let sv = |name: &str, data: &[f32]| save_layer_delta(layer_idx, name, data, checkpoint_dir);
+        sv("adam_attn_norm_m", &self.attn_norm_m);
+        sv("adam_attn_norm_v", &self.attn_norm_v);
+        sv("adam_q_proj_m", &self.q_proj_m);
+        sv("adam_q_proj_v", &self.q_proj_v);
+        sv("adam_k_proj_m", &self.k_proj_m);
+        sv("adam_k_proj_v", &self.k_proj_v);
+        sv("adam_v_proj_m", &self.v_proj_m);
+        sv("adam_v_proj_v", &self.v_proj_v);
+        sv("adam_o_proj_m", &self.o_proj_m);
+        sv("adam_o_proj_v", &self.o_proj_v);
+        sv("adam_ffn_norm_m", &self.ffn_norm_m);
+        sv("adam_ffn_norm_v", &self.ffn_norm_v);
+        sv("adam_gate_proj_m", &self.gate_proj_m);
+        sv("adam_gate_proj_v", &self.gate_proj_v);
+        sv("adam_up_proj_m", &self.up_proj_m);
+        sv("adam_up_proj_v", &self.up_proj_v);
+        sv("adam_down_proj_m", &self.down_proj_m);
+        sv("adam_down_proj_v", &self.down_proj_v);
+        if let Some(ref d) = self.q_bias_m { sv("adam_q_bias_m", d); }
+        if let Some(ref d) = self.q_bias_v { sv("adam_q_bias_v", d); }
+        if let Some(ref d) = self.k_bias_m { sv("adam_k_bias_m", d); }
+        if let Some(ref d) = self.k_bias_v { sv("adam_k_bias_v", d); }
+        if let Some(ref d) = self.v_bias_m { sv("adam_v_bias_m", d); }
+        if let Some(ref d) = self.v_bias_v { sv("adam_v_bias_v", d); }
+    }
+
+    /// ディスクから AdamW 状態を読み込む。存在しなければゼロ初期化。
+    fn load_from_disk(layer_idx: usize, config: &LlamaConfig, checkpoint_dir: &str) -> Self {
+        let hidden = config.hidden_dim;
+        let num_heads = config.num_heads;
+        let num_kv_heads = config.num_kv_heads;
+        let head_dim = config.head_dim;
+        let inter = config.intermediate_dim;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        let ld = |name: &str, size: usize| load_layer_delta(layer_idx, name, size, checkpoint_dir);
+
+        let (q_bias_m, q_bias_v, k_bias_m, k_bias_v, v_bias_m, v_bias_v) = if config.attention_bias {
+            (
+                Some(ld("adam_q_bias_m", q_dim)), Some(ld("adam_q_bias_v", q_dim)),
+                Some(ld("adam_k_bias_m", kv_dim)), Some(ld("adam_k_bias_v", kv_dim)),
+                Some(ld("adam_v_bias_m", kv_dim)), Some(ld("adam_v_bias_v", kv_dim)),
+            )
+        } else {
+            (None, None, None, None, None, None)
+        };
+
+        Self {
+            attn_norm_m: ld("adam_attn_norm_m", hidden),
+            attn_norm_v: ld("adam_attn_norm_v", hidden),
+            q_proj_m: ld("adam_q_proj_m", q_dim * hidden),
+            q_proj_v: ld("adam_q_proj_v", q_dim * hidden),
+            k_proj_m: ld("adam_k_proj_m", kv_dim * hidden),
+            k_proj_v: ld("adam_k_proj_v", kv_dim * hidden),
+            v_proj_m: ld("adam_v_proj_m", kv_dim * hidden),
+            v_proj_v: ld("adam_v_proj_v", kv_dim * hidden),
+            o_proj_m: ld("adam_o_proj_m", q_dim * hidden),
+            o_proj_v: ld("adam_o_proj_v", q_dim * hidden),
+            ffn_norm_m: ld("adam_ffn_norm_m", hidden),
+            ffn_norm_v: ld("adam_ffn_norm_v", hidden),
+            gate_proj_m: ld("adam_gate_proj_m", inter * hidden),
+            gate_proj_v: ld("adam_gate_proj_v", inter * hidden),
+            up_proj_m: ld("adam_up_proj_m", inter * hidden),
+            up_proj_v: ld("adam_up_proj_v", inter * hidden),
+            down_proj_m: ld("adam_down_proj_m", hidden * inter),
+            down_proj_v: ld("adam_down_proj_v", hidden * inter),
+            q_bias_m, q_bias_v,
+            k_bias_m, k_bias_v,
+            v_bias_m, v_bias_v,
+        }
+    }
+
+    /// RAM 使用量 (bytes) — m + v 合計。
+    fn memory_bytes(&self) -> usize {
+        let count = |v: &[f32]| v.len() * 4;
+        let mut total = 0;
+        total += count(&self.attn_norm_m) + count(&self.attn_norm_v);
+        total += count(&self.q_proj_m) + count(&self.q_proj_v);
+        total += count(&self.k_proj_m) + count(&self.k_proj_v);
+        total += count(&self.v_proj_m) + count(&self.v_proj_v);
+        total += count(&self.o_proj_m) + count(&self.o_proj_v);
+        total += count(&self.ffn_norm_m) + count(&self.ffn_norm_v);
+        total += count(&self.gate_proj_m) + count(&self.gate_proj_v);
+        total += count(&self.up_proj_m) + count(&self.up_proj_v);
+        total += count(&self.down_proj_m) + count(&self.down_proj_v);
+        if let Some(ref v) = self.q_bias_m { total += count(v) * 2; }
+        if let Some(ref v) = self.k_bias_m { total += count(v) * 2; }
+        if let Some(ref v) = self.v_bias_m { total += count(v) * 2; }
+        total
     }
 }
 
@@ -1257,6 +1800,18 @@ impl LayerDeltaCache {
         fq: &mut FakeQuantize,
         _quantize_buf: &mut Vec<f32>,
     ) -> (f64, f64, usize) {
+        self.fused_merge_and_quantize_alpha(base, workspace, fq, _quantize_buf, 1.0)
+    }
+
+    /// Alpha Blending 対応版: alpha=0 → FP32、alpha=1 → Ternary
+    fn fused_merge_and_quantize_alpha(
+        &self,
+        base: &LlamaLayerWeights,
+        workspace: &mut LlamaLayerWeights,
+        fq: &mut FakeQuantize,
+        _quantize_buf: &mut Vec<f32>,
+        alpha: f32,
+    ) -> (f64, f64, usize) {
         use rayon::prelude::*;
 
         let mut total_mae = 0.0f64;
@@ -1295,19 +1850,24 @@ impl LayerDeltaCache {
             fq.set_scale(scale);
             let inv_scale = 1.0 / scale;
 
-            // パス2 (Rayon並列): 量子化 + 統計 + 上書き を完全融合
+            // パス2 (Rayon並列): 量子化 + Alpha Blending + 統計 + 上書き を完全融合
+            let blend_alpha = alpha;
+            let one_minus_alpha = 1.0 - blend_alpha;
             let (sum_err, dot_wq, dot_ww, dot_qq) = w.par_iter_mut()
                 .map(|wv_mut| {
-                    let wv = *wv_mut;
+                    let wv = *wv_mut; // FP32 (base + delta)
                     // Ternary fake quantize: round(w/γ/temp) → clamp(-1,1) → ×γ
                     let scaled = wv * inv_scale * inv_temp;
-                    let qv = scaled.round().clamp(-1.0, 1.0) * scale;
+                    let qv_hard = scaled.round().clamp(-1.0, 1.0) * scale;
 
-                    // 統計計算
+                    // Alpha Blending: w_effective = w_fp32 * (1-α) + w_quant * α
+                    let qv = wv * one_minus_alpha + qv_hard * blend_alpha;
+
+                    // 統計計算（FP32 vs blended）
                     let wv_f64 = wv as f64;
                     let qv_f64 = qv as f64;
 
-                    // 量子化済みで上書き
+                    // blended 値で上書き
                     *wv_mut = qv;
 
                     ((wv_f64 - qv_f64).abs(), wv_f64 * qv_f64, wv_f64 * wv_f64, qv_f64 * qv_f64)
@@ -1346,50 +1906,106 @@ impl LayerDeltaCache {
         (total_mae, total_cos, count)
     }
 
-    /// 勾配からSGD更新を delta キャッシュに適用（rayon 並列）。
-    fn apply_grads(&mut self, grads: &LayerWeightGrads, lr: f32, inv_tokens: f32, weight_decay: f32) {
+    /// AdamW 更新を delta キャッシュに適用（rayon 並列）。
+    /// d_logits で Mean 化済み + グローバル gradient clipping 適用済み。
+    fn apply_adam(&mut self, grads: &LayerWeightGrads, adam: &mut LayerAdamState, lr: f32, weight_decay: f32, step: usize) {
         use rayon::prelude::*;
 
-        let update = |delta: &mut [f32], grad: &[f32], wd: f32| {
-            let mut scaled: Vec<f32> = grad.par_iter().map(|&g| g * inv_tokens).collect();
-            clip_grad(&mut scaled, 1.0);
-            delta.par_iter_mut().zip(scaled.par_iter()).for_each(|(d, &s)| {
-                *d -= lr * (s + wd * *d);
-            });
+        let beta1: f32 = 0.9;
+        let beta2: f32 = 0.999;
+        let eps: f32 = 1e-8;
+        let t = step as f32;
+        let bc1 = 1.0 - beta1.powf(t);
+        let bc2 = 1.0 - beta2.powf(t);
+
+        let adamw_update = |delta: &mut [f32], grad: &[f32], m: &mut [f32], v: &mut [f32], wd: f32| {
+            for i in 0..delta.len() {
+                let g = grad[i];
+                m[i] = beta1 * m[i] + (1.0 - beta1) * g;
+                v[i] = beta2 * v[i] + (1.0 - beta2) * g * g;
+                let m_hat = m[i] / bc1;
+                let v_hat = v[i] / bc2;
+                delta[i] -= lr * (m_hat / (v_hat.sqrt() + eps) + wd * delta[i]);
+            }
         };
 
-        // 大きい projection テンソルを rayon で並列更新
+        // 大きい projection テンソルを並列更新
         let wd = weight_decay;
-        let pairs: Vec<(&mut [f32], &[f32])> = vec![
-            (self.q_proj.as_mut_slice(), grads.q_proj.as_slice()),
-            (self.k_proj.as_mut_slice(), grads.k_proj.as_slice()),
-            (self.v_proj.as_mut_slice(), grads.v_proj.as_slice()),
-            (self.o_proj.as_mut_slice(), grads.o_proj.as_slice()),
-            (self.gate_proj.as_mut_slice(), grads.gate_proj.as_slice()),
-            (self.up_proj.as_mut_slice(), grads.up_proj.as_slice()),
-            (self.down_proj.as_mut_slice(), grads.down_proj.as_slice()),
-        ];
-        pairs.into_par_iter().for_each(|(delta, grad)| {
-            let mut scaled: Vec<f32> = grad.par_iter().map(|&g| g * inv_tokens).collect();
-            clip_grad(&mut scaled, 1.0);
-            delta.par_iter_mut().zip(scaled.par_iter()).for_each(|(d, &s)| {
-                *d -= lr * (s + wd * *d);
-            });
+        // projection 7本を並列に処理
+        rayon::scope(|s| {
+            s.spawn(|_| adamw_update(&mut self.q_proj, &grads.q_proj, &mut adam.q_proj_m, &mut adam.q_proj_v, wd));
+            s.spawn(|_| adamw_update(&mut self.k_proj, &grads.k_proj, &mut adam.k_proj_m, &mut adam.k_proj_v, wd));
+            s.spawn(|_| adamw_update(&mut self.v_proj, &grads.v_proj, &mut adam.v_proj_m, &mut adam.v_proj_v, wd));
+            s.spawn(|_| adamw_update(&mut self.o_proj, &grads.o_proj, &mut adam.o_proj_m, &mut adam.o_proj_v, wd));
+            s.spawn(|_| adamw_update(&mut self.gate_proj, &grads.gate_proj, &mut adam.gate_proj_m, &mut adam.gate_proj_v, wd));
+            s.spawn(|_| adamw_update(&mut self.up_proj, &grads.up_proj, &mut adam.up_proj_m, &mut adam.up_proj_v, wd));
+            s.spawn(|_| adamw_update(&mut self.down_proj, &grads.down_proj, &mut adam.down_proj_m, &mut adam.down_proj_v, wd));
         });
 
         // norm は小さいのでシーケンシャル
-        update(&mut self.attn_norm, &grads.attn_norm, weight_decay);
-        update(&mut self.ffn_norm, &grads.ffn_norm, weight_decay);
+        adamw_update(&mut self.attn_norm, &grads.attn_norm, &mut adam.attn_norm_m, &mut adam.attn_norm_v, weight_decay);
+        adamw_update(&mut self.ffn_norm, &grads.ffn_norm, &mut adam.ffn_norm_m, &mut adam.ffn_norm_v, weight_decay);
 
         // Bias: weight_decay なし
-        if let (Some(ref mut d), Some(ref g)) = (&mut self.q_bias, &grads.q_bias) {
-            update(d, g, 0.0);
+        if let (Some(ref mut d), Some(ref g), Some(ref mut m), Some(ref mut v)) =
+            (&mut self.q_bias, &grads.q_bias, &mut adam.q_bias_m, &mut adam.q_bias_v) {
+            adamw_update(d, g, m, v, 0.0);
         }
-        if let (Some(ref mut d), Some(ref g)) = (&mut self.k_bias, &grads.k_bias) {
-            update(d, g, 0.0);
+        if let (Some(ref mut d), Some(ref g), Some(ref mut m), Some(ref mut v)) =
+            (&mut self.k_bias, &grads.k_bias, &mut adam.k_bias_m, &mut adam.k_bias_v) {
+            adamw_update(d, g, m, v, 0.0);
         }
-        if let (Some(ref mut d), Some(ref g)) = (&mut self.v_bias, &grads.v_bias) {
-            update(d, g, 0.0);
+        if let (Some(ref mut d), Some(ref g), Some(ref mut m), Some(ref mut v)) =
+            (&mut self.v_bias, &grads.v_bias, &mut adam.v_bias_m, &mut adam.v_bias_v) {
+            adamw_update(d, g, m, v, 0.0);
+        }
+    }
+
+    /// GPU Fused AdamW 更新。projection 7本を順次 GPU カーネルで更新。
+    #[cfg(feature = "cuda")]
+    fn apply_adam_gpu(&mut self, grads: &LayerWeightGrads, adam: &mut LayerAdamState,
+                      cuda: &alice_train::cuda_matmul::CudaMatmul, lr: f32, weight_decay: f32, step: usize) {
+        let beta1: f32 = 0.9;
+        let beta2: f32 = 0.999;
+        let eps: f32 = 1e-8;
+        let t = step as f32;
+        let bc1 = 1.0 - beta1.powf(t);
+        let bc2 = 1.0 - beta2.powf(t);
+        let wd = weight_decay;
+
+        // 大きい projection テンソルを GPU で更新
+        cuda.gpu_adamw_update(&mut self.q_proj, &grads.q_proj, &mut adam.q_proj_m, &mut adam.q_proj_v, lr, beta1, beta2, eps, bc1, bc2, wd);
+        cuda.gpu_adamw_update(&mut self.k_proj, &grads.k_proj, &mut adam.k_proj_m, &mut adam.k_proj_v, lr, beta1, beta2, eps, bc1, bc2, wd);
+        cuda.gpu_adamw_update(&mut self.v_proj, &grads.v_proj, &mut adam.v_proj_m, &mut adam.v_proj_v, lr, beta1, beta2, eps, bc1, bc2, wd);
+        cuda.gpu_adamw_update(&mut self.o_proj, &grads.o_proj, &mut adam.o_proj_m, &mut adam.o_proj_v, lr, beta1, beta2, eps, bc1, bc2, wd);
+        cuda.gpu_adamw_update(&mut self.gate_proj, &grads.gate_proj, &mut adam.gate_proj_m, &mut adam.gate_proj_v, lr, beta1, beta2, eps, bc1, bc2, wd);
+        cuda.gpu_adamw_update(&mut self.up_proj, &grads.up_proj, &mut adam.up_proj_m, &mut adam.up_proj_v, lr, beta1, beta2, eps, bc1, bc2, wd);
+        cuda.gpu_adamw_update(&mut self.down_proj, &grads.down_proj, &mut adam.down_proj_m, &mut adam.down_proj_v, lr, beta1, beta2, eps, bc1, bc2, wd);
+
+        // norm は小さいのでCPU（GPU転送オーバーヘッドの方が大きい）
+        let adamw_cpu = |delta: &mut [f32], grad: &[f32], m: &mut [f32], v: &mut [f32], wd: f32| {
+            for i in 0..delta.len() {
+                let g = grad[i];
+                m[i] = beta1 * m[i] + (1.0 - beta1) * g;
+                v[i] = beta2 * v[i] + (1.0 - beta2) * g * g;
+                let m_hat = m[i] / bc1;
+                let v_hat = v[i] / bc2;
+                delta[i] -= lr * (m_hat / (v_hat.sqrt() + eps) + wd * delta[i]);
+            }
+        };
+        adamw_cpu(&mut self.attn_norm, &grads.attn_norm, &mut adam.attn_norm_m, &mut adam.attn_norm_v, weight_decay);
+        adamw_cpu(&mut self.ffn_norm, &grads.ffn_norm, &mut adam.ffn_norm_m, &mut adam.ffn_norm_v, weight_decay);
+        if let (Some(ref mut d), Some(ref g), Some(ref mut m), Some(ref mut v)) =
+            (&mut self.q_bias, &grads.q_bias, &mut adam.q_bias_m, &mut adam.q_bias_v) {
+            adamw_cpu(d, g, m, v, 0.0);
+        }
+        if let (Some(ref mut d), Some(ref g), Some(ref mut m), Some(ref mut v)) =
+            (&mut self.k_bias, &grads.k_bias, &mut adam.k_bias_m, &mut adam.k_bias_v) {
+            adamw_cpu(d, g, m, v, 0.0);
+        }
+        if let (Some(ref mut d), Some(ref g), Some(ref mut m), Some(ref mut v)) =
+            (&mut self.v_bias, &grads.v_bias, &mut adam.v_bias_m, &mut adam.v_bias_v) {
+            adamw_cpu(d, g, m, v, 0.0);
         }
     }
 
@@ -1524,29 +2140,28 @@ impl Bf16DeltaStore {
         self.to_f32().save_to_disk(layer_idx, checkpoint_dir);
     }
 
-    /// FP32 delta キャッシュの内容で BF16 ストアをリロード（展開先バッファに書き込み）。Rayon並列。
+    /// FP32 delta キャッシュの内容で BF16 ストアをリロード。
+    /// SIMD-friendly 単一スレッドループ（Rayon par_iter より高速 — メモリバウンド）。
     fn expand_into(&self, dst: &mut LayerDeltaCache) {
-        use rayon::prelude::*;
-        let expand = |dst: &mut [f32], src: &[u16]| {
-            dst.par_iter_mut().zip(src.par_iter()).for_each(|(d, s)| *d = bf16_to_f32(*s));
-        };
-        expand(&mut dst.attn_norm, &self.attn_norm);
-        expand(&mut dst.q_proj, &self.q_proj);
-        expand(&mut dst.k_proj, &self.k_proj);
-        expand(&mut dst.v_proj, &self.v_proj);
-        expand(&mut dst.o_proj, &self.o_proj);
-        expand(&mut dst.ffn_norm, &self.ffn_norm);
-        expand(&mut dst.gate_proj, &self.gate_proj);
-        expand(&mut dst.up_proj, &self.up_proj);
-        expand(&mut dst.down_proj, &self.down_proj);
-        if let (Some(dst), Some(src)) = (&mut dst.q_bias, &self.q_bias) {
-            expand(dst, src);
+        use alice_train::cuda_matmul::CudaMatmul;
+        let expand = CudaMatmul::cpu_bf16_expand_fast;
+        expand(&self.attn_norm, &mut dst.attn_norm);
+        expand(&self.q_proj, &mut dst.q_proj);
+        expand(&self.k_proj, &mut dst.k_proj);
+        expand(&self.v_proj, &mut dst.v_proj);
+        expand(&self.o_proj, &mut dst.o_proj);
+        expand(&self.ffn_norm, &mut dst.ffn_norm);
+        expand(&self.gate_proj, &mut dst.gate_proj);
+        expand(&self.up_proj, &mut dst.up_proj);
+        expand(&self.down_proj, &mut dst.down_proj);
+        if let (Some(ref src), Some(ref mut d)) = (&self.q_bias, &mut dst.q_bias) {
+            expand(src, d);
         }
-        if let (Some(dst), Some(src)) = (&mut dst.k_bias, &self.k_bias) {
-            expand(dst, src);
+        if let (Some(ref src), Some(ref mut d)) = (&self.k_bias, &mut dst.k_bias) {
+            expand(src, d);
         }
-        if let (Some(dst), Some(src)) = (&mut dst.v_bias, &self.v_bias) {
-            expand(dst, src);
+        if let (Some(ref src), Some(ref mut d)) = (&self.v_bias, &mut dst.v_bias) {
+            expand(src, d);
         }
     }
 }
@@ -1598,6 +2213,24 @@ fn clip_grad(grad: &mut [f32], max_norm: f32) -> f32 {
     }
     norm
 }
+
+/// SIGTERM/SIGINT ハンドラ — AtomicBool を立てるだけ（async-signal-safe）。
+#[cfg(unix)]
+extern "C" fn signal_handler(sig: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    // signal_handler 内では安全な操作のみ（atomic store + write syscall）
+    SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
+    // stderr に直接書き出し（async-signal-safe）
+    let msg = match sig {
+        libc::SIGTERM => b"\n[ALICE-Train] SIGTERM received, saving checkpoint...\n" as &[u8],
+        libc::SIGINT => b"\n[ALICE-Train] SIGINT received, saving checkpoint...\n" as &[u8],
+        _ => b"\n[ALICE-Train] Signal received, saving checkpoint...\n" as &[u8],
+    };
+    unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()); }
+}
+
+#[cfg(unix)]
+static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 
 /// グローバル delta をモデル重みに適用（起動時に呼ぶ）。
 fn apply_global_delta(weights: &mut [f32], name: &str, checkpoint_dir: &str) {

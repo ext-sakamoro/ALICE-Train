@@ -7,6 +7,7 @@
 ///
 /// 精度: 相対誤差 < 2% (|x| < 80)。学習用 softmax / SiLU に十分。
 #[inline(always)]
+#[must_use] 
 pub fn fast_exp(x: f32) -> f32 {
     let x = x.clamp(-87.3, 88.7);
     let val = x.mul_add(std::f32::consts::LOG2_E, 126.942_695);
@@ -16,6 +17,7 @@ pub fn fast_exp(x: f32) -> f32 {
 
 /// 高速近似 sigmoid。
 #[inline(always)]
+#[must_use] 
 pub fn fast_sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + fast_exp(-x))
 }

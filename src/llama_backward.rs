@@ -220,18 +220,19 @@ pub fn rope_backward(
     theta: f32,
 ) {
     let stride = n_heads * head_dim;
+    let half = head_dim / 2;
     d_x.par_chunks_exact_mut(stride).enumerate().for_each(|(t, token)| {
         for h in 0..n_heads {
             let base = h * head_dim;
-            for d in (0..head_dim).step_by(2) {
-                let freq = 1.0 / theta.powf(d as f32 / head_dim as f32);
+            for d in 0..half {
+                let freq = 1.0 / theta.powf((2 * d) as f32 / head_dim as f32);
                 let angle = t as f32 * freq;
                 let cos_a = angle.cos();
                 let sin_a = angle.sin();
                 let d0 = token[base + d];
-                let d1 = token[base + d + 1];
+                let d1 = token[base + d + half];
                 token[base + d] = d0.mul_add(cos_a, d1 * sin_a);
-                token[base + d + 1] = (-d0).mul_add(sin_a, d1 * cos_a);
+                token[base + d + half] = (-d0).mul_add(sin_a, d1 * cos_a);
             }
         }
     });
@@ -403,6 +404,7 @@ pub fn swiglu_ffn_backward(
 ///
 /// 入力: `d_output` — 出力勾配 (seq_len × hidden_dim)
 /// 出力: `d_input` — 入力勾配 (seq_len × hidden_dim), `LayerWeightGrads`
+#[must_use] 
 pub fn layer_backward(
     d_output: &[f32],
     cache: &LayerCache,

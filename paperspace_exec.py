@@ -7,7 +7,7 @@ import time
 import re
 import os
 
-WS_URL = os.environ.get("PAPERSPACE_WS", "wss://nem2c0vwhj.clg07azjl.paperspacegradient.com/terminals/websocket/1?token=7495c92418c784d06e76241f9cabd3b9")
+WS_URL = os.environ.get("PAPERSPACE_WS", "wss://n3epetj42n.clg07azjl.paperspacegradient.com/terminals/websocket/1?token=d1585ab0819a36f037262ebb96af3566")
 MARKER = "__ALICE_CMD_DONE__"
 
 def run_cmd(cmd: str, timeout: int = 120) -> str:
