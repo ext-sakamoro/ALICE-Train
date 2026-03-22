@@ -284,6 +284,141 @@ pub fn swiglu_ffn_backward(
     }
 }
 
+// ── レイヤー単位 backward ───────────────────────────────────────────────────
+
+/// DeltaNet レイヤーの backward — cache から勾配計算 + 重み更新。
+///
+/// `d_output`: このレイヤー出力の勾配 (seq_len × hidden)。
+/// 戻り値: `d_input` (前のレイヤーへの勾配)。
+pub fn deltanet_layer_backward(
+    d_output: &[f32],
+    cache: &crate::deltanet::DeltaNetLayerCache,
+    weights: &crate::qwen35::DeltaNetLayerWeights,
+    config: &Qwen35Config,
+    seq_len: usize,
+    _lr: f32,
+    _wd: f32,
+    weight_grads: &mut DeltaNetWeightGrads,
+) -> Vec<f32> {
+    let hidden = config.hidden_size;
+    let inter = config.intermediate_size;
+
+    let mut d_ffn_input = vec![0.0f32; seq_len * hidden];
+    swiglu_ffn_backward(
+        d_output,
+        &cache.normed_ffn,
+        &cache.gate,
+        &cache.up,
+        &cache.gate_silu,
+        &weights.gate_proj,
+        &weights.up_proj,
+        &weights.down_proj,
+        &mut d_ffn_input,
+        &mut weight_grads.d_gate_proj,
+        &mut weight_grads.d_up_proj,
+        &mut weight_grads.d_down_proj,
+        seq_len,
+        hidden,
+        inter,
+    );
+
+    // TODO: RMSNorm backward (post_attn_layernorm)
+    // 簡略化: d_ffn_input をそのまま attention 出力の勾配として使用
+    // (RMSNorm backward は norm weight の勾配 + 入力勾配のスケーリング)
+
+    // d_residual_ffn = d_output (residual skip)
+    // d_attn_block = d_ffn_input + d_output (residual add backward)
+    let mut d_input = vec![0.0f32; seq_len * hidden];
+    for i in 0..seq_len * hidden {
+        d_input[i] = d_ffn_input[i] + d_output[i];
+    }
+
+    // 2. Attention block backward は DeltaNet 再帰の backward が必要
+    // → deltanet_recurrence_backward で d_q, d_k, d_v, d_beta, d_a を取得
+    // → projection backward で d_in_proj_qkv 等を計算
+    // ここでは residual skip の勾配のみ伝播 (attention backward は省略)
+    // 完全な attention backward は CUDA 統合時に実装
+
+    // residual skip: d_input += d_output (attention block の residual)
+    for i in 0..seq_len * hidden {
+        d_input[i] += d_output[i];
+    }
+
+    d_input
+}
+
+/// Full Attention レイヤーの backward (簡略版 — FFN backward + residual)。
+pub fn full_attn_layer_backward(
+    d_output: &[f32],
+    cache: &crate::qwen35_forward::FullAttnLayerCache,
+    weights: &crate::qwen35::FullAttnLayerWeights,
+    config: &Qwen35Config,
+    seq_len: usize,
+    _lr: f32,
+    _wd: f32,
+    weight_grads: &mut FullAttnWeightGrads,
+) -> Vec<f32> {
+    let hidden = config.hidden_size;
+    let inter = config.intermediate_size;
+
+    let mut d_ffn_input = vec![0.0f32; seq_len * hidden];
+    swiglu_ffn_backward(
+        d_output,
+        &cache.normed_ffn,
+        &cache.gate,
+        &cache.up,
+        &cache.gate_silu,
+        &weights.gate_proj,
+        &weights.up_proj,
+        &weights.down_proj,
+        &mut d_ffn_input,
+        &mut weight_grads.d_gate_proj,
+        &mut weight_grads.d_up_proj,
+        &mut weight_grads.d_down_proj,
+        seq_len,
+        hidden,
+        inter,
+    );
+
+    let mut d_input = vec![0.0f32; seq_len * hidden];
+    for i in 0..seq_len * hidden {
+        d_input[i] = d_ffn_input[i] + d_output[i] + d_output[i]; // FFN + 2× residual
+    }
+
+    d_input
+}
+
+/// ハイブリッドレイヤーの backward。
+pub fn qwen35_layer_backward(
+    d_output: &[f32],
+    cache: &crate::qwen35_forward::Qwen35LayerCache,
+    weights: &crate::qwen35::Qwen35LayerWeights,
+    config: &Qwen35Config,
+    seq_len: usize,
+    lr: f32,
+    wd: f32,
+) -> (Vec<f32>, Qwen35WeightGrads) {
+    match (cache, weights) {
+        (
+            crate::qwen35_forward::Qwen35LayerCache::DeltaNet(c),
+            crate::qwen35::Qwen35LayerWeights::DeltaNet(w),
+        ) => {
+            let mut grads = DeltaNetWeightGrads::zeros(config);
+            let d_input = deltanet_layer_backward(d_output, c, w, config, seq_len, lr, wd, &mut grads);
+            (d_input, Qwen35WeightGrads::DeltaNet(grads))
+        }
+        (
+            crate::qwen35_forward::Qwen35LayerCache::FullAttention(c),
+            crate::qwen35::Qwen35LayerWeights::FullAttention(w),
+        ) => {
+            let mut grads = FullAttnWeightGrads::zeros(config);
+            let d_input = full_attn_layer_backward(d_output, c, w, config, seq_len, lr, wd, &mut grads);
+            (d_input, Qwen35WeightGrads::FullAttention(grads))
+        }
+        _ => panic!("cache と weights の型が一致しません"),
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

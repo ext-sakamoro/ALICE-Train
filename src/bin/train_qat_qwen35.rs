@@ -26,7 +26,8 @@ use std::time::Instant;
 use alice_train::qwen35::{
     DeltaNetLayerWeights, FullAttnLayerWeights, LayerType, Qwen35LayerWeights, Qwen35QatConfig,
 };
-use alice_train::qwen35_forward::{qwen35_model_forward_eval, qwen35_model_forward_eval_streaming};
+use alice_train::qwen35_backward::{qwen35_layer_backward, Qwen35WeightGrads};
+use alice_train::qwen35_forward::{qwen35_model_forward, qwen35_model_forward_eval, qwen35_model_forward_eval_streaming};
 use alice_train::{
     CheckpointData, DataLoader, DataLoaderConfig, FakeQuantize, LogEntry, LrScheduler,
     MmapDataset, QatConfig, TrainLog, WarmupCosineScheduler,
@@ -472,7 +473,7 @@ fn main() {
 
         // レイヤー重み読み込み (L10: preload/streaming 分岐)
         let num_layers = config.model.num_hidden_layers;
-        let layers: Vec<Qwen35LayerWeights> = if config.preload_all_layers {
+        let mut layers: Vec<Qwen35LayerWeights> = if config.preload_all_layers {
             println!("  レイヤー重み全プリロード中...");
             let mut layers = Vec::with_capacity(num_layers);
             for i in 0..num_layers {
@@ -559,52 +560,76 @@ fn main() {
             let mut total_loss = 0.0f32;
             let mut token_count = 0usize;
 
-            // 各バッチサンプルの勾配を蓄積して1ステップで更新
-            // output projection (lm_head) の勾配
-            let _d_lm_head = vec![0.0f32; hidden * vocab_size];
-            let _d_output_norm = vec![0.0f32; hidden];
-
             for b in 0..batch.actual_batch_size {
                 let token_ids: Vec<u32> = batch.input_ids
                     [b * seq_len..(b + 1) * seq_len]
                     .to_vec();
 
-                // Forward (L8+L10: eval専用 + ストリーミング/プリロード選択)
-                let logits = if config.preload_all_layers {
-                    qwen35_model_forward_eval(
+                if config.preload_all_layers {
+                    // ── Forward (cache付き) + Backward + Weight Update ──
+                    let (logits, caches) = qwen35_model_forward(
                         &token_ids, &embedding_table, &layers, &output_norm, &lm_head, &config.model,
-                    )
+                    );
+
+                    // Loss + d_logits
+                    let mut d_logits_all = vec![0.0f32; seq_len * vocab_size];
+                    for t in 0..seq_len {
+                        let target = batch.target_ids[b * seq_len + t] as usize % vocab_size;
+                        let tl = &logits[t * vocab_size..(t + 1) * vocab_size];
+                        let (loss, dl) = cross_entropy_loss(tl, target);
+                        total_loss += loss;
+                        token_count += 1;
+                        d_logits_all[t * vocab_size..(t + 1) * vocab_size].copy_from_slice(&dl);
+                    }
+
+                    // Backward through lm_head: d_hidden = d_logits × lm_head
+                    // lm_head: [vocab × hidden], d_logits: [seq × vocab] → d_hidden: [seq × hidden]
+                    let mut d_hidden = vec![0.0f32; seq_len * hidden];
+                    alice_train::blas::blas_matmul_nn(&d_logits_all, &lm_head, &mut d_hidden, seq_len, hidden, vocab_size);
+
+                    // Layer-by-layer backward (reverse order)
+                    let inv_tokens = 1.0 / token_count.max(1) as f32;
+                    let n_layers = caches.len();
+                    let mut all_grads: Vec<Qwen35WeightGrads> = Vec::with_capacity(n_layers);
+
+                    for i in (0..n_layers).rev() {
+                        let (d_input, grads) = qwen35_layer_backward(
+                            &d_hidden, &caches[i], &layers[i], &config.model, seq_len, lr, config.weight_decay,
+                        );
+                        all_grads.push(grads);
+                        d_hidden = d_input;
+                    }
+
+                    // Weight update (caches dropped by here)
+                    drop(caches);
+                    all_grads.reverse();
+
+                    for (i, grads) in all_grads.into_iter().enumerate() {
+                        match (grads, &mut layers[i]) {
+                            (Qwen35WeightGrads::DeltaNet(g), Qwen35LayerWeights::DeltaNet(w)) => {
+                                g.apply_sgd(w, lr * inv_tokens, config.weight_decay);
+                            }
+                            (Qwen35WeightGrads::FullAttention(g), Qwen35LayerWeights::FullAttention(w)) => {
+                                g.apply_sgd(w, lr * inv_tokens, config.weight_decay);
+                            }
+                            _ => {}
+                        }
+                    }
                 } else {
-                    qwen35_model_forward_eval_streaming(
+                    // ── Streaming eval (forward-only, no backward) ──
+                    let logits = qwen35_model_forward_eval_streaming(
                         &token_ids, &embedding_table, &get_tensor, &config.weight_prefix,
                         &output_norm, &lm_head, &config.model,
                         Some(&config.checkpoint_dir),
-                    )
-                };
-
-                // Per-token loss + d_logits 計算
-                let mut d_logits_all = vec![0.0f32; seq_len * vocab_size];
-                for t in 0..seq_len {
-                    let target = batch.target_ids[b * seq_len + t] as usize;
-                    if target >= vocab_size {
-                        continue;
+                    );
+                    for t in 0..seq_len {
+                        let target = batch.target_ids[b * seq_len + t] as usize % vocab_size;
+                        let tl = &logits[t * vocab_size..(t + 1) * vocab_size];
+                        let (loss, _) = cross_entropy_loss(tl, target);
+                        total_loss += loss;
+                        token_count += 1;
                     }
-                    let token_logits =
-                        &logits[t * vocab_size..(t + 1) * vocab_size];
-                    let (loss, d_logits) = cross_entropy_loss(token_logits, target);
-                    total_loss += loss;
-                    token_count += 1;
-                    d_logits_all[t * vocab_size..(t + 1) * vocab_size]
-                        .copy_from_slice(&d_logits);
                 }
-
-                // Backward through lm_head: d_hidden = d_logits × lm_head (not transposed)
-                // lm_head is [vocab_size × hidden], d_logits is [seq_len × vocab_size]
-                // d_hidden = d_logits × lm_head → [seq_len × hidden]
-                // d_lm_head += d_logits^T × hidden_states (but we don't save hidden_states here)
-                // For now: accumulate lm_head grad via outer product approximation
-                // This is forward-only loss for Phase 2 initial — full backward requires
-                // saving all intermediate hidden states, which is the next optimization step
             }
 
             let avg_loss = if token_count > 0 {
@@ -727,10 +752,7 @@ fn main() {
                         &config.model,
                     );
                     for t in 0..seq_len {
-                        let target = eval_batch.target_ids[t] as usize;
-                        if target >= vocab_size {
-                            continue;
-                        }
+                        let target = eval_batch.target_ids[t] as usize % vocab_size;
                         let tl = &eval_logits[t * vocab_size..(t + 1) * vocab_size];
                         let (l, _) = cross_entropy_loss(tl, target);
                         eval_loss += l;

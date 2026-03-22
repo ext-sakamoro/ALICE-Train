@@ -315,11 +315,9 @@ pub fn qwen35_model_forward(
 
     let mut hidden_states = vec![0.0f32; seq_len * hidden];
     for (t, &tok) in token_ids.iter().enumerate() {
-        let tok = tok as usize;
-        if tok < vocab_size {
-            hidden_states[t * hidden..(t + 1) * hidden]
-                .copy_from_slice(&embedding_table[tok * hidden..tok * hidden + hidden]);
-        }
+        let tok = (tok as usize) % vocab_size;
+        hidden_states[t * hidden..(t + 1) * hidden]
+            .copy_from_slice(&embedding_table[tok * hidden..(tok + 1) * hidden]);
     }
 
     let mut caches = Vec::with_capacity(layers.len());
