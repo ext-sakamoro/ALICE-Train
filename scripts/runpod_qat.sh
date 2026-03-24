@@ -49,9 +49,23 @@ echo "════════════════════════�
 
 mkdir -p logs
 
+# config 自動選択
+if [ -f configs/qat_qwen35_9b_a100_safe.json ]; then
+    CONFIG=configs/qat_qwen35_9b_a100_safe.json
+else
+    CONFIG=configs/qat_qwen35_9b_a100.json
+fi
+
+# symlink修正 (Qwen--Qwen3.5-9B → Qwen-3.5-9B)
+if [ -d models/Qwen-3.5-9B ] && [ ! -e models/Qwen--Qwen3.5-9B ]; then
+    ln -sfn Qwen-3.5-9B models/Qwen--Qwen3.5-9B
+fi
+
+echo "  Config: $CONFIG"
+
 # QAT実行 (フォアグラウンド)
 stdbuf -oL ./target/release/train-qat-qwen35 \
-    --config configs/qat_qwen35_9b_a100_safe.json \
+    --config "$CONFIG" \
     2>&1 | tee logs/qwen35_runpod.log
 
 EXIT_CODE=$?
