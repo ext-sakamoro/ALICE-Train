@@ -614,6 +614,7 @@ pub fn deltanet_layer_gc_fused(
     weight_grads: &mut DeltaNetWeightGrads,
 ) -> Vec<f32> {
     use crate::blas::blas_swiglu_ffn_training;
+    use crate::deltanet::causal_conv1d_silu_row_major;
 
     let hidden = config.hidden_size;
     let inter = config.intermediate_size;
@@ -629,12 +630,7 @@ pub fn deltanet_layer_gc_fused(
     // ═══ Phase 1: Pre-recurrence forward (projections, conv1d, gates) — GPU ═══
     let residual_attn = saved_input.to_vec();
     let mut normed = saved_input.to_vec();
-    {
-        use crate::blas::CUDA_MATMUL;
-        let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
-        let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
-        crate::cuda_matmul::cuda_dn_rmsnorm(&cuda, &mut normed, &weights.input_layernorm, hidden, config.rms_norm_eps);
-    }
+    blas_rmsnorm(&mut normed, &weights.input_layernorm, hidden, config.rms_norm_eps);
 
     let mut qkv = vec![0.0f32; seq_len * qkv_dim];
     blas_matmul_bt(&normed, &weights.in_proj_qkv, &mut qkv, seq_len, qkv_dim, hidden);
@@ -647,12 +643,7 @@ pub fn deltanet_layer_gc_fused(
 
     let pre_conv_qkv = qkv.clone();
     let mut qkv_conv = vec![0.0f32; seq_len * qkv_dim];
-    {
-        use crate::blas::CUDA_MATMUL;
-        let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
-        let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
-        crate::cuda_matmul::cuda_dn_conv1d_silu(&cuda, &qkv, &weights.conv1d_weight, &mut qkv_conv, qkv_dim, seq_len, kernel_size);
-    }
+    causal_conv1d_silu_row_major(&qkv, &weights.conv1d_weight, &mut qkv_conv, qkv_dim, seq_len, kernel_size);
 
     let mut q_raw = vec![0.0f32; seq_len * key_dim];
     let mut k_raw = vec![0.0f32; seq_len * key_dim];
@@ -875,13 +866,8 @@ pub fn deltanet_layer_gc_fused(
     }
 
     let mut d_qkv_pre_conv = vec![0.0f32; seq_len * qkv_dim];
-    {
-        use crate::blas::CUDA_MATMUL;
-        let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
-        let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
-        crate::cuda_matmul::cuda_dn_conv1d_bwd(&cuda, &d_qkv_conv, &pre_conv_qkv, &weights.conv1d_weight,
-            &mut d_qkv_pre_conv, &mut weight_grads.d_conv1d_weight, qkv_dim, seq_len, kernel_size);
-    }
+    causal_conv1d_backward(&d_qkv_conv, &pre_conv_qkv, &weights.conv1d_weight,
+        &mut d_qkv_pre_conv, &mut weight_grads.d_conv1d_weight, qkv_dim, seq_len, kernel_size);
 
     let mut d_normed = vec![0.0f32; seq_len * hidden];
     blas_matmul_nn(&d_qkv_pre_conv, &weights.in_proj_qkv, &mut d_normed, seq_len, hidden, qkv_dim);
