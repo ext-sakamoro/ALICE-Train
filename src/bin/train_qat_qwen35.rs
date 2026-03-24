@@ -597,6 +597,8 @@ fn main() {
         let mut batch_idx = 0usize;
         let seq_len = config.seq_len;
         let mut collapse_countdown: i32 = -1; // -1 = 正常, >0 = 崩壊猶予カウント
+        let mut last_ckpt_time = Instant::now();
+        let mut prev_ckpt_step: Option<usize> = None;
 
         while global_step < config.total_steps {
             let lr = scheduler.get_lr(global_step);
@@ -955,8 +957,9 @@ fn main() {
                 }
             }
 
-            // チェックポイント (最大3世代保持 — ストレージ溢れ防止)
-            if global_step > 0 && global_step % config.checkpoint_interval == 0 {
+            // チェックポイント (15分間隔、2世代保持)
+            const CKPT_INTERVAL_SECS: u64 = 15 * 60;
+            if global_step > 0 && last_ckpt_time.elapsed().as_secs() >= CKPT_INTERVAL_SECS {
                 // preloadモード: 更新済み重みをFP32キャッシュに書き戻し (resume用)
                 if config.preload_all_layers {
                     let cache_base = &config.checkpoint_dir;
@@ -992,20 +995,16 @@ fn main() {
                     eprintln!("  チェックポイント保存失敗: {e}");
                 }
 
-                // 古いチェックポイントの自動削除 (最大3世代保持)
-                const MAX_CKPT_KEEP: usize = 3;
-                let old_step = global_step as isize
-                    - (MAX_CKPT_KEEP as isize * config.checkpoint_interval as isize);
-                if old_step > 0 {
-                    let old_path = format!("{}/step_{old_step}.bin", config.checkpoint_dir);
+                // 2世代前を削除
+                if let Some(old_old) = prev_ckpt_step {
+                    let old_path = format!("{}/step_{old_old}.bin", config.checkpoint_dir);
                     if std::path::Path::new(&old_path).exists() {
-                        if let Err(e) = std::fs::remove_file(&old_path) {
-                            eprintln!("  古いチェックポイント削除失敗: {e}");
-                        } else {
-                            println!("    古いチェックポイント削除: {old_path}");
-                        }
+                        let _ = std::fs::remove_file(&old_path);
+                        println!("    古いチェックポイント削除: {old_path}");
                     }
                 }
+                prev_ckpt_step = Some(global_step);
+                last_ckpt_time = Instant::now();
             }
 
             global_step += 1;
