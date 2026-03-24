@@ -694,6 +694,54 @@ extern "C" __global__ void swiglu_elementwise_kernel(
         out[idx] = silu_g * up[idx];
     }
 }
+
+// Conv1d Backward: d_out → d_x, d_weight (SiLU grad 込み)
+// 1ブロック = 1チャネル、blockDim.x = seq_len
+extern "C" __global__ void conv1d_bwd_kernel(
+    const float* d_out,    // [seq_len, channels]
+    const float* x,        // [seq_len, channels] (pre-conv input)
+    const float* weight,   // [channels, kernel_size]
+    float* d_x,            // [seq_len, channels]
+    float* d_weight,       // [channels, kernel_size]
+    int channels,
+    int seq_len,
+    int kernel_size)
+{
+    int c = blockIdx.x;
+    if (c >= channels) return;
+    int t = threadIdx.x;
+    if (t >= seq_len) return;
+
+    const float* w = weight + c * kernel_size;
+
+    // Forward conv value for SiLU grad
+    float conv_val = 0.0f;
+    for (int k = 0; k < kernel_size; k++) {
+        int src_t = t - (kernel_size - 1) + k;
+        if (src_t >= 0) {
+            conv_val = __fmaf_rn(x[src_t * channels + c], w[k], conv_val);
+        }
+    }
+    float sig = 1.0f / (1.0f + expf(-conv_val));
+    float silu_grad = sig + conv_val * sig * (1.0f - sig);
+    float d_conv = d_out[t * channels + c] * silu_grad;
+
+    // d_x: scatter grad through conv weights
+    for (int k = 0; k < kernel_size; k++) {
+        int src_t = t - (kernel_size - 1) + k;
+        if (src_t >= 0) {
+            atomicAdd(&d_x[src_t * channels + c], d_conv * w[k]);
+        }
+    }
+
+    // d_weight: accumulate across time
+    for (int k = 0; k < kernel_size; k++) {
+        int src_t = t - (kernel_size - 1) + k;
+        if (src_t >= 0) {
+            atomicAdd(&d_weight[c * kernel_size + k], d_conv * x[src_t * channels + c]);
+        }
+    }
+}
 "#;
 
 /// GPU BF16→FP32 展開カーネル (NVRTC)。
@@ -884,6 +932,7 @@ pub struct CudaMatmul {
     dn_rmsnorm_func: CudaFunction,
     dn_gated_rmsnorm_func: CudaFunction,
     dn_conv1d_silu_func: CudaFunction,
+    dn_conv1d_bwd_func: CudaFunction,
     dn_gate_compute_func: CudaFunction,
     dn_l2norm_gqa_func: CudaFunction,
     dn_residual_add_func: CudaFunction,
@@ -1000,6 +1049,9 @@ impl CudaMatmul {
         let dn_conv1d_silu_func = mod_ops
             .load_function("conv1d_silu_kernel")
             .expect("conv1d_silu_kernel ロード失敗");
+        let dn_conv1d_bwd_func = mod_ops
+            .load_function("conv1d_bwd_kernel")
+            .expect("conv1d_bwd_kernel ロード失敗");
         let dn_gate_compute_func = mod_ops
             .load_function("gate_compute_kernel")
             .expect("gate_compute_kernel ロード失敗");
@@ -1054,6 +1106,7 @@ impl CudaMatmul {
             dn_rmsnorm_func,
             dn_gated_rmsnorm_func,
             dn_conv1d_silu_func,
+            dn_conv1d_bwd_func,
             dn_gate_compute_func,
             dn_l2norm_gqa_func,
             dn_residual_add_func,
@@ -4952,6 +5005,229 @@ pub fn cuda_deltanet_backward_from_vram(
     cuda.stream.memcpy_dtoh(&dv_gpu.slice(..total_v), &mut d_v[..total_v]).expect("dv D2H");
     cuda.stream.memcpy_dtoh(&dbeta_gpu.slice(..total_bg), &mut d_beta[..total_bg]).expect("dbeta D2H");
     cuda.stream.memcpy_dtoh(&dg_gpu.slice(..total_bg), &mut d_g[..total_bg]).expect("dg D2H");
+}
+
+/// GPU RMSNorm in-place: x[i] = x[i] / rms * weight[i]
+pub fn cuda_dn_rmsnorm(
+    cuda: &CudaMatmul,
+    x: &mut [f32],
+    weight: &[f32],
+    dim: usize,
+    eps: f32,
+) {
+    let seq_len = x.len() / dim;
+    let block = dim.next_power_of_two();
+
+    let mut x_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(x.len()).expect("rmsnorm x");
+    cuda.stream.memcpy_htod(x, &mut x_gpu).expect("rmsnorm x H2D");
+    let mut w_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(weight.len()).expect("rmsnorm w");
+    cuda.stream.memcpy_htod(weight, &mut w_gpu).expect("rmsnorm w H2D");
+
+    let cfg = LaunchConfig {
+        grid_dim: (seq_len as u32, 1, 1),
+        block_dim: (block as u32, 1, 1),
+        shared_mem_bytes: (block * 4) as u32,
+    };
+    let dim_i = dim as i32;
+    let mut builder = cuda.stream.launch_builder(&cuda.dn_rmsnorm_func);
+    builder.arg(&mut x_gpu); builder.arg(&w_gpu);
+    builder.arg(&dim_i); builder.arg(&eps);
+    unsafe { builder.launch(cfg).expect("rmsnorm launch"); }
+
+    cuda.stream.memcpy_dtoh(&x_gpu.slice(..x.len()), x).expect("rmsnorm D2H");
+}
+
+/// GPU Conv1d + SiLU forward
+pub fn cuda_dn_conv1d_silu(
+    cuda: &CudaMatmul,
+    x: &[f32],
+    weight: &[f32],
+    out: &mut [f32],
+    channels: usize,
+    seq_len: usize,
+    kernel_size: usize,
+) {
+    let mut x_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(x.len()).expect("conv1d x");
+    cuda.stream.memcpy_htod(x, &mut x_gpu).expect("conv1d x H2D");
+    let mut w_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(weight.len()).expect("conv1d w");
+    cuda.stream.memcpy_htod(weight, &mut w_gpu).expect("conv1d w H2D");
+    let mut out_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(out.len()).expect("conv1d out");
+
+    let block = channels.next_power_of_two().min(1024);
+    let cfg = LaunchConfig {
+        grid_dim: (seq_len as u32, 1, 1),
+        block_dim: (block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let ch = channels as i32;
+    let sl = seq_len as i32;
+    let ks = kernel_size as i32;
+    let mut builder = cuda.stream.launch_builder(&cuda.dn_conv1d_silu_func);
+    builder.arg(&x_gpu); builder.arg(&w_gpu); builder.arg(&mut out_gpu);
+    builder.arg(&ch); builder.arg(&sl); builder.arg(&ks);
+    unsafe { builder.launch(cfg).expect("conv1d_silu launch"); }
+
+    cuda.stream.memcpy_dtoh(&out_gpu.slice(..out.len()), out).expect("conv1d_silu D2H");
+}
+
+/// GPU Conv1d Backward (SiLU grad 込み)
+pub fn cuda_dn_conv1d_bwd(
+    cuda: &CudaMatmul,
+    d_out: &[f32],
+    x: &[f32],
+    weight: &[f32],
+    d_x: &mut [f32],
+    d_weight: &mut [f32],
+    channels: usize,
+    seq_len: usize,
+    kernel_size: usize,
+) {
+    let total = seq_len * channels;
+    let mut dout_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total).expect("conv1d_bwd dout");
+    cuda.stream.memcpy_htod(&d_out[..total], &mut dout_gpu).expect("conv1d_bwd dout H2D");
+    let mut x_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total).expect("conv1d_bwd x");
+    cuda.stream.memcpy_htod(&x[..total], &mut x_gpu).expect("conv1d_bwd x H2D");
+    let mut w_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(weight.len()).expect("conv1d_bwd w");
+    cuda.stream.memcpy_htod(weight, &mut w_gpu).expect("conv1d_bwd w H2D");
+    let mut dx_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total).expect("conv1d_bwd dx");
+    let mut dw_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(weight.len()).expect("conv1d_bwd dw");
+
+    let block = seq_len.next_power_of_two().min(1024);
+    let cfg = LaunchConfig {
+        grid_dim: (channels as u32, 1, 1),
+        block_dim: (block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let ch = channels as i32;
+    let sl = seq_len as i32;
+    let ks = kernel_size as i32;
+    let mut builder = cuda.stream.launch_builder(&cuda.dn_conv1d_bwd_func);
+    builder.arg(&dout_gpu); builder.arg(&x_gpu); builder.arg(&w_gpu);
+    builder.arg(&mut dx_gpu); builder.arg(&mut dw_gpu);
+    builder.arg(&ch); builder.arg(&sl); builder.arg(&ks);
+    unsafe { builder.launch(cfg).expect("conv1d_bwd launch"); }
+
+    cuda.stream.memcpy_dtoh(&dx_gpu.slice(..total), &mut d_x[..total]).expect("conv1d_bwd dx D2H");
+    cuda.stream.memcpy_dtoh(&dw_gpu.slice(..weight.len()), d_weight).expect("conv1d_bwd dw D2H");
+}
+
+/// GPU Gate Compute: sigmoid(b) → beta, -exp(a_log)*softplus(a+dt_bias) → g
+pub fn cuda_dn_gate_compute(
+    cuda: &CudaMatmul,
+    b_raw: &[f32],
+    a_raw: &[f32],
+    a_log: &[f32],
+    dt_bias: &[f32],
+    beta: &mut [f32],
+    g: &mut [f32],
+    seq_len: usize,
+    n_heads: usize,
+) {
+    let total = seq_len * n_heads;
+    let mut b_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total).expect("gate b");
+    cuda.stream.memcpy_htod(&b_raw[..total], &mut b_gpu).expect("gate b H2D");
+    let mut a_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total).expect("gate a");
+    cuda.stream.memcpy_htod(&a_raw[..total], &mut a_gpu).expect("gate a H2D");
+    let mut alog_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(n_heads).expect("gate alog");
+    cuda.stream.memcpy_htod(&a_log[..n_heads], &mut alog_gpu).expect("gate alog H2D");
+    let mut dtb_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(n_heads).expect("gate dtb");
+    cuda.stream.memcpy_htod(&dt_bias[..n_heads], &mut dtb_gpu).expect("gate dtb H2D");
+    let mut beta_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total).expect("gate beta");
+    let mut g_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total).expect("gate g");
+
+    let block = n_heads.next_power_of_two().min(1024);
+    let cfg = LaunchConfig {
+        grid_dim: (seq_len as u32, 1, 1),
+        block_dim: (block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nh = n_heads as i32;
+    let mut builder = cuda.stream.launch_builder(&cuda.dn_gate_compute_func);
+    builder.arg(&b_gpu); builder.arg(&a_gpu);
+    builder.arg(&alog_gpu); builder.arg(&dtb_gpu);
+    builder.arg(&mut beta_gpu); builder.arg(&mut g_gpu);
+    builder.arg(&nh);
+    unsafe { builder.launch(cfg).expect("gate_compute launch"); }
+
+    cuda.stream.memcpy_dtoh(&beta_gpu.slice(..total), &mut beta[..total]).expect("gate beta D2H");
+    cuda.stream.memcpy_dtoh(&g_gpu.slice(..total), &mut g[..total]).expect("gate g D2H");
+}
+
+/// GPU L2Norm + GQA Expand
+pub fn cuda_dn_l2norm_gqa(
+    cuda: &CudaMatmul,
+    q_in: &[f32],
+    k_in: &[f32],
+    q_out: &mut [f32],
+    k_out: &mut [f32],
+    seq_len: usize,
+    n_k_heads: usize,
+    n_v_heads: usize,
+    dk: usize,
+    eps: f32,
+) {
+    let in_total = seq_len * n_k_heads * dk;
+    let out_total = seq_len * n_v_heads * dk;
+    let mut qi_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(in_total).expect("l2norm qi");
+    cuda.stream.memcpy_htod(&q_in[..in_total], &mut qi_gpu).expect("l2norm qi H2D");
+    let mut ki_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(in_total).expect("l2norm ki");
+    cuda.stream.memcpy_htod(&k_in[..in_total], &mut ki_gpu).expect("l2norm ki H2D");
+    let mut qo_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(out_total).expect("l2norm qo");
+    let mut ko_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(out_total).expect("l2norm ko");
+
+    let block = dk.next_power_of_two().min(1024);
+    let num_blocks = seq_len * n_k_heads;
+    let cfg = LaunchConfig {
+        grid_dim: (num_blocks as u32, 1, 1),
+        block_dim: (block as u32, 1, 1),
+        shared_mem_bytes: (dk * 2 * 4) as u32,
+    };
+    let nkh = n_k_heads as i32;
+    let nvh = n_v_heads as i32;
+    let dki = dk as i32;
+    let mut builder = cuda.stream.launch_builder(&cuda.dn_l2norm_gqa_func);
+    builder.arg(&qi_gpu); builder.arg(&ki_gpu);
+    builder.arg(&mut qo_gpu); builder.arg(&mut ko_gpu);
+    builder.arg(&nkh); builder.arg(&nvh); builder.arg(&dki); builder.arg(&eps);
+    unsafe { builder.launch(cfg).expect("l2norm_gqa launch"); }
+
+    cuda.stream.memcpy_dtoh(&qo_gpu.slice(..out_total), &mut q_out[..out_total]).expect("l2norm qo D2H");
+    cuda.stream.memcpy_dtoh(&ko_gpu.slice(..out_total), &mut k_out[..out_total]).expect("l2norm ko D2H");
+}
+
+/// GPU Gated RMSNorm: out = RMSNorm(x) * SiLU(z)
+pub fn cuda_dn_gated_rmsnorm(
+    cuda: &CudaMatmul,
+    x: &[f32],
+    z: &[f32],
+    weight: &[f32],
+    out: &mut [f32],
+    dim: usize,
+    eps: f32,
+) {
+    let seq_len = x.len() / dim;
+    let block = dim.next_power_of_two().min(1024);
+
+    let mut x_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(x.len()).expect("gated_rmsnorm x");
+    cuda.stream.memcpy_htod(x, &mut x_gpu).expect("gated_rmsnorm x H2D");
+    let mut z_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(z.len()).expect("gated_rmsnorm z");
+    cuda.stream.memcpy_htod(z, &mut z_gpu).expect("gated_rmsnorm z H2D");
+    let mut w_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(weight.len()).expect("gated_rmsnorm w");
+    cuda.stream.memcpy_htod(weight, &mut w_gpu).expect("gated_rmsnorm w H2D");
+    let mut out_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(out.len()).expect("gated_rmsnorm out");
+
+    let cfg = LaunchConfig {
+        grid_dim: (seq_len as u32, 1, 1),
+        block_dim: (block as u32, 1, 1),
+        shared_mem_bytes: (block * 4) as u32,
+    };
+    let dim_i = dim as i32;
+    let mut builder = cuda.stream.launch_builder(&cuda.dn_gated_rmsnorm_func);
+    builder.arg(&x_gpu); builder.arg(&z_gpu); builder.arg(&w_gpu);
+    builder.arg(&mut out_gpu); builder.arg(&dim_i); builder.arg(&eps);
+    unsafe { builder.launch(cfg).expect("gated_rmsnorm launch"); }
+
+    cuda.stream.memcpy_dtoh(&out_gpu.slice(..out.len()), out).expect("gated_rmsnorm D2H");
 }
 
 /// GPU DeltaNet Fused Forward+Backward — 状態をVRAM内に保持、D2H転送ゼロ

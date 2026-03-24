@@ -614,9 +614,6 @@ pub fn deltanet_layer_gc_fused(
     weight_grads: &mut DeltaNetWeightGrads,
 ) -> Vec<f32> {
     use crate::blas::blas_swiglu_ffn_training;
-    use crate::deltanet::{
-        causal_conv1d_silu_row_major, compute_gates_fused, gated_rmsnorm, l2norm_and_gqa_expand,
-    };
 
     let hidden = config.hidden_size;
     let inter = config.intermediate_size;
@@ -629,10 +626,15 @@ pub fn deltanet_layer_gc_fused(
     let kernel_size = config.linear_conv_kernel_dim;
     let qkv_dim = key_dim * 2 + val_dim;
 
-    // ═══ Phase 1: Pre-recurrence forward (projections, conv1d, gates) ═══
+    // ═══ Phase 1: Pre-recurrence forward (projections, conv1d, gates) — GPU ═══
     let residual_attn = saved_input.to_vec();
     let mut normed = saved_input.to_vec();
-    blas_rmsnorm(&mut normed, &weights.input_layernorm, hidden, config.rms_norm_eps);
+    {
+        use crate::blas::CUDA_MATMUL;
+        let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
+        let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+        crate::cuda_matmul::cuda_dn_rmsnorm(&cuda, &mut normed, &weights.input_layernorm, hidden, config.rms_norm_eps);
+    }
 
     let mut qkv = vec![0.0f32; seq_len * qkv_dim];
     blas_matmul_bt(&normed, &weights.in_proj_qkv, &mut qkv, seq_len, qkv_dim, hidden);
@@ -645,7 +647,12 @@ pub fn deltanet_layer_gc_fused(
 
     let pre_conv_qkv = qkv.clone();
     let mut qkv_conv = vec![0.0f32; seq_len * qkv_dim];
-    causal_conv1d_silu_row_major(&qkv, &weights.conv1d_weight, &mut qkv_conv, qkv_dim, seq_len, kernel_size);
+    {
+        use crate::blas::CUDA_MATMUL;
+        let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
+        let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+        crate::cuda_matmul::cuda_dn_conv1d_silu(&cuda, &qkv, &weights.conv1d_weight, &mut qkv_conv, qkv_dim, seq_len, kernel_size);
+    }
 
     let mut q_raw = vec![0.0f32; seq_len * key_dim];
     let mut k_raw = vec![0.0f32; seq_len * key_dim];
@@ -659,11 +666,21 @@ pub fn deltanet_layer_gc_fused(
 
     let mut q_expanded = vec![0.0f32; seq_len * n_v_heads * dk];
     let mut k_expanded = vec![0.0f32; seq_len * n_v_heads * dk];
-    l2norm_and_gqa_expand(&q_raw, &k_raw, &mut q_expanded, &mut k_expanded, seq_len, n_k_heads, n_v_heads, dk, 1e-6);
+    {
+        use crate::blas::CUDA_MATMUL;
+        let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
+        let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+        crate::cuda_matmul::cuda_dn_l2norm_gqa(&cuda, &q_raw, &k_raw, &mut q_expanded, &mut k_expanded, seq_len, n_k_heads, n_v_heads, dk, 1e-6);
+    }
 
     let mut beta = vec![0.0f32; seq_len * n_v_heads];
     let mut g = vec![0.0f32; seq_len * n_v_heads];
-    compute_gates_fused(&b_raw, &a_raw, &weights.a_log, &weights.dt_bias, &mut beta, &mut g, seq_len, n_v_heads);
+    {
+        use crate::blas::CUDA_MATMUL;
+        let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
+        let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+        crate::cuda_matmul::cuda_dn_gate_compute(&cuda, &b_raw, &a_raw, &weights.a_log, &weights.dt_bias, &mut beta, &mut g, seq_len, n_v_heads);
+    }
 
     // ═══ Phase 2: GPU Forward (VRAM state保持) ═══
     let total_qk = n_v_heads * seq_len * dk;
@@ -717,7 +734,12 @@ pub fn deltanet_layer_gc_fused(
     // ═══ Phase 3: Post-recurrence forward (gated rmsnorm, out_proj, FFN) ═══
     let attn_out_pre_norm = attn_out_raw.clone();
     let mut attn_normed = vec![0.0f32; seq_len * val_dim];
-    gated_rmsnorm(&attn_out_raw, &z, &weights.norm_weight, &mut attn_normed, dv, config.rms_norm_eps);
+    {
+        use crate::blas::CUDA_MATMUL;
+        let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
+        let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+        crate::cuda_matmul::cuda_dn_gated_rmsnorm(&cuda, &attn_out_raw, &z, &weights.norm_weight, &mut attn_normed, dv, config.rms_norm_eps);
+    }
 
     let mut attn_out = vec![0.0f32; seq_len * hidden];
     blas_matmul_bt(&attn_normed, &weights.out_proj, &mut attn_out, seq_len, hidden, val_dim);
@@ -853,8 +875,13 @@ pub fn deltanet_layer_gc_fused(
     }
 
     let mut d_qkv_pre_conv = vec![0.0f32; seq_len * qkv_dim];
-    causal_conv1d_backward(&d_qkv_conv, &pre_conv_qkv, &weights.conv1d_weight,
-        &mut d_qkv_pre_conv, &mut weight_grads.d_conv1d_weight, qkv_dim, seq_len, kernel_size);
+    {
+        use crate::blas::CUDA_MATMUL;
+        let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
+        let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+        crate::cuda_matmul::cuda_dn_conv1d_bwd(&cuda, &d_qkv_conv, &pre_conv_qkv, &weights.conv1d_weight,
+            &mut d_qkv_pre_conv, &mut weight_grads.d_conv1d_weight, qkv_dim, seq_len, kernel_size);
+    }
 
     let mut d_normed = vec![0.0f32; seq_len * hidden];
     blas_matmul_nn(&d_qkv_pre_conv, &weights.in_proj_qkv, &mut d_normed, seq_len, hidden, qkv_dim);
