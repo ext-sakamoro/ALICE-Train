@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use alice_train::qwen35::{LayerType, Qwen35LayerWeights, Qwen35QatConfig};
 use alice_train::qwen35_backward::{qwen35_layer_backward, Qwen35WeightGrads};
-use alice_train::qwen35_forward::{qwen35_model_forward, qwen35_model_forward_eval};
+use alice_train::qwen35_forward::qwen35_model_forward_eval;
 use alice_train::{
     CheckpointData, DataLoader, DataLoaderConfig, FakeQuantize, LogEntry, LrScheduler, MmapDataset,
     QatConfig, TrainLog, WarmupCosineScheduler,
@@ -616,17 +616,38 @@ fn main() {
                 let token_ids: Vec<u32> = batch.input_ids[b * seq_len..(b + 1) * seq_len].to_vec();
 
                 if config.preload_all_layers {
-                    // ── Forward (cache付き) + Backward + Weight Update ──
-                    let (logits, caches) = qwen35_model_forward(
-                        &token_ids,
-                        &embedding_table,
-                        &layers,
-                        &output_norm,
-                        &lm_head,
-                        &config.model,
-                    );
+                    // ── Preloaded Gradient Checkpointing ──
+                    // 重みはRAM常駐、活性化は1層分のみ保持 → OOM回避
+                    // Forward: eval mode (cache なし) → 各層入力を保存
+                    // Backward: 逆順で forward 再計算 (cache生成) → backward → weight update
+                    use alice_train::qwen35_forward::qwen35_layer_forward;
 
-                    // Loss + d_logits
+                    let num_l = config.model.num_hidden_layers;
+
+                    // 1. Embedding
+                    let mut hidden_states = vec![0.0f32; seq_len * hidden];
+                    for (t, &tok) in token_ids.iter().enumerate() {
+                        let tok = (tok as usize) % vocab_size;
+                        hidden_states[t * hidden..(t + 1) * hidden]
+                            .copy_from_slice(&embedding_table[tok * hidden..(tok + 1) * hidden]);
+                    }
+
+                    // 2. Eval forward: 各層入力を保存、activation cache は保存しない
+                    let mut saved_inputs: Vec<Vec<f32>> = Vec::with_capacity(num_l);
+                    for i in 0..num_l {
+                        saved_inputs.push(hidden_states.clone());
+                        alice_train::qwen35_forward::qwen35_layer_forward_eval_inplace(
+                            &mut hidden_states, &layers[i], &config.model, seq_len,
+                        );
+                    }
+
+                    // 3. Output norm + lm_head → logits
+                    alice_train::blas::blas_rmsnorm(&mut hidden_states, &output_norm, hidden, config.model.rms_norm_eps);
+                    let mut logits = vec![0.0f32; seq_len * vocab_size];
+                    alice_train::blas::blas_matmul_bt(&hidden_states, &lm_head, &mut logits, seq_len, vocab_size, hidden);
+                    drop(hidden_states);
+
+                    // 4. Loss + d_logits
                     let mut d_logits_all = vec![0.0f32; seq_len * vocab_size];
                     for t in 0..seq_len {
                         let target = batch.target_ids[b * seq_len + t] as usize % vocab_size;
@@ -636,51 +657,39 @@ fn main() {
                         token_count += 1;
                         d_logits_all[t * vocab_size..(t + 1) * vocab_size].copy_from_slice(&dl);
                     }
+                    drop(logits);
 
-                    // Backward through lm_head: d_hidden = d_logits × lm_head
-                    // lm_head: [vocab × hidden], d_logits: [seq × vocab] → d_hidden: [seq × hidden]
+                    // 5. Backward through lm_head
                     let mut d_hidden = vec![0.0f32; seq_len * hidden];
                     alice_train::blas::blas_matmul_nn(
-                        &d_logits_all,
-                        &lm_head,
-                        &mut d_hidden,
-                        seq_len,
-                        hidden,
-                        vocab_size,
+                        &d_logits_all, &lm_head, &mut d_hidden, seq_len, hidden, vocab_size,
                     );
+                    drop(d_logits_all);
 
-                    // Layer-by-layer backward (reverse order)
+                    // 6. Gradient checkpointing backward:
+                    // 逆順で saved_input → forward 再計算 (cache生成) → backward → weight update
+                    // 活性化メモリ: 1層分のみ (全層分の27GB → ~150MB)
                     let inv_tokens = 1.0 / token_count.max(1) as f32;
-                    let n_layers = caches.len();
-                    let mut all_grads: Vec<Qwen35WeightGrads> = Vec::with_capacity(n_layers);
-
-                    for i in (0..n_layers).rev() {
-                        let (d_input, grads) = qwen35_layer_backward(
-                            &d_hidden,
-                            &caches[i],
-                            &layers[i],
-                            &config.model,
-                            seq_len,
-                            lr,
-                            config.weight_decay,
+                    for i in (0..num_l).rev() {
+                        // Forward 再計算 (RAM上のpreloaded weightsを直接参照)
+                        let mut recompute_input = saved_inputs.pop().unwrap();
+                        let cache = qwen35_layer_forward(
+                            &mut recompute_input, &layers[i], &config.model, seq_len,
                         );
-                        all_grads.push(grads);
+
+                        // Backward
+                        let (d_input, grads) = qwen35_layer_backward(
+                            &d_hidden, &cache, &layers[i], &config.model, seq_len, lr, config.weight_decay,
+                        );
                         d_hidden = d_input;
-                    }
+                        drop(cache); // activation cache 即解放
 
-                    // Weight update (caches dropped by here)
-                    drop(caches);
-                    all_grads.reverse();
-
-                    for (i, grads) in all_grads.into_iter().enumerate() {
+                        // Weight update (preloaded weightsを直接更新)
                         match (grads, &mut layers[i]) {
                             (Qwen35WeightGrads::DeltaNet(g), Qwen35LayerWeights::DeltaNet(w)) => {
                                 g.apply_sgd(w, lr * inv_tokens, config.weight_decay);
                             }
-                            (
-                                Qwen35WeightGrads::FullAttention(g),
-                                Qwen35LayerWeights::FullAttention(w),
-                            ) => {
+                            (Qwen35WeightGrads::FullAttention(g), Qwen35LayerWeights::FullAttention(w)) => {
                                 g.apply_sgd(w, lr * inv_tokens, config.weight_decay);
                             }
                             _ => {}
