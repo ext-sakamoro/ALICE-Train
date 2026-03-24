@@ -16,6 +16,9 @@ export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 cd /workspace/alice-train || { echo "alice-train not found"; exit 1; }
 
 RUNPOD_API_KEY="${RUNPOD_API_KEY:-}"
+if [ -z "$RUNPOD_API_KEY" ]; then
+    echo "RUNPOD_API_KEY 未設定 — Pod自動停止無効"
+fi
 RUNPOD_POD_ID="${RUNPOD_POD_ID:-}"
 
 # Pod ID 自動検出
