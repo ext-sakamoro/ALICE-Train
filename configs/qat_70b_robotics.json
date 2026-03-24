@@ -1,0 +1,31 @@
+{
+  "model": {
+    "vocab_size": 128256,
+    "hidden_dim": 8192,
+    "intermediate_dim": 28672,
+    "num_heads": 64,
+    "num_kv_heads": 8,
+    "num_layers": 80,
+    "max_seq_len": 8192,
+    "head_dim": 128,
+    "rope_theta": 500000.0,
+    "norm_eps": 1e-5
+  },
+  "learning_rate": 1e-4,
+  "min_lr": 1e-6,
+  "warmup_steps": 200,
+  "total_steps": 8000,
+  "gradient_accumulation_steps": 8,
+  "eval_interval": 100,
+  "checkpoint_interval": 500,
+  "checkpoint_dir": "checkpoints/robotics",
+  "train_data_path": "data/robotics/train.bin",
+  "eval_data_path": "data/robotics/eval.bin",
+  "model_path": "models/meta-llama--Llama-3-70B-Instruct",
+  "batch_size": 1,
+  "seq_len": 1024,
+  "weight_decay": 0.01,
+  "max_grad_norm": 1.0,
+  "use_bf16": true,
+  "resume_from": null
+}

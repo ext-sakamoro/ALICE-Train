@@ -1,0 +1,77 @@
+[package]
+name = "alice-train"
+version = "0.2.0"
+edition = "2021"
+authors = ["Moroya Sakamoto"]
+description = "Backpropagation & Training Framework for ALICE-ML ternary networks"
+license = "AGPL-3.0"
+repository = "https://github.com/ext-sakamoro/ALICE-Train"
+keywords = ["machine-learning", "training", "backpropagation", "bitnet"]
+categories = ["science"]
+publish = false
+
+[features]
+default = []
+gpu = ["wgpu", "pollster", "bytemuck"]
+cuda = ["cudarc"]
+qat-cli = ["safetensors", "clap"]
+qat-gpu = ["gpu", "qat-cli"]
+qat-cuda = ["cuda", "qat-cli"]
+
+[[bin]]
+name = "train-qat-70b"
+path = "src/bin/train_qat_70b.rs"
+required-features = ["qat-cuda"]
+
+[[bin]]
+name = "train-qat-qwen35"
+path = "src/bin/train_qat_qwen35.rs"
+required-features = ["qat-cli"]
+
+[[bin]]
+name = "train-debug"
+path = "src/bin/train_debug.rs"
+required-features = ["qat-cli"]
+
+[[bin]]
+name = "prepare-data"
+path = "src/bin/prepare_data.rs"
+required-features = ["qat-cli"]
+
+[dependencies]
+alice-ml = { path = "../ALICE-ML", default-features = true }
+memmap2 = "0.9"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# GPU backward (optional)
+wgpu = { version = "24", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+
+# CUDA (optional)
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "cublas", "nvrtc", "dynamic-loading", "cuda-12000"], optional = true }
+
+# madvise for mmap page cache control
+libc = "0.2"
+
+# Parallelization
+rayon = "1.10"
+
+# High-performance allocator (CPU並列のmalloc競合を解消)
+mimalloc = "0.1"
+
+# QAT CLI (optional)
+safetensors = { version = "0.4", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

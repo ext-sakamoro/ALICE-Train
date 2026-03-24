@@ -1,0 +1,9 @@
+/target
+CLAUDE.md
+.claude/
+.DS_Store
+models/
+data/
+checkpoints/
+logs/
+__pycache__/
