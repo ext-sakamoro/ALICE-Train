@@ -102,6 +102,84 @@ extern "C" __global__ void deltanet_recurrence(
 }
 "#;
 
+/// GPU DeltaNet 訓練用カーネル — 全timestepのS_{t-1}とe_tを保存
+const DELTANET_RECURRENCE_TRAIN_CU: &str = r#"
+extern "C" __global__ void deltanet_recurrence_train(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ beta,
+    const float* __restrict__ g,
+    float* __restrict__ output,
+    float* __restrict__ state_buf,
+    float* __restrict__ all_s_prev,
+    float* __restrict__ all_e,
+    int seq_len, int dk, int dv)
+{
+    int head = blockIdx.x;
+    int j = threadIdx.x;
+
+    float* S = state_buf + head * dk * dv;
+    extern __shared__ float smem[];
+    float* k_buf = smem;
+    float* q_buf = smem + dk;
+
+    for (int i = 0; i < dk; i++) {
+        S[i * dv + j] = 0.0f;
+    }
+    __syncthreads();
+
+    int off_qk = head * seq_len * dk;
+    int off_v  = head * seq_len * dv;
+    int off_bg = head * seq_len;
+    int off_o  = head * seq_len * dv;
+    long long off_st = (long long)head * seq_len * dk * dv;
+    int off_e  = head * seq_len * dv;
+
+    for (int t = 0; t < seq_len; t++) {
+        if (j < dk) {
+            k_buf[j] = k[off_qk + t * dk + j];
+            q_buf[j] = q[off_qk + t * dk + j];
+        }
+        __syncthreads();
+
+        float beta_t = beta[off_bg + t];
+        float exp_g_t = expf(g[off_bg + t]);
+        float v_j = v[off_v + t * dv + j];
+
+        // Store S_{t-1}
+        for (int i = 0; i < dk; i++) {
+            all_s_prev[off_st + (long long)t * dk * dv + i * dv + j] = S[i * dv + j];
+        }
+
+        // r[j] = sum_i S[i][j] * k[i]
+        float r_j = 0.0f;
+        for (int i = 0; i < dk; i++) {
+            r_j = __fmaf_rn(S[i * dv + j], k_buf[i], r_j);
+        }
+
+        // e[j] = v[j] - r[j]
+        float e_j = v_j - r_j;
+        all_e[off_e + t * dv + j] = e_j;
+
+        // State update
+        float be = beta_t * e_j;
+        for (int i = 0; i < dk; i++) {
+            S[i * dv + j] = __fmaf_rn(exp_g_t, S[i * dv + j], k_buf[i] * be);
+        }
+        __syncthreads();
+
+        // Output
+        float o_j = 0.0f;
+        for (int i = 0; i < dk; i++) {
+            o_j = __fmaf_rn(S[i * dv + j], q_buf[i], o_j);
+        }
+        output[off_o + t * dv + j] = o_j;
+        __syncthreads();
+    }
+}
+"#;
+
 /// GPU DeltaNet 補助カーネル群 (NVRTC)。
 /// RMSNorm, Conv1d+SiLU, L2Norm+GQA, Gate計算, Gated RMSNorm, Residual Add。
 /// 1回のNVRTCコンパイルで全カーネルを生成。
@@ -483,6 +561,7 @@ pub struct CudaMatmul {
     sum_abs_func: CudaFunction,
     fused_adamw_func: CudaFunction,
     deltanet_func: CudaFunction,
+    deltanet_train_func: CudaFunction,
     // DeltaNet 補助カーネル群
     dn_rmsnorm_func: CudaFunction,
     dn_gated_rmsnorm_func: CudaFunction,
@@ -564,6 +643,15 @@ impl CudaMatmul {
             .load_function("deltanet_recurrence")
             .expect("deltanet_recurrence ロード失敗");
 
+        let ptx_dn_train = compile_ptx(DELTANET_RECURRENCE_TRAIN_CU)
+            .expect("NVRTC: deltanet_recurrence_train コンパイル失敗");
+        let mod_dn_train = ctx
+            .load_module(ptx_dn_train)
+            .expect("deltanet_recurrence_train module ロード失敗");
+        let deltanet_train_func = mod_dn_train
+            .load_function("deltanet_recurrence_train")
+            .expect("deltanet_recurrence_train ロード失敗");
+
         let ptx_ops = compile_ptx(DELTANET_OPS_CU).expect("NVRTC: deltanet_ops コンパイル失敗");
         let mod_ops = ctx
             .load_module(ptx_ops)
@@ -625,6 +713,7 @@ impl CudaMatmul {
             sum_abs_func,
             fused_adamw_func,
             deltanet_func,
+            deltanet_train_func,
             dn_rmsnorm_func,
             dn_gated_rmsnorm_func,
             dn_conv1d_silu_func,
@@ -4292,4 +4381,107 @@ pub fn cuda_deltanet_recurrence(
             .memcpy_dtoh(&bs.buf.slice(..total_v), &mut output[..total_v])
             .expect("output D2H 失敗");
     }
+}
+
+/// GPU DeltaNet forward (訓練用) — 全timestepの S_{t-1} と e を保存して返す
+pub fn cuda_deltanet_recurrence_train(
+    cuda: &CudaMatmul,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    beta: &[f32],
+    g: &[f32],
+    output: &mut [f32],
+    all_s_prev: &mut [f32],
+    all_e: &mut [f32],
+    num_heads: usize,
+    seq_len: usize,
+    dk: usize,
+    dv: usize,
+) {
+    let total_qk = num_heads * seq_len * dk;
+    let total_v = num_heads * seq_len * dv;
+    let total_bg = num_heads * seq_len;
+    let total_states = num_heads * seq_len * dk * dv;
+    let total_e = num_heads * seq_len * dv;
+
+    // H2D: q, k, v, beta, g
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_a, total_qk);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_b, total_qk);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_c, total_v);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_d, total_bg);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_e, total_bg);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_scores, total_v);
+
+    {
+        let mut ba = cuda.buf_a.borrow_mut();
+        cuda.stream.memcpy_htod(&q[..total_qk], &mut ba.buf.slice_mut(..total_qk)).expect("q H2D");
+    }
+    {
+        let mut bb = cuda.buf_b.borrow_mut();
+        cuda.stream.memcpy_htod(&k[..total_qk], &mut bb.buf.slice_mut(..total_qk)).expect("k H2D");
+    }
+    {
+        let mut bc = cuda.buf_c.borrow_mut();
+        cuda.stream.memcpy_htod(&v[..total_v], &mut bc.buf.slice_mut(..total_v)).expect("v H2D");
+    }
+    {
+        let mut bd = cuda.buf_d.borrow_mut();
+        cuda.stream.memcpy_htod(&beta[..total_bg], &mut bd.buf.slice_mut(..total_bg)).expect("beta H2D");
+    }
+    {
+        let mut be_buf = cuda.buf_e.borrow_mut();
+        cuda.stream.memcpy_htod(&g[..total_bg], &mut be_buf.buf.slice_mut(..total_bg)).expect("g H2D");
+    }
+
+    // GPU バッファ: state, all_s_prev, all_e
+    let state_size = num_heads * dk * dv;
+    let mut state_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(state_size).expect("state_buf 確保失敗");
+    let mut all_s_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_states).expect("all_s_prev 確保失敗");
+    let mut all_e_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_e).expect("all_e 確保失敗");
+
+    let shared_bytes = dk * 2 * 4;
+    let cfg = LaunchConfig {
+        grid_dim: (num_heads as u32, 1, 1),
+        block_dim: (dv as u32, 1, 1),
+        shared_mem_bytes: shared_bytes as u32,
+    };
+
+    {
+        let ba = cuda.buf_a.borrow();
+        let bb = cuda.buf_b.borrow();
+        let bc = cuda.buf_c.borrow();
+        let bd = cuda.buf_d.borrow();
+        let be_buf = cuda.buf_e.borrow();
+        let mut bs = cuda.buf_scores.borrow_mut();
+
+        let mut builder = cuda.stream.launch_builder(&cuda.deltanet_train_func);
+        builder.arg(&ba.buf);
+        builder.arg(&bb.buf);
+        builder.arg(&bc.buf);
+        builder.arg(&bd.buf);
+        builder.arg(&be_buf.buf);
+        builder.arg(&mut bs.buf);
+        builder.arg(&mut state_gpu);
+        builder.arg(&mut all_s_gpu);
+        builder.arg(&mut all_e_gpu);
+        let seq_len_i32 = seq_len as i32;
+        let dk_i32 = dk as i32;
+        let dv_i32 = dv as i32;
+        builder.arg(&seq_len_i32);
+        builder.arg(&dk_i32);
+        builder.arg(&dv_i32);
+
+        unsafe {
+            builder.launch(cfg).expect("deltanet_recurrence_train カーネル起動失敗");
+        }
+    }
+
+    // D2H: output, all_s_prev, all_e
+    {
+        let bs = cuda.buf_scores.borrow();
+        cuda.stream.memcpy_dtoh(&bs.buf.slice(..total_v), &mut output[..total_v]).expect("output D2H");
+    }
+    cuda.stream.memcpy_dtoh(&all_s_gpu.slice(..total_states), &mut all_s_prev[..total_states]).expect("all_s_prev D2H");
+    cuda.stream.memcpy_dtoh(&all_e_gpu.slice(..total_e), &mut all_e[..total_e]).expect("all_e D2H");
 }

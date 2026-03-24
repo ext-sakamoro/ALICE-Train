@@ -710,6 +710,120 @@ pub fn deltanet_recurrence_forward_eval_cuda(
     }
 }
 
+/// GPU DeltaNet 訓練 forward — S_{t-1} と e をGPU上で計算し DeltaNetStepCache を構築
+#[cfg(feature = "cuda")]
+pub fn deltanet_recurrence_forward_train_cuda(
+    q_all: &[f32],
+    k_all: &[f32],
+    v_all: &[f32],
+    beta_all: &[f32],
+    g_all: &[f32],
+    a_logit_all: &[f32],
+    b_logit_all: &[f32],
+    output: &mut [f32],
+    num_heads: usize,
+    dk: usize,
+    dv: usize,
+    seq_len: usize,
+) -> (Vec<Vec<DeltaNetStepCache>>, Vec<Vec<f32>>) {
+    let total_qk = num_heads * seq_len * dk;
+    let total_v = num_heads * seq_len * dv;
+    let total_bg = num_heads * seq_len;
+    let total_states = num_heads * seq_len * dk * dv;
+    let total_e = num_heads * seq_len * dv;
+
+    // レイアウト変換: [seq, heads, dim] → [heads, seq, dim]
+    let mut q_gpu = vec![0.0f32; total_qk];
+    let mut k_gpu = vec![0.0f32; total_qk];
+    let mut v_gpu = vec![0.0f32; total_v];
+    let mut beta_gpu = vec![0.0f32; total_bg];
+    let mut g_gpu = vec![0.0f32; total_bg];
+
+    for t in 0..seq_len {
+        for h in 0..num_heads {
+            let src_qk = t * num_heads * dk + h * dk;
+            let dst_qk = h * seq_len * dk + t * dk;
+            q_gpu[dst_qk..dst_qk + dk].copy_from_slice(&q_all[src_qk..src_qk + dk]);
+            k_gpu[dst_qk..dst_qk + dk].copy_from_slice(&k_all[src_qk..src_qk + dk]);
+
+            let src_v = t * num_heads * dv + h * dv;
+            let dst_v = h * seq_len * dv + t * dv;
+            v_gpu[dst_v..dst_v + dv].copy_from_slice(&v_all[src_v..src_v + dv]);
+
+            beta_gpu[h * seq_len + t] = beta_all[t * num_heads + h];
+            g_gpu[h * seq_len + t] = g_all[t * num_heads + h];
+        }
+    }
+
+    // GPU forward + state storage
+    let mut out_gpu = vec![0.0f32; total_v];
+    let mut all_s_prev = vec![0.0f32; total_states];
+    let mut all_e_flat = vec![0.0f32; total_e];
+
+    {
+        use crate::blas::CUDA_MATMUL;
+        let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
+        let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+        crate::cuda_matmul::cuda_deltanet_recurrence_train(
+            &cuda, &q_gpu, &k_gpu, &v_gpu, &beta_gpu, &g_gpu,
+            &mut out_gpu, &mut all_s_prev, &mut all_e_flat,
+            num_heads, seq_len, dk, dv,
+        );
+    }
+
+    // レイアウト逆変換: [heads, seq, dv] → [seq, heads, dv]
+    for t in 0..seq_len {
+        for h in 0..num_heads {
+            let src = h * seq_len * dv + t * dv;
+            let dst = t * num_heads * dv + h * dv;
+            output[dst..dst + dv].copy_from_slice(&out_gpu[src..src + dv]);
+        }
+    }
+
+    // DeltaNetStepCache 構築
+    let mut per_head_caches: Vec<Vec<DeltaNetStepCache>> = Vec::with_capacity(num_heads);
+    let mut final_states: Vec<Vec<f32>> = Vec::with_capacity(num_heads);
+
+    for h in 0..num_heads {
+        let mut step_caches = Vec::with_capacity(seq_len);
+        for t in 0..seq_len {
+            let s_off = h * seq_len * dk * dv + t * dk * dv;
+            let s_prev = all_s_prev[s_off..s_off + dk * dv].to_vec();
+            let q_t: Vec<f32> = q_gpu[h * seq_len * dk + t * dk..h * seq_len * dk + (t + 1) * dk].to_vec();
+            let k_t: Vec<f32> = k_gpu[h * seq_len * dk + t * dk..h * seq_len * dk + (t + 1) * dk].to_vec();
+            let v_t: Vec<f32> = v_gpu[h * seq_len * dv + t * dv..h * seq_len * dv + (t + 1) * dv].to_vec();
+            let e_t: Vec<f32> = all_e_flat[h * seq_len * dv + t * dv..h * seq_len * dv + (t + 1) * dv].to_vec();
+            let beta_t = beta_gpu[h * seq_len + t];
+            let g_t = g_gpu[h * seq_len + t];
+
+            step_caches.push(DeltaNetStepCache {
+                s_prev,
+                q: q_t,
+                k: k_t,
+                v: v_t,
+                e: e_t,
+                beta: beta_t,
+                g: g_t,
+                exp_g: g_t.exp(),
+                a_logit: a_logit_all[t * num_heads + h],
+                b_logit: b_logit_all[t * num_heads + h],
+            });
+        }
+        // Final state
+        let last = &step_caches[seq_len - 1];
+        let mut fs = vec![0.0f32; dk * dv];
+        for i in 0..dk {
+            for j in 0..dv {
+                fs[i * dv + j] = last.exp_g * last.s_prev[i * dv + j] + last.beta * last.k[i] * last.e[j];
+            }
+        }
+        final_states.push(fs);
+        per_head_caches.push(step_caches);
+    }
+
+    (per_head_caches, final_states)
+}
+
 // ── DeltaNet Backward (L1: ヘッド並列) ─────────────────────────────────────
 
 /// DeltaNet 再帰の backward 勾配。
