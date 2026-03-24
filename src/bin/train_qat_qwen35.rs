@@ -957,6 +957,19 @@ fn main() {
 
             // チェックポイント (最大3世代保持 — ストレージ溢れ防止)
             if global_step > 0 && global_step % config.checkpoint_interval == 0 {
+                // preloadモード: 更新済み重みをFP32キャッシュに書き戻し (resume用)
+                if config.preload_all_layers {
+                    let cache_base = &config.checkpoint_dir;
+                    for li in 0..config.model.num_hidden_layers {
+                        if let Err(e) = alice_train::fp32_cache::save_layer_to_cache(
+                            cache_base, li, &layers[li], &config.model,
+                        ) {
+                            eprintln!("  レイヤー{li} キャッシュ書き戻し失敗: {e}");
+                        }
+                    }
+                    println!("    FP32キャッシュ書き戻し完了 ({} layers)", config.model.num_hidden_layers);
+                }
+
                 let ckpt_path = format!("{}/step_{global_step}.bin", config.checkpoint_dir);
                 println!("  チェックポイント保存: {ckpt_path}");
                 let meta = alice_train::CheckpointMeta {
