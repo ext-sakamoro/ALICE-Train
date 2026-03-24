@@ -667,32 +667,62 @@ fn main() {
                     drop(d_logits_all);
 
                     // 6. Gradient checkpointing backward:
-                    // 逆順で saved_input → forward 再計算 (cache生成) → backward → weight update
-                    // 活性化メモリ: 1層分のみ (全層分の27GB → ~150MB)
+                    // DeltaNet層: GPU fused (VRAM state保持、step_caches不要)
+                    // FullAttention層: 従来のforward再計算+backward
                     let inv_tokens = 1.0 / token_count.max(1) as f32;
                     for i in (0..num_l).rev() {
-                        // Forward 再計算 (RAM上のpreloaded weightsを直接参照)
-                        let mut recompute_input = saved_inputs.pop().unwrap();
-                        let cache = qwen35_layer_forward(
-                            &mut recompute_input, &layers[i], &config.model, seq_len,
-                        );
+                        let saved_input = saved_inputs.pop().unwrap();
 
-                        // Backward
-                        let (d_input, grads) = qwen35_layer_backward(
-                            &d_hidden, &cache, &layers[i], &config.model, seq_len, lr, config.weight_decay,
-                        );
+                        #[cfg(feature = "cuda")]
+                        let use_fused = alice_train::blas::cuda_blas_available()
+                            && matches!(layers[i], Qwen35LayerWeights::DeltaNet(_));
+
+                        #[cfg(not(feature = "cuda"))]
+                        let use_fused = false;
+
+                        let (d_input, grads) = if use_fused {
+                            #[cfg(feature = "cuda")]
+                            {
+                                match &mut layers[i] {
+                                    Qwen35LayerWeights::DeltaNet(w) => {
+                                        let mut wg = alice_train::qwen35_backward::DeltaNetWeightGrads::zeros(&config.model);
+                                        let d_in = alice_train::qwen35_backward::deltanet_layer_gc_fused(
+                                            &saved_input, &d_hidden, w, &config.model, seq_len, &mut wg,
+                                        );
+                                        wg.apply_sgd(w, lr * inv_tokens, config.weight_decay);
+                                        (d_in, None)
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            }
+                            #[cfg(not(feature = "cuda"))]
+                            { unreachable!() }
+                        } else {
+                            // FullAttention or CPU fallback
+                            let mut recompute_input = saved_input;
+                            let cache = qwen35_layer_forward(
+                                &mut recompute_input, &layers[i], &config.model, seq_len,
+                            );
+                            let (d_in, grads) = qwen35_layer_backward(
+                                &d_hidden, &cache, &layers[i], &config.model, seq_len, lr, config.weight_decay,
+                            );
+                            drop(cache);
+                            (d_in, Some(grads))
+                        };
+
                         d_hidden = d_input;
-                        drop(cache); // activation cache 即解放
 
-                        // Weight update (preloaded weightsを直接更新)
-                        match (grads, &mut layers[i]) {
-                            (Qwen35WeightGrads::DeltaNet(g), Qwen35LayerWeights::DeltaNet(w)) => {
-                                g.apply_sgd(w, lr * inv_tokens, config.weight_decay);
+                        // FullAttention層のweight update
+                        if let Some(grads) = grads {
+                            match (grads, &mut layers[i]) {
+                                (Qwen35WeightGrads::DeltaNet(g), Qwen35LayerWeights::DeltaNet(w)) => {
+                                    g.apply_sgd(w, lr * inv_tokens, config.weight_decay);
+                                }
+                                (Qwen35WeightGrads::FullAttention(g), Qwen35LayerWeights::FullAttention(w)) => {
+                                    g.apply_sgd(w, lr * inv_tokens, config.weight_decay);
+                                }
+                                _ => {}
                             }
-                            (Qwen35WeightGrads::FullAttention(g), Qwen35LayerWeights::FullAttention(w)) => {
-                                g.apply_sgd(w, lr * inv_tokens, config.weight_decay);
-                            }
-                            _ => {}
                         }
                     }
                 } else {

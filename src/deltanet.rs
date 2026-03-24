@@ -824,6 +824,119 @@ pub fn deltanet_recurrence_forward_train_cuda(
     (per_head_caches, final_states)
 }
 
+/// GPU DeltaNet Fused Forward+Backward — 状態をVRAM内に保持
+/// forward output + backward gradients を一発で計算。DeltaNetStepCache 不要。
+#[cfg(feature = "cuda")]
+pub fn deltanet_recurrence_fused_fwd_bwd_cuda(
+    q_all: &[f32],      // [seq_len × num_heads × dk]
+    k_all: &[f32],
+    v_all: &[f32],
+    beta_all: &[f32],   // [seq_len × num_heads]
+    g_all: &[f32],
+    d_output: &[f32],   // [seq_len × num_heads × dv]
+    output: &mut [f32],  // [seq_len × num_heads × dv]
+    num_heads: usize,
+    dk: usize,
+    dv: usize,
+    seq_len: usize,
+) -> DeltaNetRecurrenceGrads {
+    let total_qk = num_heads * seq_len * dk;
+    let total_v = num_heads * seq_len * dv;
+    let total_bg = num_heads * seq_len;
+
+    // レイアウト変換: [seq, heads, dim] → [heads, seq, dim]
+    let mut q_gpu = vec![0.0f32; total_qk];
+    let mut k_gpu = vec![0.0f32; total_qk];
+    let mut v_gpu = vec![0.0f32; total_v];
+    let mut beta_gpu = vec![0.0f32; total_bg];
+    let mut g_gpu = vec![0.0f32; total_bg];
+    let mut do_gpu = vec![0.0f32; total_v];
+
+    for t in 0..seq_len {
+        for h in 0..num_heads {
+            let src_qk = t * num_heads * dk + h * dk;
+            let dst_qk = h * seq_len * dk + t * dk;
+            q_gpu[dst_qk..dst_qk + dk].copy_from_slice(&q_all[src_qk..src_qk + dk]);
+            k_gpu[dst_qk..dst_qk + dk].copy_from_slice(&k_all[src_qk..src_qk + dk]);
+
+            let src_v = t * num_heads * dv + h * dv;
+            let dst_v = h * seq_len * dv + t * dv;
+            v_gpu[dst_v..dst_v + dv].copy_from_slice(&v_all[src_v..src_v + dv]);
+            do_gpu[dst_v..dst_v + dv].copy_from_slice(&d_output[src_v..src_v + dv]);
+
+            beta_gpu[h * seq_len + t] = beta_all[t * num_heads + h];
+            g_gpu[h * seq_len + t] = g_all[t * num_heads + h];
+        }
+    }
+
+    let mut out_gpu = vec![0.0f32; total_v];
+    let mut dq_gpu = vec![0.0f32; total_qk];
+    let mut dk_gpu_out = vec![0.0f32; total_qk];
+    let mut dv_gpu_out = vec![0.0f32; total_v];
+    let mut dbeta_gpu = vec![0.0f32; total_bg];
+    let mut dg_gpu = vec![0.0f32; total_bg];
+
+    {
+        use crate::blas::CUDA_MATMUL;
+        let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
+        let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+        crate::cuda_matmul::cuda_deltanet_fused_fwd_bwd(
+            &cuda, &q_gpu, &k_gpu, &v_gpu, &beta_gpu, &g_gpu, &do_gpu,
+            &mut out_gpu, &mut dq_gpu, &mut dk_gpu_out, &mut dv_gpu_out,
+            &mut dbeta_gpu, &mut dg_gpu,
+            num_heads, seq_len, dk, dv,
+        );
+    }
+
+    // レイアウト逆変換: [heads, seq, dim] → [seq, heads, dim]
+    for t in 0..seq_len {
+        for h in 0..num_heads {
+            let src = h * seq_len * dv + t * dv;
+            let dst = t * num_heads * dv + h * dv;
+            output[dst..dst + dv].copy_from_slice(&out_gpu[src..src + dv]);
+        }
+    }
+
+    let mut d_q = vec![0.0f32; total_qk];
+    let mut d_k = vec![0.0f32; total_qk];
+    let mut d_v = vec![0.0f32; total_v];
+    let mut d_b_logit = vec![0.0f32; total_bg];
+    let mut d_a_logit = vec![0.0f32; total_bg];
+
+    for t in 0..seq_len {
+        for h in 0..num_heads {
+            let src_qk = h * seq_len * dk + t * dk;
+            let dst_qk = t * num_heads * dk + h * dk;
+            d_q[dst_qk..dst_qk + dk].copy_from_slice(&dq_gpu[src_qk..src_qk + dk]);
+            d_k[dst_qk..dst_qk + dk].copy_from_slice(&dk_gpu_out[src_qk..src_qk + dk]);
+
+            let src_v = h * seq_len * dv + t * dv;
+            let dst_v = t * num_heads * dv + h * dv;
+            d_v[dst_v..dst_v + dv].copy_from_slice(&dv_gpu_out[src_v..src_v + dv]);
+
+            // d_beta → d_b_logit (sigmoid chain既にカーネル内で適用)
+            d_b_logit[t * num_heads + h] = dbeta_gpu[h * seq_len + t];
+            // d_g → d_a_logit (chain rule は呼出側で)
+            d_a_logit[t * num_heads + h] = dg_gpu[h * seq_len + t];
+        }
+    }
+
+    // d_a_log, d_dt_bias: カーネルの d_g は raw dg (chain未適用部分)
+    // 呼出側で a_log/dt_bias の chain rule を適用
+    let d_a_log = vec![0.0f32; num_heads];
+    let d_dt_bias = vec![0.0f32; num_heads];
+
+    DeltaNetRecurrenceGrads {
+        d_q,
+        d_k,
+        d_v,
+        d_b_logit,
+        d_a_logit,
+        d_a_log,
+        d_dt_bias,
+    }
+}
+
 // ── DeltaNet Backward (L1: ヘッド並列) ─────────────────────────────────────
 
 /// DeltaNet 再帰の backward 勾配。

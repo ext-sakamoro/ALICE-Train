@@ -180,6 +180,282 @@ extern "C" __global__ void deltanet_recurrence_train(
 }
 "#;
 
+/// GPU DeltaNet Fused Forward+Backward — 状態をVRAM内に保持、D2H転送ゼロ
+const DELTANET_FUSED_FWD_BWD_CU: &str = r#"
+extern "C" __global__ void deltanet_fused_fwd_bwd(
+    const float* __restrict__ q,       // [H, T, dk]
+    const float* __restrict__ k,       // [H, T, dk]
+    const float* __restrict__ v,       // [H, T, dv]
+    const float* __restrict__ beta,    // [H, T]
+    const float* __restrict__ g,       // [H, T]
+    const float* __restrict__ d_out,   // [H, T, dv]
+    float* __restrict__ output,        // [H, T, dv]
+    float* __restrict__ d_q_out,       // [H, T, dk]
+    float* __restrict__ d_k_out,       // [H, T, dk]
+    float* __restrict__ d_v_out,       // [H, T, dv]
+    float* __restrict__ d_beta_out,    // [H, T]
+    float* __restrict__ d_g_out,       // [H, T]
+    float* __restrict__ state_buf,     // [H, dk, dv] current state
+    float* __restrict__ all_s,         // [H, T, dk, dv] workspace
+    int seq_len, int dk, int dv)
+{
+    int h = blockIdx.x;
+    int j = threadIdx.x;  // 0..dv-1
+
+    float* S = state_buf + h * dk * dv;
+    extern __shared__ float smem[];
+    float* k_buf = smem;
+    float* q_buf = smem + dk;
+    float* do_buf = smem + 2 * dk;  // reuse in backward
+
+    int off_qk = h * seq_len * dk;
+    int off_v  = h * seq_len * dv;
+    int off_bg = h * seq_len;
+    long long off_st = (long long)h * seq_len * dk * dv;
+
+    // ═══ Phase 1: Forward ═══
+    for (int i = 0; i < dk; i++) S[i * dv + j] = 0.0f;
+    __syncthreads();
+
+    for (int t = 0; t < seq_len; t++) {
+        if (j < dk) {
+            k_buf[j] = k[off_qk + t * dk + j];
+            q_buf[j] = q[off_qk + t * dk + j];
+        }
+        __syncthreads();
+
+        float beta_t = beta[off_bg + t];
+        float exp_g_t = expf(g[off_bg + t]);
+        float v_j = v[off_v + t * dv + j];
+
+        // Store S_{t-1}
+        for (int i = 0; i < dk; i++)
+            all_s[off_st + (long long)t * dk * dv + i * dv + j] = S[i * dv + j];
+
+        // r = S^T k
+        float r_j = 0.0f;
+        for (int i = 0; i < dk; i++)
+            r_j = __fmaf_rn(S[i * dv + j], k_buf[i], r_j);
+
+        // e = v - r (stored implicitly via output)
+        float e_j = v_j - r_j;
+
+        // State update: S = exp_g * S + beta * k * e
+        float be = beta_t * e_j;
+        for (int i = 0; i < dk; i++)
+            S[i * dv + j] = __fmaf_rn(exp_g_t, S[i * dv + j], k_buf[i] * be);
+        __syncthreads();
+
+        // Output: o = S q
+        float o_j = 0.0f;
+        for (int i = 0; i < dk; i++)
+            o_j = __fmaf_rn(S[i * dv + j], q_buf[i], o_j);
+        output[off_v + t * dv + j] = o_j;
+        __syncthreads();
+    }
+
+    // ═══ Phase 2: Backward ═══
+    // dS accumulator in state_buf (reuse S memory)
+    for (int i = 0; i < dk; i++) S[i * dv + j] = 0.0f;
+    __syncthreads();
+
+    for (int t = seq_len - 1; t >= 0; t--) {
+        if (j < dk) {
+            k_buf[j] = k[off_qk + t * dk + j];
+            q_buf[j] = q[off_qk + t * dk + j];
+        }
+        __syncthreads();
+
+        float beta_t = beta[off_bg + t];
+        float g_t = g[off_bg + t];
+        float exp_g_t = expf(g_t);
+        float v_j = v[off_v + t * dv + j];
+        float do_j = d_out[off_v + t * dv + j];
+
+        // Load S_{t-1} from saved states
+        // Reconstruct S_t = exp_g * S_{t-1} + beta * k * e
+        float s_prev_col[128];  // Stack alloc per thread (max dk=128)
+        for (int i = 0; i < dk; i++)
+            s_prev_col[i] = all_s[off_st + (long long)t * dk * dv + i * dv + j];
+
+        // r_j = sum_i S_{t-1}[i][j] * k[i]
+        float r_j = 0.0f;
+        for (int i = 0; i < dk; i++)
+            r_j = __fmaf_rn(s_prev_col[i], k_buf[i], r_j);
+        float e_j = v_j - r_j;
+
+        // S_t[i][j] = exp_g * S_{t-1}[i][j] + beta * k[i] * e_j
+        float be = beta_t * e_j;
+        float s_t_col[128];
+        for (int i = 0; i < dk; i++)
+            s_t_col[i] = __fmaf_rn(exp_g_t, s_prev_col[i], k_buf[i] * be);
+
+        // dq_t[i] = sum_j S_t[i][j] * do[j]  — need warp reduce across j
+        // Thread j holds s_t_col[i] and do_j
+        // dq_t[i] = S_t[i][j] * do_j accumulated across all j
+        // Use shared memory for reduction
+        if (j < dk) {
+            float dq_i = 0.0f;
+            // Each thread j contributes s_t[i=j_loop][j] * do_j, but we need sum over j
+            // This requires a different threading model. Use atomicAdd.
+        }
+
+        // Simpler approach: each thread j computes its contribution
+        // dS[i][j] += q[i] * do[j]
+        for (int i = 0; i < dk; i++)
+            S[i * dv + j] += q_buf[i] * do_j;  // dS accumulation
+
+        // dst_k[j] = sum_i dS[i][j] * k[i]
+        float dst_k_j = 0.0f;
+        for (int i = 0; i < dk; i++)
+            dst_k_j = __fmaf_rn(S[i * dv + j], k_buf[i], dst_k_j);
+
+        // dv[t][j] = beta * dst_k[j]
+        d_v_out[off_v + t * dv + j] = beta_t * dst_k_j;
+
+        // dq[t][i]: need reduction across j dimension
+        // Thread j holds: s_t_col[i] * do_j for each i
+        // dq[t][i] = sum_j (s_t_col[i] * do_j)  — need cross-thread sum
+        // Use atomicAdd to global d_q_out
+        for (int i = 0; i < dk; i++)
+            atomicAdd(&d_q_out[off_qk + t * dk + i], s_t_col[i] * do_j);
+
+        // dk[t][i] = beta * (sum_j dS[i][j]*e[j] - sum_j S_{t-1}[i][j]*dst_k[j])
+        for (int i = 0; i < dk; i++) {
+            float ds_e = S[i * dv + j] * e_j;
+            float s_dst = s_prev_col[i] * dst_k_j;
+            atomicAdd(&d_k_out[off_qk + t * dk + i], beta_t * (ds_e - s_dst));
+        }
+
+        // d_beta[t] = sum_{i,j} dS[i][j] * k[i] * e[j]
+        float d_beta_contrib = 0.0f;
+        for (int i = 0; i < dk; i++)
+            d_beta_contrib += S[i * dv + j] * k_buf[i] * e_j;
+        // Chain sigmoid: d_beta_logit = d_beta * beta * (1 - beta)
+        atomicAdd(&d_beta_out[off_bg + t], d_beta_contrib * beta_t * (1.0f - beta_t));
+
+        // d_g[t] = exp_g * frobenius(dS, S_{t-1})
+        float frob_contrib = 0.0f;
+        for (int i = 0; i < dk; i++)
+            frob_contrib += S[i * dv + j] * s_prev_col[i];
+        atomicAdd(&d_g_out[off_bg + t], exp_g_t * frob_contrib);
+
+        // dS update: dS = exp_g * dS - beta * k ⊗ dst_k
+        for (int i = 0; i < dk; i++)
+            S[i * dv + j] = exp_g_t * S[i * dv + j] - beta_t * k_buf[i] * dst_k_j;
+        __syncthreads();
+    }
+}
+"#;
+
+/// GPU DeltaNet Backward-only — VRAM上の保存済み状態S_{t-1}を使用
+const DELTANET_BACKWARD_CU: &str = r#"
+extern "C" __global__ void deltanet_backward(
+    const float* __restrict__ q,       // [H, T, dk]
+    const float* __restrict__ k,       // [H, T, dk]
+    const float* __restrict__ v,       // [H, T, dv]
+    const float* __restrict__ beta,    // [H, T]
+    const float* __restrict__ g,       // [H, T]
+    const float* __restrict__ d_out,   // [H, T, dv]
+    const float* __restrict__ all_s,   // [H, T, dk, dv] — stored S_{t-1} from forward
+    float* __restrict__ d_q_out,       // [H, T, dk]
+    float* __restrict__ d_k_out,       // [H, T, dk]
+    float* __restrict__ d_v_out,       // [H, T, dv]
+    float* __restrict__ d_beta_out,    // [H, T]
+    float* __restrict__ d_g_out,       // [H, T]
+    int seq_len, int dk, int dv)
+{
+    int h = blockIdx.x;
+    int j = threadIdx.x;  // 0..dv-1
+
+    extern __shared__ float smem[];
+    float* k_buf = smem;
+    float* q_buf = smem + dk;
+
+    // dS accumulator in registers/global
+    // Use state_buf area (reuse from forward, but we need separate alloc)
+    // Actually just use a per-head global memory area
+    // We'll index into a workspace: d_s_buf[H * dk * dv]
+    // Pass it as the first part of all_s (caller provides separate buffer)
+    // For simplicity, allocate dS column in registers
+    float dS_col[128];  // max dk=128, one column per thread j
+    for (int i = 0; i < dk; i++) dS_col[i] = 0.0f;
+
+    int off_qk = h * seq_len * dk;
+    int off_v  = h * seq_len * dv;
+    int off_bg = h * seq_len;
+    long long off_st = (long long)h * seq_len * dk * dv;
+
+    for (int t = seq_len - 1; t >= 0; t--) {
+        if (j < dk) {
+            k_buf[j] = k[off_qk + t * dk + j];
+            q_buf[j] = q[off_qk + t * dk + j];
+        }
+        __syncthreads();
+
+        float beta_t = beta[off_bg + t];
+        float g_t = g[off_bg + t];
+        float exp_g_t = expf(g_t);
+        float v_j = v[off_v + t * dv + j];
+        float do_j = d_out[off_v + t * dv + j];
+
+        // Load S_{t-1}[i][j] for this column j
+        float s_prev_col[128];
+        for (int i = 0; i < dk; i++)
+            s_prev_col[i] = all_s[off_st + (long long)t * dk * dv + i * dv + j];
+
+        // Reconstruct e[j] = v[j] - sum_i S_{t-1}[i][j] * k[i]
+        float r_j = 0.0f;
+        for (int i = 0; i < dk; i++)
+            r_j = __fmaf_rn(s_prev_col[i], k_buf[i], r_j);
+        float e_j = v_j - r_j;
+
+        // Reconstruct S_t[i][j]
+        float be = beta_t * e_j;
+        float s_t_col[128];
+        for (int i = 0; i < dk; i++)
+            s_t_col[i] = __fmaf_rn(exp_g_t, s_prev_col[i], k_buf[i] * be);
+
+        // dS[i][j] += q[i] * do[j]
+        for (int i = 0; i < dk; i++)
+            dS_col[i] += q_buf[i] * do_j;
+
+        // dq[t][i] = sum_j S_t[i][j] * do[j] — needs cross-thread reduction
+        for (int i = 0; i < dk; i++)
+            atomicAdd(&d_q_out[off_qk + t * dk + i], s_t_col[i] * do_j);
+
+        // dst_k[j] = sum_i dS[i][j] * k[i]
+        float dst_k_j = 0.0f;
+        for (int i = 0; i < dk; i++)
+            dst_k_j = __fmaf_rn(dS_col[i], k_buf[i], dst_k_j);
+
+        // dk[t][i] = beta * (sum_j dS[i][j]*e[j] - sum_j S_{t-1}[i][j]*dst_k[j])
+        for (int i = 0; i < dk; i++)
+            atomicAdd(&d_k_out[off_qk + t * dk + i], beta_t * (dS_col[i] * e_j - s_prev_col[i] * dst_k_j));
+
+        // dv[t][j] = beta * dst_k[j]
+        d_v_out[off_v + t * dv + j] = beta_t * dst_k_j;
+
+        // d_beta[t] = sum_{i,j} dS[i][j] * k[i] * e[j] → chain sigmoid
+        float d_beta_contrib = 0.0f;
+        for (int i = 0; i < dk; i++)
+            d_beta_contrib += dS_col[i] * k_buf[i] * e_j;
+        atomicAdd(&d_beta_out[off_bg + t], d_beta_contrib * beta_t * (1.0f - beta_t));
+
+        // d_g[t] = exp_g * frobenius(dS, S_{t-1})
+        float frob = 0.0f;
+        for (int i = 0; i < dk; i++)
+            frob += dS_col[i] * s_prev_col[i];
+        atomicAdd(&d_g_out[off_bg + t], exp_g_t * frob);
+
+        // dS update: dS = exp_g * dS - beta * k ⊗ dst_k
+        for (int i = 0; i < dk; i++)
+            dS_col[i] = exp_g_t * dS_col[i] - beta_t * k_buf[i] * dst_k_j;
+        __syncthreads();
+    }
+}
+"#;
+
 /// GPU DeltaNet 補助カーネル群 (NVRTC)。
 /// RMSNorm, Conv1d+SiLU, L2Norm+GQA, Gate計算, Gated RMSNorm, Residual Add。
 /// 1回のNVRTCコンパイルで全カーネルを生成。
@@ -562,6 +838,8 @@ pub struct CudaMatmul {
     fused_adamw_func: CudaFunction,
     deltanet_func: CudaFunction,
     deltanet_train_func: CudaFunction,
+    deltanet_fused_func: CudaFunction,
+    deltanet_bwd_func: CudaFunction,
     // DeltaNet 補助カーネル群
     dn_rmsnorm_func: CudaFunction,
     dn_gated_rmsnorm_func: CudaFunction,
@@ -652,6 +930,23 @@ impl CudaMatmul {
             .load_function("deltanet_recurrence_train")
             .expect("deltanet_recurrence_train ロード失敗");
 
+        let ptx_dn_fused = compile_ptx(DELTANET_FUSED_FWD_BWD_CU)
+            .expect("NVRTC: deltanet_fused_fwd_bwd コンパイル失敗");
+        let mod_dn_fused = ctx
+            .load_module(ptx_dn_fused)
+            .expect("deltanet_fused module ロード失敗");
+        let deltanet_fused_func = mod_dn_fused
+            .load_function("deltanet_fused_fwd_bwd")
+            .expect("deltanet_fused_fwd_bwd ロード失敗");
+
+        let ptx_dn_bwd = compile_ptx(DELTANET_BACKWARD_CU)
+            .expect("NVRTC: deltanet_backward コンパイル失敗");
+        let mod_dn_bwd = ctx.load_module(ptx_dn_bwd)
+            .expect("deltanet_backward module ロード失敗");
+        let deltanet_bwd_func = mod_dn_bwd
+            .load_function("deltanet_backward")
+            .expect("deltanet_backward ロード失敗");
+
         let ptx_ops = compile_ptx(DELTANET_OPS_CU).expect("NVRTC: deltanet_ops コンパイル失敗");
         let mod_ops = ctx
             .load_module(ptx_ops)
@@ -714,6 +1009,8 @@ impl CudaMatmul {
             fused_adamw_func,
             deltanet_func,
             deltanet_train_func,
+            deltanet_fused_func,
+            deltanet_bwd_func,
             dn_rmsnorm_func,
             dn_gated_rmsnorm_func,
             dn_conv1d_silu_func,
@@ -4484,4 +4781,254 @@ pub fn cuda_deltanet_recurrence_train(
     }
     cuda.stream.memcpy_dtoh(&all_s_gpu.slice(..total_states), &mut all_s_prev[..total_states]).expect("all_s_prev D2H");
     cuda.stream.memcpy_dtoh(&all_e_gpu.slice(..total_e), &mut all_e[..total_e]).expect("all_e D2H");
+}
+
+/// GPU DeltaNet Forward — 状態をVRAMに保持して返す（D2Hなし）
+/// 返り値の CudaSlice は backward で使う
+pub fn cuda_deltanet_forward_store(
+    cuda: &CudaMatmul,
+    q: &[f32], k: &[f32], v: &[f32], beta: &[f32], g: &[f32],
+    output: &mut [f32],
+    num_heads: usize, seq_len: usize, dk: usize, dv: usize,
+) -> CudaSlice<f32> {
+    let total_qk = num_heads * seq_len * dk;
+    let total_v = num_heads * seq_len * dv;
+    let total_bg = num_heads * seq_len;
+    let total_states = num_heads * seq_len * dk * dv;
+
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_a, total_qk);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_b, total_qk);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_c, total_v);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_d, total_bg);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_e, total_bg);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_scores, total_v);
+
+    { let mut ba = cuda.buf_a.borrow_mut(); cuda.stream.memcpy_htod(&q[..total_qk], &mut ba.buf.slice_mut(..total_qk)).expect("q"); }
+    { let mut bb = cuda.buf_b.borrow_mut(); cuda.stream.memcpy_htod(&k[..total_qk], &mut bb.buf.slice_mut(..total_qk)).expect("k"); }
+    { let mut bc = cuda.buf_c.borrow_mut(); cuda.stream.memcpy_htod(&v[..total_v], &mut bc.buf.slice_mut(..total_v)).expect("v"); }
+    { let mut bd = cuda.buf_d.borrow_mut(); cuda.stream.memcpy_htod(&beta[..total_bg], &mut bd.buf.slice_mut(..total_bg)).expect("beta"); }
+    { let mut be_buf = cuda.buf_e.borrow_mut(); cuda.stream.memcpy_htod(&g[..total_bg], &mut be_buf.buf.slice_mut(..total_bg)).expect("g"); }
+
+    let state_size = num_heads * dk * dv;
+    let mut state_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(state_size).expect("state");
+    let mut all_s_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_states).expect("all_s");
+    let mut all_e_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_v).expect("all_e");
+
+    let cfg = LaunchConfig {
+        grid_dim: (num_heads as u32, 1, 1),
+        block_dim: (dv as u32, 1, 1),
+        shared_mem_bytes: (dk * 2 * 4) as u32,
+    };
+
+    {
+        let ba = cuda.buf_a.borrow();
+        let bb = cuda.buf_b.borrow();
+        let bc = cuda.buf_c.borrow();
+        let bd = cuda.buf_d.borrow();
+        let be_buf = cuda.buf_e.borrow();
+        let mut bs = cuda.buf_scores.borrow_mut();
+
+        let mut builder = cuda.stream.launch_builder(&cuda.deltanet_train_func);
+        builder.arg(&ba.buf); builder.arg(&bb.buf); builder.arg(&bc.buf);
+        builder.arg(&bd.buf); builder.arg(&be_buf.buf);
+        builder.arg(&mut bs.buf); builder.arg(&mut state_gpu);
+        builder.arg(&mut all_s_gpu); builder.arg(&mut all_e_gpu);
+        let sl = seq_len as i32; let dki = dk as i32; let dvi = dv as i32;
+        builder.arg(&sl); builder.arg(&dki); builder.arg(&dvi);
+        unsafe { builder.launch(cfg).expect("forward_store launch"); }
+    }
+
+    // D2H: output のみ (all_s はVRAMに残す)
+    {
+        let bs = cuda.buf_scores.borrow();
+        cuda.stream.memcpy_dtoh(&bs.buf.slice(..total_v), &mut output[..total_v]).expect("output D2H");
+    }
+
+    all_s_gpu // VRAM handle を返す
+}
+
+/// GPU DeltaNet Backward — VRAM上の保存済み状態を使用
+pub fn cuda_deltanet_backward_from_vram(
+    cuda: &CudaMatmul,
+    q: &[f32], k: &[f32], v: &[f32], beta: &[f32], g: &[f32],
+    d_out: &[f32],
+    all_s_vram: &CudaSlice<f32>,
+    d_q: &mut [f32], d_k: &mut [f32], d_v: &mut [f32],
+    d_beta: &mut [f32], d_g: &mut [f32],
+    num_heads: usize, seq_len: usize, dk: usize, dv: usize,
+) {
+    let total_qk = num_heads * seq_len * dk;
+    let total_v = num_heads * seq_len * dv;
+    let total_bg = num_heads * seq_len;
+
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_a, total_qk);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_b, total_qk);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_c, total_v);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_d, total_bg);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_e, total_bg);
+
+    { let mut ba = cuda.buf_a.borrow_mut(); cuda.stream.memcpy_htod(&q[..total_qk], &mut ba.buf.slice_mut(..total_qk)).expect("q"); }
+    { let mut bb = cuda.buf_b.borrow_mut(); cuda.stream.memcpy_htod(&k[..total_qk], &mut bb.buf.slice_mut(..total_qk)).expect("k"); }
+    { let mut bc = cuda.buf_c.borrow_mut(); cuda.stream.memcpy_htod(&v[..total_v], &mut bc.buf.slice_mut(..total_v)).expect("v"); }
+    { let mut bd = cuda.buf_d.borrow_mut(); cuda.stream.memcpy_htod(&beta[..total_bg], &mut bd.buf.slice_mut(..total_bg)).expect("beta"); }
+    { let mut be_buf = cuda.buf_e.borrow_mut(); cuda.stream.memcpy_htod(&g[..total_bg], &mut be_buf.buf.slice_mut(..total_bg)).expect("g"); }
+
+    let mut d_out_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_v).expect("d_out");
+    cuda.stream.memcpy_htod(&d_out[..total_v], &mut d_out_gpu).expect("d_out H2D");
+
+    let mut dq_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_qk).expect("dq");
+    let mut dk_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_qk).expect("dk");
+    let mut dv_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_v).expect("dv");
+    let mut dbeta_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_bg).expect("dbeta");
+    let mut dg_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_bg).expect("dg");
+
+    let cfg = LaunchConfig {
+        grid_dim: (num_heads as u32, 1, 1),
+        block_dim: (dv as u32, 1, 1),
+        shared_mem_bytes: (dk * 2 * 4) as u32,
+    };
+
+    {
+        let ba = cuda.buf_a.borrow();
+        let bb = cuda.buf_b.borrow();
+        let bc = cuda.buf_c.borrow();
+        let bd = cuda.buf_d.borrow();
+        let be_buf = cuda.buf_e.borrow();
+
+        let mut builder = cuda.stream.launch_builder(&cuda.deltanet_bwd_func);
+        builder.arg(&ba.buf); builder.arg(&bb.buf); builder.arg(&bc.buf);
+        builder.arg(&bd.buf); builder.arg(&be_buf.buf);
+        builder.arg(&d_out_gpu); builder.arg(all_s_vram);
+        builder.arg(&mut dq_gpu); builder.arg(&mut dk_gpu); builder.arg(&mut dv_gpu);
+        builder.arg(&mut dbeta_gpu); builder.arg(&mut dg_gpu);
+        let sl = seq_len as i32; let dki = dk as i32; let dvi = dv as i32;
+        builder.arg(&sl); builder.arg(&dki); builder.arg(&dvi);
+        unsafe { builder.launch(cfg).expect("backward launch"); }
+    }
+
+    cuda.stream.memcpy_dtoh(&dq_gpu.slice(..total_qk), &mut d_q[..total_qk]).expect("dq D2H");
+    cuda.stream.memcpy_dtoh(&dk_gpu.slice(..total_qk), &mut d_k[..total_qk]).expect("dk D2H");
+    cuda.stream.memcpy_dtoh(&dv_gpu.slice(..total_v), &mut d_v[..total_v]).expect("dv D2H");
+    cuda.stream.memcpy_dtoh(&dbeta_gpu.slice(..total_bg), &mut d_beta[..total_bg]).expect("dbeta D2H");
+    cuda.stream.memcpy_dtoh(&dg_gpu.slice(..total_bg), &mut d_g[..total_bg]).expect("dg D2H");
+}
+
+/// GPU DeltaNet Fused Forward+Backward — 状態をVRAM内に保持、D2H転送ゼロ
+/// forward output + backward gradients を一発で計算
+pub fn cuda_deltanet_fused_fwd_bwd(
+    cuda: &CudaMatmul,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    beta: &[f32],
+    g: &[f32],
+    d_out: &[f32],
+    output: &mut [f32],
+    d_q: &mut [f32],
+    d_k: &mut [f32],
+    d_v: &mut [f32],
+    d_beta: &mut [f32],
+    d_g: &mut [f32],
+    num_heads: usize,
+    seq_len: usize,
+    dk: usize,
+    dv: usize,
+) {
+    let total_qk = num_heads * seq_len * dk;
+    let total_v = num_heads * seq_len * dv;
+    let total_bg = num_heads * seq_len;
+    let total_states = num_heads * seq_len * dk * dv;
+
+    // H2D: q, k, v, beta, g, d_out
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_a, total_qk);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_b, total_qk);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_c, total_v);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_d, total_bg);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_e, total_bg);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_scores, total_v);
+
+    {
+        let mut ba = cuda.buf_a.borrow_mut();
+        cuda.stream.memcpy_htod(&q[..total_qk], &mut ba.buf.slice_mut(..total_qk)).expect("q H2D");
+    }
+    {
+        let mut bb = cuda.buf_b.borrow_mut();
+        cuda.stream.memcpy_htod(&k[..total_qk], &mut bb.buf.slice_mut(..total_qk)).expect("k H2D");
+    }
+    {
+        let mut bc = cuda.buf_c.borrow_mut();
+        cuda.stream.memcpy_htod(&v[..total_v], &mut bc.buf.slice_mut(..total_v)).expect("v H2D");
+    }
+    {
+        let mut bd = cuda.buf_d.borrow_mut();
+        cuda.stream.memcpy_htod(&beta[..total_bg], &mut bd.buf.slice_mut(..total_bg)).expect("beta H2D");
+    }
+    {
+        let mut be_buf = cuda.buf_e.borrow_mut();
+        cuda.stream.memcpy_htod(&g[..total_bg], &mut be_buf.buf.slice_mut(..total_bg)).expect("g H2D");
+    }
+
+    // d_out H2D — 専用バッファ
+    let mut d_out_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_v).expect("d_out 確保");
+    cuda.stream.memcpy_htod(&d_out[..total_v], &mut d_out_gpu).expect("d_out H2D");
+
+    // Output + gradient バッファ
+    let mut out_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_v).expect("output 確保");
+    let mut dq_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_qk).expect("dq 確保");
+    let mut dk_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_qk).expect("dk 確保");
+    let mut dv_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_v).expect("dv 確保");
+    let mut dbeta_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_bg).expect("dbeta 確保");
+    let mut dg_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_bg).expect("dg 確保");
+
+    // State + workspace (VRAM内完結)
+    let state_size = num_heads * dk * dv;
+    let mut state_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(state_size).expect("state 確保");
+    let mut all_s_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_states).expect("all_s 確保");
+
+    let shared_bytes = (dk * 2 + dv) * 4; // k_buf + q_buf + do_buf
+    let cfg = LaunchConfig {
+        grid_dim: (num_heads as u32, 1, 1),
+        block_dim: (dv as u32, 1, 1),
+        shared_mem_bytes: shared_bytes as u32,
+    };
+
+    {
+        let ba = cuda.buf_a.borrow();
+        let bb = cuda.buf_b.borrow();
+        let bc = cuda.buf_c.borrow();
+        let bd = cuda.buf_d.borrow();
+        let be_buf = cuda.buf_e.borrow();
+
+        let mut builder = cuda.stream.launch_builder(&cuda.deltanet_fused_func);
+        builder.arg(&ba.buf);       // q
+        builder.arg(&bb.buf);       // k
+        builder.arg(&bc.buf);       // v
+        builder.arg(&bd.buf);       // beta
+        builder.arg(&be_buf.buf);   // g
+        builder.arg(&d_out_gpu);    // d_out
+        builder.arg(&mut out_gpu);  // output
+        builder.arg(&mut dq_gpu);   // d_q
+        builder.arg(&mut dk_gpu);   // d_k
+        builder.arg(&mut dv_gpu);   // d_v
+        builder.arg(&mut dbeta_gpu);// d_beta
+        builder.arg(&mut dg_gpu);   // d_g
+        builder.arg(&mut state_gpu);// state_buf
+        builder.arg(&mut all_s_gpu);// all_s workspace
+        let sl = seq_len as i32;
+        let dki = dk as i32;
+        let dvi = dv as i32;
+        builder.arg(&sl);
+        builder.arg(&dki);
+        builder.arg(&dvi);
+
+        unsafe { builder.launch(cfg).expect("deltanet_fused_fwd_bwd 起動失敗"); }
+    }
+
+    // D2H: output + gradients のみ (状態はGPU内で完結)
+    cuda.stream.memcpy_dtoh(&out_gpu.slice(..total_v), &mut output[..total_v]).expect("output D2H");
+    cuda.stream.memcpy_dtoh(&dq_gpu.slice(..total_qk), &mut d_q[..total_qk]).expect("dq D2H");
+    cuda.stream.memcpy_dtoh(&dk_gpu.slice(..total_qk), &mut d_k[..total_qk]).expect("dk D2H");
+    cuda.stream.memcpy_dtoh(&dv_gpu.slice(..total_v), &mut d_v[..total_v]).expect("dv D2H");
+    cuda.stream.memcpy_dtoh(&dbeta_gpu.slice(..total_bg), &mut d_beta[..total_bg]).expect("dbeta D2H");
+    cuda.stream.memcpy_dtoh(&dg_gpu.slice(..total_bg), &mut d_g[..total_bg]).expect("dg D2H");
 }

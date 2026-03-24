@@ -602,6 +602,300 @@ pub fn full_attn_layer_backward(
 
 /// ハイブリッドレイヤーの backward。
 #[must_use]
+/// DeltaNet層のGradient Checkpointing Fused — GPU forward(VRAM state保持) + GPU backward
+/// step_caches を一切生成しない。VRAM上の保存済みS_{t-1}で backward を直接実行。
+#[cfg(feature = "cuda")]
+pub fn deltanet_layer_gc_fused(
+    saved_input: &[f32],
+    d_output: &[f32],
+    weights: &crate::qwen35::DeltaNetLayerWeights,
+    config: &Qwen35Config,
+    seq_len: usize,
+    weight_grads: &mut DeltaNetWeightGrads,
+) -> Vec<f32> {
+    use crate::blas::blas_swiglu_ffn_training;
+    use crate::deltanet::{
+        causal_conv1d_silu_row_major, compute_gates_fused, gated_rmsnorm, l2norm_and_gqa_expand,
+    };
+
+    let hidden = config.hidden_size;
+    let inter = config.intermediate_size;
+    let key_dim = config.linear_key_dim();
+    let val_dim = config.linear_value_dim();
+    let n_k_heads = config.linear_num_key_heads;
+    let n_v_heads = config.linear_num_value_heads;
+    let dk = config.linear_key_head_dim;
+    let dv = config.linear_value_head_dim;
+    let kernel_size = config.linear_conv_kernel_dim;
+    let qkv_dim = key_dim * 2 + val_dim;
+
+    // ═══ Phase 1: Pre-recurrence forward (projections, conv1d, gates) ═══
+    let residual_attn = saved_input.to_vec();
+    let mut normed = saved_input.to_vec();
+    blas_rmsnorm(&mut normed, &weights.input_layernorm, hidden, config.rms_norm_eps);
+
+    let mut qkv = vec![0.0f32; seq_len * qkv_dim];
+    blas_matmul_bt(&normed, &weights.in_proj_qkv, &mut qkv, seq_len, qkv_dim, hidden);
+    let mut z = vec![0.0f32; seq_len * val_dim];
+    blas_matmul_bt(&normed, &weights.in_proj_z, &mut z, seq_len, val_dim, hidden);
+    let mut b_raw = vec![0.0f32; seq_len * n_v_heads];
+    blas_matmul_bt(&normed, &weights.in_proj_b, &mut b_raw, seq_len, n_v_heads, hidden);
+    let mut a_raw = vec![0.0f32; seq_len * n_v_heads];
+    blas_matmul_bt(&normed, &weights.in_proj_a, &mut a_raw, seq_len, n_v_heads, hidden);
+
+    let pre_conv_qkv = qkv.clone();
+    let mut qkv_conv = vec![0.0f32; seq_len * qkv_dim];
+    causal_conv1d_silu_row_major(&qkv, &weights.conv1d_weight, &mut qkv_conv, qkv_dim, seq_len, kernel_size);
+
+    let mut q_raw = vec![0.0f32; seq_len * key_dim];
+    let mut k_raw = vec![0.0f32; seq_len * key_dim];
+    let mut v_all = vec![0.0f32; seq_len * val_dim];
+    for t in 0..seq_len {
+        let row = &qkv_conv[t * qkv_dim..];
+        q_raw[t * key_dim..(t + 1) * key_dim].copy_from_slice(&row[..key_dim]);
+        k_raw[t * key_dim..(t + 1) * key_dim].copy_from_slice(&row[key_dim..key_dim * 2]);
+        v_all[t * val_dim..(t + 1) * val_dim].copy_from_slice(&row[key_dim * 2..qkv_dim]);
+    }
+
+    let mut q_expanded = vec![0.0f32; seq_len * n_v_heads * dk];
+    let mut k_expanded = vec![0.0f32; seq_len * n_v_heads * dk];
+    l2norm_and_gqa_expand(&q_raw, &k_raw, &mut q_expanded, &mut k_expanded, seq_len, n_k_heads, n_v_heads, dk, 1e-6);
+
+    let mut beta = vec![0.0f32; seq_len * n_v_heads];
+    let mut g = vec![0.0f32; seq_len * n_v_heads];
+    compute_gates_fused(&b_raw, &a_raw, &weights.a_log, &weights.dt_bias, &mut beta, &mut g, seq_len, n_v_heads);
+
+    // ═══ Phase 2: GPU Forward (VRAM state保持) ═══
+    let total_qk = n_v_heads * seq_len * dk;
+    let total_v = n_v_heads * seq_len * dv;
+    let total_bg = n_v_heads * seq_len;
+
+    // Layout: [seq, heads, dim] → [heads, seq, dim]
+    let mut q_gpu = vec![0.0f32; total_qk];
+    let mut k_gpu = vec![0.0f32; total_qk];
+    let mut v_gpu = vec![0.0f32; total_v];
+    let mut beta_gpu = vec![0.0f32; total_bg];
+    let mut g_gpu = vec![0.0f32; total_bg];
+
+    for t in 0..seq_len {
+        for h in 0..n_v_heads {
+            let sq = t * n_v_heads * dk + h * dk;
+            let dq = h * seq_len * dk + t * dk;
+            q_gpu[dq..dq + dk].copy_from_slice(&q_expanded[sq..sq + dk]);
+            k_gpu[dq..dq + dk].copy_from_slice(&k_expanded[sq..sq + dk]);
+            let sv = t * n_v_heads * dv + h * dv;
+            let dvv = h * seq_len * dv + t * dv;
+            v_gpu[dvv..dvv + dv].copy_from_slice(&v_all[sv..sv + dv]);
+            beta_gpu[h * seq_len + t] = beta[t * n_v_heads + h];
+            g_gpu[h * seq_len + t] = g[t * n_v_heads + h];
+        }
+    }
+
+    let all_s_vram;
+    let mut attn_out_raw = vec![0.0f32; seq_len * val_dim];
+    {
+        let mut out_gpu = vec![0.0f32; total_v];
+        {
+            use crate::blas::CUDA_MATMUL;
+            let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
+            let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+            all_s_vram = crate::cuda_matmul::cuda_deltanet_forward_store(
+                &cuda, &q_gpu, &k_gpu, &v_gpu, &beta_gpu, &g_gpu,
+                &mut out_gpu, n_v_heads, seq_len, dk, dv,
+            );
+        }
+        // Layout back: [heads, seq, dv] → [seq, heads, dv]
+        for t in 0..seq_len {
+            for h in 0..n_v_heads {
+                let src = h * seq_len * dv + t * dv;
+                let dst = t * n_v_heads * dv + h * dv;
+                attn_out_raw[dst..dst + dv].copy_from_slice(&out_gpu[src..src + dv]);
+            }
+        }
+    }
+
+    // ═══ Phase 3: Post-recurrence forward (gated rmsnorm, out_proj, FFN) ═══
+    let attn_out_pre_norm = attn_out_raw.clone();
+    let mut attn_normed = vec![0.0f32; seq_len * val_dim];
+    gated_rmsnorm(&attn_out_raw, &z, &weights.norm_weight, &mut attn_normed, dv, config.rms_norm_eps);
+
+    let mut attn_out = vec![0.0f32; seq_len * hidden];
+    blas_matmul_bt(&attn_normed, &weights.out_proj, &mut attn_out, seq_len, hidden, val_dim);
+
+    let mut layer_out = saved_input.to_vec();
+    for i in 0..layer_out.len() { layer_out[i] = residual_attn[i] + attn_out[i]; }
+
+    let residual_ffn = layer_out.clone();
+    let mut normed_ffn = layer_out.clone();
+    blas_rmsnorm(&mut normed_ffn, &weights.post_attn_layernorm, hidden, config.rms_norm_eps);
+    let normed_ffn_saved = normed_ffn.clone();
+
+    let mut ffn_out = vec![0.0f32; seq_len * hidden];
+    let mut gate_buf = vec![0.0f32; seq_len * inter];
+    let mut up_buf = vec![0.0f32; seq_len * inter];
+    let mut gate_silu_buf = vec![0.0f32; seq_len * inter];
+    blas_swiglu_ffn_training(&normed_ffn, &weights.gate_proj, &weights.up_proj, &weights.down_proj,
+        &mut ffn_out, &mut gate_buf, &mut up_buf, &mut gate_silu_buf, seq_len, hidden, inter);
+
+    // ═══ Phase 4: Post-recurrence backward (FFN → gated rmsnorm → out_proj) ═══
+    let mut d_ffn_input = vec![0.0f32; seq_len * hidden];
+    swiglu_ffn_backward(d_output, &normed_ffn_saved, &gate_buf, &up_buf, &gate_silu_buf,
+        &weights.gate_proj, &weights.up_proj, &weights.down_proj,
+        &mut d_ffn_input, &mut weight_grads.d_gate_proj, &mut weight_grads.d_up_proj,
+        &mut weight_grads.d_down_proj, seq_len, hidden, inter);
+
+    let mut d_attn_block = vec![0.0f32; seq_len * hidden];
+    for t in 0..seq_len {
+        let row = &residual_ffn[t * hidden..(t + 1) * hidden];
+        let ss: f64 = row.iter().map(|&v| (v as f64) * (v as f64)).sum();
+        let inv_rms = 1.0 / (ss / hidden as f64 + config.rms_norm_eps as f64).sqrt() as f32;
+        for h in 0..hidden {
+            let n = row[h] * inv_rms;
+            weight_grads.d_post_attn_layernorm[h] += d_ffn_input[t * hidden + h] * n;
+            d_attn_block[t * hidden + h] = d_ffn_input[t * hidden + h] * weights.post_attn_layernorm[h] * inv_rms;
+        }
+    }
+    for i in 0..seq_len * hidden { d_attn_block[i] += d_output[i]; }
+
+    let mut d_attn_normed = vec![0.0f32; seq_len * val_dim];
+    blas_matmul_nn(&d_attn_block, &weights.out_proj, &mut d_attn_normed, seq_len, val_dim, hidden);
+    {
+        let mut d_block_t = vec![0.0f32; hidden * seq_len];
+        for t in 0..seq_len { for h in 0..hidden { d_block_t[h * seq_len + t] = d_attn_block[t * hidden + h]; } }
+        let mut tmp = vec![0.0f32; hidden * val_dim];
+        blas_matmul_nn(&d_block_t, &attn_normed, &mut tmp, hidden, val_dim, seq_len);
+        for i in 0..hidden * val_dim { weight_grads.d_out_proj[i] += tmp[i]; }
+    }
+
+    let mut d_recurrence_out = vec![0.0f32; seq_len * val_dim];
+    for t in 0..seq_len {
+        let row_x = &attn_out_pre_norm[t * val_dim..(t + 1) * val_dim];
+        let row_z = &z[t * val_dim..(t + 1) * val_dim];
+        let ss: f64 = row_x.iter().map(|&v| (v as f64) * (v as f64)).sum();
+        let inv_rms = 1.0 / (ss / dv as f64 + config.rms_norm_eps as f64).sqrt() as f32;
+        for j in 0..dv {
+            let sig_z = 1.0 / (1.0 + (-row_z[j]).exp());
+            let silu_z = row_z[j] * sig_z;
+            d_recurrence_out[t * val_dim + j] = d_attn_normed[t * val_dim + j] * silu_z * weights.norm_weight[j % dv] * inv_rms;
+            let normed_x = row_x[j] * inv_rms;
+            weight_grads.d_norm_weight[j % dv] += d_attn_normed[t * val_dim + j] * normed_x * silu_z;
+        }
+    }
+
+    // ═══ Phase 5: GPU Backward (VRAM state使用) ═══
+    let mut do_gpu = vec![0.0f32; total_v];
+    for t in 0..seq_len {
+        for h in 0..n_v_heads {
+            let src = t * n_v_heads * dv + h * dv;
+            let dst = h * seq_len * dv + t * dv;
+            do_gpu[dst..dst + dv].copy_from_slice(&d_recurrence_out[src..src + dv]);
+        }
+    }
+
+    let mut dq_gpu = vec![0.0f32; total_qk];
+    let mut dk_gpu_out = vec![0.0f32; total_qk];
+    let mut dv_gpu_out = vec![0.0f32; total_v];
+    let mut dbeta_gpu = vec![0.0f32; total_bg];
+    let mut dg_gpu = vec![0.0f32; total_bg];
+
+    {
+        use crate::blas::CUDA_MATMUL;
+        let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
+        let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+        crate::cuda_matmul::cuda_deltanet_backward_from_vram(
+            &cuda, &q_gpu, &k_gpu, &v_gpu, &beta_gpu, &g_gpu, &do_gpu,
+            &all_s_vram,
+            &mut dq_gpu, &mut dk_gpu_out, &mut dv_gpu_out, &mut dbeta_gpu, &mut dg_gpu,
+            n_v_heads, seq_len, dk, dv,
+        );
+    }
+    drop(all_s_vram); // VRAM解放
+
+    // Layout back: [heads, seq, dim] → [seq, heads, dim]
+    let mut d_q = vec![0.0f32; total_qk];
+    let mut d_k = vec![0.0f32; total_qk];
+    let mut d_v = vec![0.0f32; total_v];
+    let mut d_b_logit = vec![0.0f32; total_bg];
+    let mut d_a_logit = vec![0.0f32; total_bg];
+    for t in 0..seq_len {
+        for h in 0..n_v_heads {
+            let sq = h * seq_len * dk + t * dk;
+            let dq = t * n_v_heads * dk + h * dk;
+            d_q[dq..dq + dk].copy_from_slice(&dq_gpu[sq..sq + dk]);
+            d_k[dq..dq + dk].copy_from_slice(&dk_gpu_out[sq..sq + dk]);
+            let sv = h * seq_len * dv + t * dv;
+            let dvv = t * n_v_heads * dv + h * dv;
+            d_v[dvv..dvv + dv].copy_from_slice(&dv_gpu_out[sv..sv + dv]);
+            d_b_logit[t * n_v_heads + h] = dbeta_gpu[h * seq_len + t];
+            d_a_logit[t * n_v_heads + h] = dg_gpu[h * seq_len + t];
+        }
+    }
+
+    // ═══ Phase 6: Projection backward ═══
+    let gqa_ratio = n_v_heads / n_k_heads;
+    let mut d_qkv_conv = vec![0.0f32; seq_len * qkv_dim];
+    for t in 0..seq_len {
+        for kh in 0..n_k_heads {
+            for d in 0..dk {
+                let mut sum = 0.0f32;
+                for gg in 0..gqa_ratio { sum += d_q[t * n_v_heads * dk + (kh * gqa_ratio + gg) * dk + d]; }
+                d_qkv_conv[t * qkv_dim + kh * dk + d] = sum;
+            }
+        }
+        for kh in 0..n_k_heads {
+            for d in 0..dk {
+                let mut sum = 0.0f32;
+                for gg in 0..gqa_ratio { sum += d_k[t * n_v_heads * dk + (kh * gqa_ratio + gg) * dk + d]; }
+                d_qkv_conv[t * qkv_dim + key_dim + kh * dk + d] = sum;
+            }
+        }
+        for j in 0..val_dim { d_qkv_conv[t * qkv_dim + key_dim * 2 + j] = d_v[t * n_v_heads * dv + j]; }
+    }
+
+    let mut d_qkv_pre_conv = vec![0.0f32; seq_len * qkv_dim];
+    causal_conv1d_backward(&d_qkv_conv, &pre_conv_qkv, &weights.conv1d_weight,
+        &mut d_qkv_pre_conv, &mut weight_grads.d_conv1d_weight, qkv_dim, seq_len, kernel_size);
+
+    let mut d_normed = vec![0.0f32; seq_len * hidden];
+    blas_matmul_nn(&d_qkv_pre_conv, &weights.in_proj_qkv, &mut d_normed, seq_len, hidden, qkv_dim);
+    {
+        let mut normed_input = residual_attn.clone();
+        blas_rmsnorm(&mut normed_input, &weights.input_layernorm, hidden, config.rms_norm_eps);
+        let mut d_qkv_t = vec![0.0f32; qkv_dim * seq_len];
+        for t in 0..seq_len { for j in 0..qkv_dim { d_qkv_t[j * seq_len + t] = d_qkv_pre_conv[t * qkv_dim + j]; } }
+        let mut tmp = vec![0.0f32; qkv_dim * hidden];
+        blas_matmul_nn(&d_qkv_t, &normed_input, &mut tmp, qkv_dim, hidden, seq_len);
+        for i in 0..qkv_dim * hidden { weight_grads.d_in_proj_qkv[i] += tmp[i]; }
+    }
+    {
+        let mut normed_input = residual_attn.clone();
+        blas_rmsnorm(&mut normed_input, &weights.input_layernorm, hidden, config.rms_norm_eps);
+        let mut d_b_t = vec![0.0f32; n_v_heads * seq_len];
+        let mut d_a_t = vec![0.0f32; n_v_heads * seq_len];
+        for t in 0..seq_len { for h in 0..n_v_heads { d_b_t[h * seq_len + t] = d_b_logit[t * n_v_heads + h]; d_a_t[h * seq_len + t] = d_a_logit[t * n_v_heads + h]; } }
+        let mut tmp_b = vec![0.0f32; n_v_heads * hidden];
+        let mut tmp_a = vec![0.0f32; n_v_heads * hidden];
+        blas_matmul_nn(&d_b_t, &normed_input, &mut tmp_b, n_v_heads, hidden, seq_len);
+        blas_matmul_nn(&d_a_t, &normed_input, &mut tmp_a, n_v_heads, hidden, seq_len);
+        for i in 0..n_v_heads * hidden { weight_grads.d_in_proj_b[i] += tmp_b[i]; weight_grads.d_in_proj_a[i] += tmp_a[i]; }
+    }
+
+    let mut d_input = vec![0.0f32; seq_len * hidden];
+    for t in 0..seq_len {
+        let row = &residual_attn[t * hidden..(t + 1) * hidden];
+        let ss: f64 = row.iter().map(|&v| (v as f64) * (v as f64)).sum();
+        let inv_rms = 1.0 / (ss / hidden as f64 + config.rms_norm_eps as f64).sqrt() as f32;
+        for h in 0..hidden {
+            let n = row[h] * inv_rms;
+            weight_grads.d_input_layernorm[h] += d_normed[t * hidden + h] * n;
+            d_input[t * hidden + h] = d_normed[t * hidden + h] * weights.input_layernorm[h] * inv_rms;
+        }
+    }
+    for i in 0..seq_len * hidden { d_input[i] += d_output[i]; }
+
+    d_input
+}
+
 pub fn qwen35_layer_backward(
     d_output: &[f32],
     cache: &crate::qwen35_forward::Qwen35LayerCache,
