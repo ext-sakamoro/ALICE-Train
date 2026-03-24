@@ -348,37 +348,46 @@ extern "C" __global__ void deltanet_fused_fwd_bwd(
 }
 "#;
 
-/// GPU DeltaNet Backward-only — VRAM上の保存済み状態S_{t-1}を使用
+/// GPU DeltaNet Backward — VRAM上の保存済み状態S_{t-1}を使用
+/// atomicAdd排除: warp shuffle + shared memory reduction
 const DELTANET_BACKWARD_CU: &str = r#"
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    val += __shfl_down_sync(0xFFFFFFFF, val, 16);
+    val += __shfl_down_sync(0xFFFFFFFF, val, 8);
+    val += __shfl_down_sync(0xFFFFFFFF, val, 4);
+    val += __shfl_down_sync(0xFFFFFFFF, val, 2);
+    val += __shfl_down_sync(0xFFFFFFFF, val, 1);
+    return val;
+}
+
 extern "C" __global__ void deltanet_backward(
-    const float* __restrict__ q,       // [H, T, dk]
-    const float* __restrict__ k,       // [H, T, dk]
-    const float* __restrict__ v,       // [H, T, dv]
-    const float* __restrict__ beta,    // [H, T]
-    const float* __restrict__ g,       // [H, T]
-    const float* __restrict__ d_out,   // [H, T, dv]
-    const float* __restrict__ all_s,   // [H, T, dk, dv] — stored S_{t-1} from forward
-    float* __restrict__ d_q_out,       // [H, T, dk]
-    float* __restrict__ d_k_out,       // [H, T, dk]
-    float* __restrict__ d_v_out,       // [H, T, dv]
-    float* __restrict__ d_beta_out,    // [H, T]
-    float* __restrict__ d_g_out,       // [H, T]
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ beta,
+    const float* __restrict__ g,
+    const float* __restrict__ d_out,
+    const float* __restrict__ all_s,
+    float* __restrict__ d_q_out,
+    float* __restrict__ d_k_out,
+    float* __restrict__ d_v_out,
+    float* __restrict__ d_beta_out,
+    float* __restrict__ d_g_out,
     int seq_len, int dk, int dv)
 {
     int h = blockIdx.x;
-    int j = threadIdx.x;  // 0..dv-1
+    int j = threadIdx.x;
+    int lane = j & 31;
+    int warp_id = j >> 5;
+    int num_warps = (dv + 31) >> 5;
 
     extern __shared__ float smem[];
     float* k_buf = smem;
     float* q_buf = smem + dk;
+    float* warp_buf = smem + 2 * dk;  // [num_warps] for cross-warp reduce
 
-    // dS accumulator in registers/global
-    // Use state_buf area (reuse from forward, but we need separate alloc)
-    // Actually just use a per-head global memory area
-    // We'll index into a workspace: d_s_buf[H * dk * dv]
-    // Pass it as the first part of all_s (caller provides separate buffer)
-    // For simplicity, allocate dS column in registers
-    float dS_col[128];  // max dk=128, one column per thread j
+    float dS_col[128];
     for (int i = 0; i < dk; i++) dS_col[i] = 0.0f;
 
     int off_qk = h * seq_len * dk;
@@ -394,61 +403,92 @@ extern "C" __global__ void deltanet_backward(
         __syncthreads();
 
         float beta_t = beta[off_bg + t];
-        float g_t = g[off_bg + t];
-        float exp_g_t = expf(g_t);
+        float exp_g_t = expf(g[off_bg + t]);
         float v_j = v[off_v + t * dv + j];
         float do_j = d_out[off_v + t * dv + j];
 
-        // Load S_{t-1}[i][j] for this column j
         float s_prev_col[128];
         for (int i = 0; i < dk; i++)
             s_prev_col[i] = all_s[off_st + (long long)t * dk * dv + i * dv + j];
 
-        // Reconstruct e[j] = v[j] - sum_i S_{t-1}[i][j] * k[i]
         float r_j = 0.0f;
         for (int i = 0; i < dk; i++)
             r_j = __fmaf_rn(s_prev_col[i], k_buf[i], r_j);
         float e_j = v_j - r_j;
 
-        // Reconstruct S_t[i][j]
         float be = beta_t * e_j;
         float s_t_col[128];
         for (int i = 0; i < dk; i++)
             s_t_col[i] = __fmaf_rn(exp_g_t, s_prev_col[i], k_buf[i] * be);
 
-        // dS[i][j] += q[i] * do[j]
         for (int i = 0; i < dk; i++)
             dS_col[i] += q_buf[i] * do_j;
 
-        // dq[t][i] = sum_j S_t[i][j] * do[j] — needs cross-thread reduction
-        for (int i = 0; i < dk; i++)
-            atomicAdd(&d_q_out[off_qk + t * dk + i], s_t_col[i] * do_j);
+        // d_q[t][i] = sum_j(S_t[i][j] * do[j]) — warp reduce
+        for (int i = 0; i < dk; i++) {
+            float val = warp_reduce_sum(s_t_col[i] * do_j);
+            if (lane == 0) warp_buf[warp_id] = val;
+            __syncthreads();
+            if (j == 0) {
+                float total = 0.0f;
+                for (int w = 0; w < num_warps; w++) total += warp_buf[w];
+                d_q_out[off_qk + t * dk + i] = total;
+            }
+            __syncthreads();
+        }
 
-        // dst_k[j] = sum_i dS[i][j] * k[i]
         float dst_k_j = 0.0f;
         for (int i = 0; i < dk; i++)
             dst_k_j = __fmaf_rn(dS_col[i], k_buf[i], dst_k_j);
 
-        // dk[t][i] = beta * (sum_j dS[i][j]*e[j] - sum_j S_{t-1}[i][j]*dst_k[j])
-        for (int i = 0; i < dk; i++)
-            atomicAdd(&d_k_out[off_qk + t * dk + i], beta_t * (dS_col[i] * e_j - s_prev_col[i] * dst_k_j));
+        // d_k[t][i] = beta * sum_j(dS[i][j]*e[j] - S_{t-1}[i][j]*dst_k[j])
+        for (int i = 0; i < dk; i++) {
+            float contrib = beta_t * (dS_col[i] * e_j - s_prev_col[i] * dst_k_j);
+            float val = warp_reduce_sum(contrib);
+            if (lane == 0) warp_buf[warp_id] = val;
+            __syncthreads();
+            if (j == 0) {
+                float total = 0.0f;
+                for (int w = 0; w < num_warps; w++) total += warp_buf[w];
+                d_k_out[off_qk + t * dk + i] = total;
+            }
+            __syncthreads();
+        }
 
-        // dv[t][j] = beta * dst_k[j]
         d_v_out[off_v + t * dv + j] = beta_t * dst_k_j;
 
-        // d_beta[t] = sum_{i,j} dS[i][j] * k[i] * e[j] → chain sigmoid
-        float d_beta_contrib = 0.0f;
-        for (int i = 0; i < dk; i++)
-            d_beta_contrib += dS_col[i] * k_buf[i] * e_j;
-        atomicAdd(&d_beta_out[off_bg + t], d_beta_contrib * beta_t * (1.0f - beta_t));
+        // d_beta[t] = sum_{i,j}(dS[i][j]*k[i]*e[j]) * beta*(1-beta)
+        {
+            float db = 0.0f;
+            for (int i = 0; i < dk; i++)
+                db += dS_col[i] * k_buf[i] * e_j;
+            float val = warp_reduce_sum(db);
+            if (lane == 0) warp_buf[warp_id] = val;
+            __syncthreads();
+            if (j == 0) {
+                float total = 0.0f;
+                for (int w = 0; w < num_warps; w++) total += warp_buf[w];
+                d_beta_out[off_bg + t] = total * beta_t * (1.0f - beta_t);
+            }
+            __syncthreads();
+        }
 
-        // d_g[t] = exp_g * frobenius(dS, S_{t-1})
-        float frob = 0.0f;
-        for (int i = 0; i < dk; i++)
-            frob += dS_col[i] * s_prev_col[i];
-        atomicAdd(&d_g_out[off_bg + t], exp_g_t * frob);
+        // d_g[t] = exp_g * sum_{i,j}(dS[i][j]*S_{t-1}[i][j])
+        {
+            float fr = 0.0f;
+            for (int i = 0; i < dk; i++)
+                fr += dS_col[i] * s_prev_col[i];
+            float val = warp_reduce_sum(fr);
+            if (lane == 0) warp_buf[warp_id] = val;
+            __syncthreads();
+            if (j == 0) {
+                float total = 0.0f;
+                for (int w = 0; w < num_warps; w++) total += warp_buf[w];
+                d_g_out[off_bg + t] = total * exp_g_t;
+            }
+            __syncthreads();
+        }
 
-        // dS update: dS = exp_g * dS - beta * k ⊗ dst_k
         for (int i = 0; i < dk; i++)
             dS_col[i] = exp_g_t * dS_col[i] - beta_t * k_buf[i] * dst_k_j;
         __syncthreads();
@@ -4882,10 +4922,11 @@ pub fn cuda_deltanet_backward_from_vram(
     let mut dbeta_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_bg).expect("dbeta");
     let mut dg_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_bg).expect("dg");
 
+    let num_warps = (dv + 31) / 32;
     let cfg = LaunchConfig {
         grid_dim: (num_heads as u32, 1, 1),
         block_dim: (dv as u32, 1, 1),
-        shared_mem_bytes: (dk * 2 * 4) as u32,
+        shared_mem_bytes: ((dk * 2 + num_warps) * 4) as u32,
     };
 
     {
