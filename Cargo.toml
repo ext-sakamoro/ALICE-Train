@@ -2,7 +2,7 @@
 name = "alice-train"
 version = "0.2.0"
 edition = "2021"
-authors = ["Moroya Sakamoto"]
+authors = ["Moroya Sakamoto <sakamoro@alicelaw.net>"]
 description = "Backpropagation & Training Framework for ALICE-ML ternary networks"
 license = "AGPL-3.0"
 repository = "https://github.com/ext-sakamoro/ALICE-Train"
