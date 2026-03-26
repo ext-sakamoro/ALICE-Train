@@ -29,6 +29,11 @@ path = "src/bin/train_qat_qwen35.rs"
 required-features = ["qat-cli"]
 
 [[bin]]
+name = "export-ternary"
+path = "src/bin/export_ternary.rs"
+required-features = ["qat-cli"]
+
+[[bin]]
 name = "train-debug"
 path = "src/bin/train_debug.rs"
 required-features = ["qat-cli"]

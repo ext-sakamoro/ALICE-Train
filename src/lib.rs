@@ -90,6 +90,7 @@ pub mod dataloader;
 pub mod deltanet;
 pub mod distill;
 pub mod evaluator;
+pub mod export;
 pub mod fast_math;
 pub mod fp32_cache;
 pub mod llama;
@@ -127,6 +128,10 @@ pub use checkpoint::{CheckpointData, CheckpointMeta};
 pub use dataloader::{Batch, DataLoader, DataLoaderConfig, MmapDataset};
 pub use distill::{DistillConfig, DistillEpochResult, DistillTrainer};
 pub use evaluator::{evaluate, BestCheckpointTracker, EvalResult};
+pub use export::{
+    dequantize, export_alice_model, pack_ternary, quantize_and_pack, read_alice_meta,
+    unpack_ternary, AliceModelMeta, ExportStats, LayerScales,
+};
 pub use logger::{compute_grad_norm, LogEntry, TrainLog};
 pub use mixed_precision::{
     bf16_to_f32_batch, bf16_to_f32_vec, f32_to_bf16_batch, f32_to_bf16_vec, Bf16, LossScaler,
