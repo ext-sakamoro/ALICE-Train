@@ -34,6 +34,11 @@ path = "src/bin/export_ternary.rs"
 required-features = ["qat-cli"]
 
 [[bin]]
+name = "alice-inference"
+path = "src/bin/alice_inference.rs"
+required-features = ["qat-cli"]
+
+[[bin]]
 name = "train-debug"
 path = "src/bin/train_debug.rs"
 required-features = ["qat-cli"]

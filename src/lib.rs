@@ -93,6 +93,7 @@ pub mod evaluator;
 pub mod export;
 pub mod fast_math;
 pub mod fp32_cache;
+pub mod inference;
 pub mod llama;
 pub mod llama_backward;
 pub mod llama_forward;
@@ -107,6 +108,7 @@ pub mod qwen35_forward;
 #[cfg(feature = "qat-cli")]
 pub mod safetensors_loader;
 pub mod scheduler;
+pub mod tokenizer;
 pub mod trainer;
 
 // GPU モジュール (feature gate)
