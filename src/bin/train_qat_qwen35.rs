@@ -610,8 +610,11 @@ fn main() {
         let seq_len = config.seq_len;
         let mut collapse_countdown: i32 = -1; // -1 = 正常, >0 = 崩壊猶予カウント
         let mut last_ckpt_time = Instant::now();
-        let mut prev_ckpt_step: Option<usize> = None;
+        const CKPT_KEEP_COUNT: usize = 10; // チェックポイント保持世代数
+        let mut ckpt_history: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
         let mut last_loss = 0.0f32;
+        let mut stuck_loss_count: usize = 0; // 同一loss連続カウント
+        let mut stuck_loss_value: f32 = 0.0;
 
         while global_step < config.total_steps {
             let lr = scheduler.get_lr(global_step);
@@ -943,19 +946,38 @@ fn main() {
 
             log.append(LogEntry::new(0, global_step, avg_loss, lr, 0.0));
 
-            // ── 崩壊検知 (NaN/Inf/異常Loss) → 自動停止 ──
-            if avg_loss.is_nan() || avg_loss.is_infinite() {
+            // ── 崩壊検知 (NaN/Inf/異常Loss/固定Loss) → 自動停止 ──
+            let is_collapsed = avg_loss.is_nan()
+                || avg_loss.is_infinite()
+                || (global_step > 200 && avg_loss > 15.0);
+
+            // 固定Loss検知: 同じ値が5step以上続く = モデル崩壊
+            if (avg_loss - stuck_loss_value).abs() < 1e-4 {
+                stuck_loss_count += 1;
+            } else {
+                stuck_loss_count = 0;
+                stuck_loss_value = avg_loss;
+            }
+            let is_stuck = stuck_loss_count >= 5 && global_step > 200;
+
+            if is_collapsed || is_stuck {
+                let reason = if avg_loss.is_nan() || avg_loss.is_infinite() {
+                    "NaN/Inf"
+                } else if is_stuck {
+                    "固定Loss (モデル崩壊)"
+                } else {
+                    "異常Loss上昇"
+                };
                 eprintln!("╔══════════════════════════════════════════════════════════╗");
-                eprintln!("║  *** 崩壊検知: Loss = {avg_loss} — 学習を緊急停止 ***      ║");
+                eprintln!("║  *** 崩壊検知: {reason} — 学習を緊急停止 ***");
                 eprintln!("╚══════════════════════════════════════════════════════════╝");
-                eprintln!("  step: {global_step}, lr: {lr:.2e}");
-                eprintln!("  最終正常チェックポイントから再開してください。");
-                // ログ保存
+                eprintln!("  step: {global_step}, loss: {avg_loss:.4}, lr: {lr:.2e}");
+                eprintln!("  fp32_cacheは書き戻しません（崩壊前の重みを保全）");
                 let log_path = format!("{}/train_log.csv", config.checkpoint_dir);
                 let _ = log.save_csv_to_file(&log_path);
                 let crash_json = format!(
-                    "{{\"step\":{},\"loss\":{:.6},\"lr\":{:.2e},\"status\":\"COLLAPSED\"}}",
-                    global_step, avg_loss, lr
+                    "{{\"step\":{},\"loss\":{:.6},\"lr\":{:.2e},\"status\":\"COLLAPSED\",\"reason\":\"{}\"}}",
+                    global_step, avg_loss, lr, reason
                 );
                 let _ = fs::write(
                     format!("{}/resume_state.json", config.checkpoint_dir),
@@ -963,17 +985,15 @@ fn main() {
                 );
                 std::process::exit(1);
             }
-            // Loss 異常上昇検知 — 10ステップ猶予後に自動停止
+            // Loss 緩やかな上昇検知 — 5ステップ猶予後に自動停止
             if global_step > 100 {
                 if let Some(prev) = log.entries().iter().rev().nth(10) {
-                    // 10ステップ前と比較して3倍以上かつ絶対値50超
-                    if prev.loss > 0.0 && avg_loss > prev.loss * 3.0 && avg_loss > 50.0 {
+                    if prev.loss > 0.0 && avg_loss > prev.loss * 2.0 && avg_loss > 12.0 {
                         if collapse_countdown < 0 {
-                            collapse_countdown = 10;
-                            eprintln!("  *** 崩壊警告: Loss {:.2} → {:.2} (3倍超) — 残り{collapse_countdown}ステップで自動停止 ***", prev.loss, avg_loss);
+                            collapse_countdown = 5;
+                            eprintln!("  *** 崩壊警告: Loss {:.2} → {:.2} (2倍超) — 残り{collapse_countdown}ステップで自動停止 ***", prev.loss, avg_loss);
                         }
                     } else if collapse_countdown > 0 {
-                        // 回復した
                         eprintln!("  崩壊警告解除: Loss回復 ({avg_loss:.4})");
                         collapse_countdown = -1;
                     }
@@ -986,6 +1006,7 @@ fn main() {
                     eprintln!("║  *** 崩壊確定: Loss回復せず — 学習を自動停止 ***        ║");
                     eprintln!("╚══════════════════════════════════════════════════════════╝");
                     eprintln!("  step: {global_step}, loss: {avg_loss:.4}");
+                    eprintln!("  fp32_cacheは書き戻しません（崩壊前の重みを保全）");
                     let log_path = format!("{}/train_log.csv", config.checkpoint_dir);
                     let _ = log.save_csv_to_file(&log_path);
                     let crash_json = format!(
@@ -1104,15 +1125,17 @@ fn main() {
                     eprintln!("  チェックポイント保存失敗: {e}");
                 }
 
-                // 2世代前を削除
-                if let Some(old_old) = prev_ckpt_step {
-                    let old_path = format!("{}/step_{old_old}.bin", config.checkpoint_dir);
-                    if std::path::Path::new(&old_path).exists() {
-                        let _ = std::fs::remove_file(&old_path);
-                        println!("    古いチェックポイント削除: {old_path}");
+                // 10世代保持 — 崩壊時にロールバック可能
+                ckpt_history.push_back(global_step);
+                if ckpt_history.len() > CKPT_KEEP_COUNT {
+                    if let Some(oldest) = ckpt_history.pop_front() {
+                        let old_path = format!("{}/step_{oldest}.bin", config.checkpoint_dir);
+                        if std::path::Path::new(&old_path).exists() {
+                            let _ = std::fs::remove_file(&old_path);
+                            println!("    古いチェックポイント削除: {old_path}");
+                        }
                     }
                 }
-                prev_ckpt_step = Some(global_step);
                 last_ckpt_time = Instant::now();
             }
 
