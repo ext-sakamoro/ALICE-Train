@@ -33,7 +33,7 @@ struct Args {
     model_path: String,
 
     /// 出力 .alice ファイルパス。
-    #[arg(long, short, default_value = "qwen35_9b_ternary.alice")]
+    #[arg(long, short, default_value = "ALICE-Cognitive-9B-Ternary.alice")]
     output: String,
 
     /// 元チェックポイントのステップ番号。

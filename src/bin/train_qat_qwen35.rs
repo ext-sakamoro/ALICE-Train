@@ -1163,7 +1163,7 @@ fn main() {
                 Some(lm_head.as_slice())
             };
 
-            let output_path = format!("{}/qwen35_9b_ternary.alice", config.checkpoint_dir);
+            let output_path = format!("{}/ALICE-Cognitive-9B-Ternary.alice", config.checkpoint_dir);
             match std::fs::File::create(&output_path) {
                 Ok(file) => {
                     let mut writer = std::io::BufWriter::new(file);
