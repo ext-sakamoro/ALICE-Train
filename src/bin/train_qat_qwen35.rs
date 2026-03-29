@@ -783,22 +783,23 @@ fn main() {
 
                 if config.preload_all_layers {
                     // ── Preloaded Gradient Checkpointing ──
-                    // 重みはRAM常駐、活性化は1層分のみ保持 → OOM回避
-                    // Forward: eval mode (cache なし) → 各層入力を保存
-                    // Backward: 逆順で forward 再計算 (cache生成) → backward → weight update
                     use alice_train::qwen35_forward::qwen35_layer_forward;
 
                     let num_l = config.model.num_hidden_layers;
+                    let profile = global_step < 3 && b == 0; // 最初の3 stepでプロファイル
 
                     // 1. Embedding
+                    let t_embed = Instant::now();
                     let mut hidden_states = vec![0.0f32; seq_len * hidden];
                     for (t, &tok) in token_ids.iter().enumerate() {
                         let tok = (tok as usize) % vocab_size;
                         hidden_states[t * hidden..(t + 1) * hidden]
                             .copy_from_slice(&embedding_table[tok * hidden..(tok + 1) * hidden]);
                     }
+                    let embed_ms = t_embed.elapsed().as_millis();
 
-                    // 2. Eval forward: 各層入力を保存、activation cache は保存しない
+                    // 2. Eval forward: 各層入力を保存
+                    let t_fwd = Instant::now();
                     let mut saved_inputs: Vec<Vec<f32>> = Vec::with_capacity(num_l);
                     for i in 0..num_l {
                         saved_inputs.push(hidden_states.clone());
@@ -809,8 +810,10 @@ fn main() {
                             seq_len,
                         );
                     }
+                    let fwd_ms = t_fwd.elapsed().as_millis();
 
                     // 3. Output norm + lm_head → logits
+                    let t_head = Instant::now();
                     alice_train::blas::blas_rmsnorm(
                         &mut hidden_states,
                         &output_norm,
@@ -827,8 +830,10 @@ fn main() {
                         hidden,
                     );
                     drop(hidden_states);
+                    let head_ms = t_head.elapsed().as_millis();
 
                     // 4. Loss + d_logits
+                    let t_loss = Instant::now();
                     let mut d_logits_all = vec![0.0f32; seq_len * vocab_size];
                     for t in 0..seq_len {
                         let target = batch.target_ids[b * seq_len + t] as usize % vocab_size;
@@ -839,8 +844,10 @@ fn main() {
                         d_logits_all[t * vocab_size..(t + 1) * vocab_size].copy_from_slice(&dl);
                     }
                     drop(logits);
+                    let loss_ms = t_loss.elapsed().as_millis();
 
                     // 5. Backward through lm_head
+                    let t_bwd_head = Instant::now();
                     let mut d_hidden = vec![0.0f32; seq_len * hidden];
                     alice_train::blas::blas_matmul_nn(
                         &d_logits_all,
@@ -851,8 +858,17 @@ fn main() {
                         vocab_size,
                     );
                     drop(d_logits_all);
+                    let bwd_head_ms = t_bwd_head.elapsed().as_millis();
+
+                    if profile {
+                        eprintln!(
+                            "  [PROFILE step={global_step} b={b}] embed={}ms fwd_32layers={}ms lm_head={}ms loss={}ms bwd_lm_head={}ms",
+                            embed_ms, fwd_ms, head_ms, loss_ms, bwd_head_ms,
+                        );
+                    }
 
                     // 6. Gradient checkpointing backward:
+                    let t_bwd_layers = Instant::now();
                     // DeltaNet層: GPU fused (VRAM state保持、step_caches不要)
                     // FullAttention層: 従来のforward再計算+backward
                     let inv_tokens = 1.0 / token_count.max(1) as f32;
@@ -933,6 +949,14 @@ fn main() {
                                 _ => {}
                             }
                         }
+                    }
+                    if profile {
+                        let bwd_layers_ms = t_bwd_layers.elapsed().as_millis();
+                        eprintln!(
+                            "  [PROFILE step={global_step} b={b}] bwd_32layers={}ms | total_micro_batch={}ms",
+                            bwd_layers_ms,
+                            embed_ms + fwd_ms + head_ms + loss_ms + bwd_head_ms + bwd_layers_ms,
+                        );
                     }
                 } else {
                     // ── Streaming gradient-checkpointing (FP32キャッシュ + CUDA) ──
