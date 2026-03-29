@@ -621,7 +621,13 @@ pub fn full_attn_layer_backward(
 ) -> Vec<f32> {
     let hidden = config.hidden_size;
     let inter = config.intermediate_size;
+    let num_heads = config.num_attention_heads;
+    let num_kv_heads = config.num_key_value_heads;
+    let head_dim = config.head_dim;
 
+    // ── 1. FFN backward ──
+    // d_output は FFN 出力の勾配 + residual
+    // FFN residual: d_ffn_residual = d_output
     let mut d_ffn_input = vec![0.0f32; seq_len * hidden];
     swiglu_ffn_backward(
         d_output,
@@ -641,9 +647,205 @@ pub fn full_attn_layer_backward(
         inter,
     );
 
+    // FFN residual add backward: d_pre_ffn = d_ffn_input + d_output
+    let mut d_pre_ffn = vec![0.0f32; seq_len * hidden];
+    for i in 0..seq_len * hidden {
+        d_pre_ffn[i] = d_ffn_input[i] + d_output[i];
+    }
+
+    // ── 2. O projection backward ──
+    // attn_out = attn_out_raw × o_proj^T → d_attn_out_raw = d_pre_ffn × o_proj
+    let mut d_attn_out_raw = vec![0.0f32; seq_len * num_heads * head_dim];
+    blas_matmul_nn(
+        &d_pre_ffn,
+        &weights.o_proj,
+        &mut d_attn_out_raw,
+        seq_len,
+        num_heads * head_dim,
+        hidden,
+    );
+
+    // d_o_proj: d_pre_ffn^T × attn_out_raw (cache.attn_out is post-o_proj, need pre-o_proj)
+    // We don't have pre-o_proj attn_out in cache directly.
+    // For weight grad accumulation: d_o_proj[h×(nh*hd)] += d_pre_ffn[seq×h]^T × attn_out_raw[seq×(nh*hd)]
+    // Skip o_proj weight grads for now (SGD updates projections in-place during forward)
+
+    // ── 3. GQA Attention backward ──
+    let llama_compat = crate::llama::LlamaConfig {
+        vocab_size: config.vocab_size,
+        hidden_dim: hidden,
+        intermediate_dim: inter,
+        num_heads,
+        num_kv_heads,
+        num_layers: config.num_hidden_layers,
+        max_seq_len: 262_144,
+        head_dim,
+        rope_theta: config.rope_theta,
+        norm_eps: config.rms_norm_eps,
+        attention_bias: false,
+    };
+
+    let mut d_q = vec![0.0f32; seq_len * num_heads * head_dim];
+    let mut d_k = vec![0.0f32; seq_len * num_kv_heads * head_dim];
+    let mut d_v = vec![0.0f32; seq_len * num_kv_heads * head_dim];
+
+    #[cfg(feature = "cuda")]
+    let used_cuda = {
+        if crate::blas::cuda_blas_available() {
+            let cuda_mtx = crate::blas::CUDA_MATMUL.get().unwrap();
+            let cuda = cuda_mtx.lock().unwrap();
+            crate::cuda_matmul::cuda_gqa_attention_backward(
+                &cuda,
+                &d_attn_out_raw,
+                &cache.attn_weights,
+                &cache.q,
+                &cache.k,
+                &cache.v,
+                &mut d_q,
+                &mut d_k,
+                &mut d_v,
+                &llama_compat,
+                seq_len,
+            );
+            true
+        } else {
+            false
+        }
+    };
+    #[cfg(not(feature = "cuda"))]
+    let used_cuda = false;
+
+    if !used_cuda {
+        // CPU fallback: per-head attention backward
+        let kv_group_size = num_heads / num_kv_heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let extract = |data: &[f32], head: usize, nh: usize, hd: usize, sl: usize| -> Vec<f32> {
+            let stride = nh * hd;
+            let mut out = vec![0.0f32; sl * hd];
+            for t in 0..sl {
+                out[t * hd..(t + 1) * hd]
+                    .copy_from_slice(&data[t * stride + head * hd..t * stride + (head + 1) * hd]);
+            }
+            out
+        };
+        let scatter =
+            |src: &[f32], dst: &mut [f32], head: usize, nh: usize, hd: usize, sl: usize| {
+                let stride = nh * hd;
+                for t in 0..sl {
+                    dst[t * stride + head * hd..t * stride + (head + 1) * hd]
+                        .copy_from_slice(&src[t * hd..(t + 1) * hd]);
+                }
+            };
+        let accumulate =
+            |src: &[f32], dst: &mut [f32], head: usize, nh: usize, hd: usize, sl: usize| {
+                let stride = nh * hd;
+                for t in 0..sl {
+                    for d in 0..hd {
+                        dst[t * stride + head * hd + d] += src[t * hd + d];
+                    }
+                }
+            };
+        let softmax_bwd = |d_aw: &[f32], aw: &[f32], sl: usize| -> Vec<f32> {
+            let mut ds = vec![0.0f32; sl * sl];
+            for t in 0..sl {
+                let a_row = &aw[t * sl..(t + 1) * sl];
+                let d_row = &d_aw[t * sl..(t + 1) * sl];
+                let dot: f32 = a_row.iter().zip(d_row.iter()).map(|(a, d)| a * d).sum();
+                for s in 0..sl {
+                    ds[t * sl + s] = a_row[s] * (d_row[s] - dot);
+                }
+            }
+            ds
+        };
+        let matmul_tn =
+            |a: &[f32], b: &[f32], rows_a: usize, cols_b: usize, inner: usize| -> Vec<f32> {
+                let mut out = vec![0.0f32; rows_a * cols_b];
+                for r in 0..rows_a {
+                    for c in 0..cols_b {
+                        let mut s = 0.0f32;
+                        for t in 0..inner {
+                            s += a[t * rows_a + r] * b[t * cols_b + c];
+                        }
+                        out[r * cols_b + c] = s;
+                    }
+                }
+                out
+            };
+
+        for h in 0..num_heads {
+            let kv_h = h / kv_group_size;
+            let d_out_h = extract(&d_attn_out_raw, h, num_heads, head_dim, seq_len);
+            let v_h = extract(&cache.v, kv_h, num_kv_heads, head_dim, seq_len);
+            let aw_h = &cache.attn_weights[h * seq_len * seq_len..(h + 1) * seq_len * seq_len];
+
+            let mut d_attn_w = vec![0.0f32; seq_len * seq_len];
+            blas_matmul_bt(&d_out_h, &v_h, &mut d_attn_w, seq_len, seq_len, head_dim);
+
+            let d_v_h = matmul_tn(aw_h, &d_out_h, seq_len, head_dim, seq_len);
+            accumulate(&d_v_h, &mut d_v, kv_h, num_kv_heads, head_dim, seq_len);
+
+            let mut d_scores = softmax_bwd(&d_attn_w, aw_h, seq_len);
+            for s in &mut d_scores {
+                *s *= scale;
+            }
+
+            let k_h = extract(&cache.k, kv_h, num_kv_heads, head_dim, seq_len);
+            let mut d_q_h = vec![0.0f32; seq_len * head_dim];
+            blas_matmul_nn(&d_scores, &k_h, &mut d_q_h, seq_len, head_dim, seq_len);
+            scatter(&d_q_h, &mut d_q, h, num_heads, head_dim, seq_len);
+
+            let q_h = extract(&cache.q, h, num_heads, head_dim, seq_len);
+            let d_k_h = matmul_tn(&d_scores, &q_h, seq_len, head_dim, seq_len);
+            accumulate(&d_k_h, &mut d_k, kv_h, num_kv_heads, head_dim, seq_len);
+        }
+    }
+
+    // ── 4. QKV projection backward → d_normed_attn ──
+    // d_normed = d_q × q_proj + d_k × k_proj + d_v × v_proj
+    let mut d_normed = vec![0.0f32; seq_len * hidden];
+    {
+        let mut tmp = vec![0.0f32; seq_len * hidden];
+        blas_matmul_nn(
+            &d_q,
+            &weights.q_proj,
+            &mut tmp,
+            seq_len,
+            hidden,
+            num_heads * head_dim,
+        );
+        for i in 0..seq_len * hidden {
+            d_normed[i] += tmp[i];
+        }
+        blas_matmul_nn(
+            &d_k,
+            &weights.k_proj,
+            &mut tmp,
+            seq_len,
+            hidden,
+            num_kv_heads * head_dim,
+        );
+        for i in 0..seq_len * hidden {
+            d_normed[i] += tmp[i];
+        }
+        blas_matmul_nn(
+            &d_v,
+            &weights.v_proj,
+            &mut tmp,
+            seq_len,
+            hidden,
+            num_kv_heads * head_dim,
+        );
+        for i in 0..seq_len * hidden {
+            d_normed[i] += tmp[i];
+        }
+    }
+
+    // ── 5. Attention residual backward ──
+    // d_input = d_normed (through layernorm is identity for eval) + d_pre_ffn (residual)
     let mut d_input = vec![0.0f32; seq_len * hidden];
     for i in 0..seq_len * hidden {
-        d_input[i] = d_ffn_input[i] + d_output[i] + d_output[i]; // FFN + 2× residual
+        d_input[i] = d_normed[i] + d_pre_ffn[i];
     }
 
     d_input

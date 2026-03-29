@@ -2166,7 +2166,7 @@ impl CudaLayerWorkspace {
 // ── CUDA GQA Attention ──────────────────────────────────────────────────
 
 /// ヘッドデータ抽出: interleaved [seq_len, num_heads * head_dim] → [seq_len, head_dim]
-fn extract_head(
+pub fn extract_head(
     data: &[f32],
     head: usize,
     num_heads: usize,
@@ -2183,7 +2183,7 @@ fn extract_head(
 }
 
 /// ヘッドデータ書き戻し: [seq_len, head_dim] → interleaved [seq_len, num_heads * head_dim]
-fn scatter_head(
+pub fn scatter_head(
     src: &[f32],
     dst: &mut [f32],
     head: usize,
@@ -2199,7 +2199,7 @@ fn scatter_head(
 }
 
 /// ヘッドデータ加算: [seq_len, head_dim] を interleaved dst に加算（GQA 用）
-fn accumulate_head(
+pub fn accumulate_head(
     src: &[f32],
     dst: &mut [f32],
     head: usize,
@@ -2244,7 +2244,7 @@ fn causal_softmax(scores: &mut [f32], seq_len: usize) {
 }
 
 /// Softmax backward (in-place): d_scores = attn * (d_attn_w - row_dot)
-fn softmax_backward(d_attn_w: &[f32], attn: &[f32], seq_len: usize) -> Vec<f32> {
+pub fn softmax_backward(d_attn_w: &[f32], attn: &[f32], seq_len: usize) -> Vec<f32> {
     let mut d_scores = vec![0.0f32; seq_len * seq_len];
     d_scores
         .par_chunks_exact_mut(seq_len)
