@@ -801,16 +801,28 @@ fn main() {
                     // 2. Eval forward: 各層入力を保存
                     let t_fwd = Instant::now();
                     let mut saved_inputs: Vec<Vec<f32>> = Vec::with_capacity(num_l);
+                    let mut clone_ms_total = 0u128;
+                    let mut layer_ms_total = 0u128;
                     for i in 0..num_l {
+                        let tc = Instant::now();
                         saved_inputs.push(hidden_states.clone());
+                        clone_ms_total += tc.elapsed().as_millis();
+                        let tl = Instant::now();
                         alice_train::qwen35_forward::qwen35_layer_forward_eval_inplace(
                             &mut hidden_states,
                             &layers[i],
                             &config.model,
                             seq_len,
                         );
+                        layer_ms_total += tl.elapsed().as_millis();
                     }
                     let fwd_ms = t_fwd.elapsed().as_millis();
+                    if profile {
+                        eprintln!(
+                            "  [FWD_DETAIL] clone_inputs={}ms layers={}ms total={}ms",
+                            clone_ms_total, layer_ms_total, fwd_ms,
+                        );
+                    }
 
                     // 3. Output norm + lm_head → logits
                     let t_head = Instant::now();
