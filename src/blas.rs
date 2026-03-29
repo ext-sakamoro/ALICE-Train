@@ -258,6 +258,25 @@ pub fn blas_swiglu_ffn(
     hidden_dim: usize,
     intermediate_dim: usize,
 ) {
+    // CUDA fused path: input H2D 1回 + gemm×3 + GPU SiLU + D2H 1回
+    #[cfg(feature = "cuda")]
+    if let Some(cuda_mtx) = CUDA_MATMUL.get() {
+        let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+        crate::cuda_matmul::cuda_swiglu_ffn_fused(
+            &cuda,
+            input,
+            gate_proj,
+            up_proj,
+            down_proj,
+            output,
+            seq_len,
+            hidden_dim,
+            intermediate_dim,
+        );
+        return;
+    }
+
+    // CPU fallback
     // gate = input × gate_proj^T
     blas_matmul_bt(
         input,

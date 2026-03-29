@@ -5598,3 +5598,158 @@ pub fn cuda_deltanet_fused_fwd_bwd(
         .memcpy_dtoh(&dg_gpu.slice(..total_bg), &mut d_g[..total_bg])
         .expect("dg D2H");
 }
+
+// ── Fused SwiGLU FFN (GPU 完結) ─────────────────────────────────────────────
+
+/// Fused SwiGLU FFN — gate/up gemm + SiLU*up + down gemm をGPU上で完結。
+///
+/// 従来: H2D(input)×2 + gemm×3 + D2H×3 + CPU SiLU = 6 H2D/D2H + CPU往復
+/// fused: H2D(input)×1 + H2D(proj)×3 + gemm×3 + GPU SiLU + D2H(output)×1
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_swiglu_ffn_fused(
+    cuda: &CudaMatmul,
+    input: &[f32],
+    gate_proj: &[f32],
+    up_proj: &[f32],
+    down_proj: &[f32],
+    output: &mut [f32],
+    seq_len: usize,
+    hidden: usize,
+    inter: usize,
+) {
+    let input_size = seq_len * hidden;
+    let proj_size = inter * hidden;
+    let gate_out_size = seq_len * inter;
+
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_a, input_size);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_b, proj_size);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_c, gate_out_size);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_d, gate_out_size);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_e, gate_out_size);
+    CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_scores, input_size);
+
+    // 1. H2D: input (1回のみ)
+    {
+        let mut ba = cuda.buf_a.borrow_mut();
+        cuda.stream
+            .memcpy_htod(&input[..input_size], &mut ba.buf.slice_mut(..input_size))
+            .expect("FFN: input H2D");
+    }
+
+    let gemm_bt = |cuda: &CudaMatmul,
+                   proj_buf: &RefCell<GpuBuf>,
+                   out_buf: &RefCell<GpuBuf>,
+                   m: usize,
+                   n: usize,
+                   k: usize| {
+        let ba = cuda.buf_a.borrow();
+        let bp = proj_buf.borrow();
+        let mut bo = out_buf.borrow_mut();
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_T,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha: 1.0f32,
+            lda: k as i32,
+            ldb: k as i32,
+            beta: 0.0f32,
+            ldc: n as i32,
+        };
+        unsafe {
+            cuda.blas
+                .gemm(
+                    cfg,
+                    &bp.buf.slice(..n * k),
+                    &ba.buf.slice(..m * k),
+                    &mut bo.buf.slice_mut(..m * n),
+                )
+                .unwrap();
+        }
+    };
+
+    // 2. gate_proj H2D + gemm
+    {
+        let mut bb = cuda.buf_b.borrow_mut();
+        cuda.stream
+            .memcpy_htod(&gate_proj[..proj_size], &mut bb.buf.slice_mut(..proj_size))
+            .expect("FFN: gate_proj H2D");
+    }
+    gemm_bt(cuda, &cuda.buf_b, &cuda.buf_c, seq_len, inter, hidden);
+
+    // 3. up_proj H2D + gemm (input GPU残存)
+    {
+        let mut bb = cuda.buf_b.borrow_mut();
+        cuda.stream
+            .memcpy_htod(&up_proj[..proj_size], &mut bb.buf.slice_mut(..proj_size))
+            .expect("FFN: up_proj H2D");
+    }
+    gemm_bt(cuda, &cuda.buf_b, &cuda.buf_d, seq_len, inter, hidden);
+
+    // 4. GPU SiLU(gate) ⊙ up
+    {
+        let bc = cuda.buf_c.borrow();
+        let bd = cuda.buf_d.borrow();
+        let mut be = cuda.buf_e.borrow_mut();
+        let n_i32 = gate_out_size as i32;
+        let block = 256u32;
+        let grid = ((gate_out_size as u32 + block - 1) / block, 1, 1);
+        let cfg = LaunchConfig {
+            grid_dim: grid,
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = cuda.stream.launch_builder(&cuda.dn_swiglu_elem_func);
+        builder.arg(&bc.buf);
+        builder.arg(&bd.buf);
+        builder.arg(&mut be.buf);
+        builder.arg(&n_i32);
+        unsafe {
+            builder.launch(cfg).expect("FFN: swiglu elem");
+        }
+    }
+
+    // 5. down_proj H2D + gemm
+    {
+        let mut bb = cuda.buf_b.borrow_mut();
+        cuda.stream
+            .memcpy_htod(&down_proj[..proj_size], &mut bb.buf.slice_mut(..proj_size))
+            .expect("FFN: down_proj H2D");
+    }
+    {
+        let be = cuda.buf_e.borrow();
+        let bb = cuda.buf_b.borrow();
+        let mut bs = cuda.buf_scores.borrow_mut();
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_T,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: hidden as i32,
+            n: seq_len as i32,
+            k: inter as i32,
+            alpha: 1.0f32,
+            lda: inter as i32,
+            ldb: inter as i32,
+            beta: 0.0f32,
+            ldc: hidden as i32,
+        };
+        unsafe {
+            cuda.blas
+                .gemm(
+                    cfg,
+                    &bb.buf.slice(..proj_size),
+                    &be.buf.slice(..gate_out_size),
+                    &mut bs.buf.slice_mut(..input_size),
+                )
+                .unwrap();
+        }
+    }
+
+    // 6. D2H: output (1回のみ)
+    {
+        let bs = cuda.buf_scores.borrow();
+        cuda.stream
+            .memcpy_dtoh(&bs.buf.slice(..input_size), &mut output[..input_size])
+            .expect("FFN: output D2H");
+    }
+}
