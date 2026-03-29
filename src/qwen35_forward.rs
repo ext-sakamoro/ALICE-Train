@@ -414,15 +414,41 @@ fn full_attn_layer_forward(
 
     let mut attn_out_raw = vec![0.0f32; seq_len * num_heads * head_dim];
     let mut attn_weights = vec![0.0f32; num_heads * seq_len * seq_len];
-    gqa_attention(
-        &q,
-        &k,
-        &v,
-        &mut attn_out_raw,
-        &mut attn_weights,
-        &llama_compat,
-        seq_len,
-    );
+
+    #[cfg(feature = "cuda")]
+    let used_cuda_attn = {
+        if crate::blas::cuda_blas_available() {
+            let cuda_mtx = crate::blas::CUDA_MATMUL.get().unwrap();
+            let cuda = cuda_mtx.lock().unwrap();
+            crate::cuda_matmul::cuda_gqa_attention(
+                &cuda,
+                &q,
+                &k,
+                &v,
+                &mut attn_out_raw,
+                &mut attn_weights,
+                &llama_compat,
+                seq_len,
+            );
+            true
+        } else {
+            false
+        }
+    };
+    #[cfg(not(feature = "cuda"))]
+    let used_cuda_attn = false;
+
+    if !used_cuda_attn {
+        gqa_attention(
+            &q,
+            &k,
+            &v,
+            &mut attn_out_raw,
+            &mut attn_weights,
+            &llama_compat,
+            seq_len,
+        );
+    }
 
     let mut attn_out = vec![0.0f32; seq_len * hidden];
     blas_matmul_bt(
@@ -911,15 +937,42 @@ fn full_attn_layer_forward_eval(
 
     let mut attn_out_raw = vec![0.0f32; seq_len * num_heads * head_dim];
     let mut attn_weights = vec![0.0f32; num_heads * seq_len * seq_len];
-    gqa_attention(
-        &q,
-        &k,
-        &v,
-        &mut attn_out_raw,
-        &mut attn_weights,
-        &llama_compat,
-        seq_len,
-    );
+
+    // CUDA GQA Attention (GPU: Q×K^T + causal softmax + attn×V)
+    #[cfg(feature = "cuda")]
+    let used_cuda_attn = {
+        if crate::blas::cuda_blas_available() {
+            let cuda_mtx = crate::blas::CUDA_MATMUL.get().unwrap();
+            let cuda = cuda_mtx.lock().unwrap();
+            crate::cuda_matmul::cuda_gqa_attention(
+                &cuda,
+                &q,
+                &k,
+                &v,
+                &mut attn_out_raw,
+                &mut attn_weights,
+                &llama_compat,
+                seq_len,
+            );
+            true
+        } else {
+            false
+        }
+    };
+    #[cfg(not(feature = "cuda"))]
+    let used_cuda_attn = false;
+
+    if !used_cuda_attn {
+        gqa_attention(
+            &q,
+            &k,
+            &v,
+            &mut attn_out_raw,
+            &mut attn_weights,
+            &llama_compat,
+            seq_len,
+        );
+    }
 
     let mut attn_out = vec![0.0f32; seq_len * hidden];
     blas_matmul_bt(
