@@ -576,6 +576,10 @@ fn deltanet_layer_forward_eval(
     config: &Qwen35Config,
     seq_len: usize,
 ) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static LAYER_PROFILE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let profile_layer = LAYER_PROFILE_COUNT.fetch_add(1, Ordering::Relaxed) < 2; // 最初の2層のみ
+
     let hidden = config.hidden_size;
     let key_dim = config.linear_key_dim();
     let val_dim = config.linear_value_dim();
@@ -586,6 +590,8 @@ fn deltanet_layer_forward_eval(
     let kernel_size = config.linear_conv_kernel_dim;
     let qkv_dim = key_dim * 2 + val_dim;
 
+    let t_layer_start = std::time::Instant::now();
+
     let residual_attn = input.clone();
     let mut normed = input.clone();
     blas_rmsnorm(
@@ -595,6 +601,7 @@ fn deltanet_layer_forward_eval(
         config.rms_norm_eps,
     );
 
+    let t_matmul_start = std::time::Instant::now();
     let mut qkv = vec![0.0f32; seq_len * qkv_dim];
     blas_matmul_bt(
         &normed,
@@ -682,7 +689,10 @@ fn deltanet_layer_forward_eval(
         n_v_heads,
     );
 
+    let matmul_gates_ms = t_matmul_start.elapsed().as_millis();
+
     let mut attn_out_raw = vec![0.0f32; seq_len * n_v_heads * dv];
+    let t_recurrence = std::time::Instant::now();
 
     #[cfg(feature = "cuda")]
     {
@@ -730,6 +740,9 @@ fn deltanet_layer_forward_eval(
         );
     }
 
+    let recurrence_ms = t_recurrence.elapsed().as_millis();
+    let t_output = std::time::Instant::now();
+
     let mut attn_normed = vec![0.0f32; seq_len * val_dim];
     gated_rmsnorm(
         &attn_out_raw,
@@ -755,6 +768,7 @@ fn deltanet_layer_forward_eval(
     }
 
     // FFN
+    let t_ffn = std::time::Instant::now();
     let residual_ffn = input.clone();
     let mut normed_ffn = input.clone();
     blas_rmsnorm(
@@ -785,6 +799,16 @@ fn deltanet_layer_forward_eval(
 
     for i in 0..input.len() {
         input[i] = residual_ffn[i] + ffn_out[i];
+    }
+
+    let layer_total_ms = t_layer_start.elapsed().as_millis();
+    if profile_layer {
+        let output_ms = t_output.elapsed().as_millis() - t_ffn.elapsed().as_millis();
+        let ffn_ms = t_ffn.elapsed().as_millis();
+        eprintln!(
+            "  [LAYER_PROFILE] matmul+gates={}ms recurrence={}ms output_proj={}ms ffn={}ms total={}ms",
+            matmul_gates_ms, recurrence_ms, output_ms, ffn_ms, layer_total_ms,
+        );
     }
 }
 
