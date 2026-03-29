@@ -31,7 +31,7 @@
     "min_lr": 1e-6,
     "warmup_steps": 200,
     "total_steps": 5000,
-    "gradient_accumulation_steps": 4,
+    "gradient_accumulation_steps": 1,
     "eval_interval": 100,
     "checkpoint_interval": 50,
     "checkpoint_dir": "checkpoints/qwen35_9b",
