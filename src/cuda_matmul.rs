@@ -1028,9 +1028,10 @@ impl CudaMatmul {
             .load_function("deltanet_fused_fwd_bwd")
             .expect("deltanet_fused_fwd_bwd ロード失敗");
 
-        let ptx_dn_bwd = compile_ptx(DELTANET_BACKWARD_CU)
-            .expect("NVRTC: deltanet_backward コンパイル失敗");
-        let mod_dn_bwd = ctx.load_module(ptx_dn_bwd)
+        let ptx_dn_bwd =
+            compile_ptx(DELTANET_BACKWARD_CU).expect("NVRTC: deltanet_backward コンパイル失敗");
+        let mod_dn_bwd = ctx
+            .load_module(ptx_dn_bwd)
             .expect("deltanet_backward module ロード失敗");
         let deltanet_bwd_func = mod_dn_bwd
             .load_function("deltanet_backward")
@@ -4805,29 +4806,45 @@ pub fn cuda_deltanet_recurrence_train(
 
     {
         let mut ba = cuda.buf_a.borrow_mut();
-        cuda.stream.memcpy_htod(&q[..total_qk], &mut ba.buf.slice_mut(..total_qk)).expect("q H2D");
+        cuda.stream
+            .memcpy_htod(&q[..total_qk], &mut ba.buf.slice_mut(..total_qk))
+            .expect("q H2D");
     }
     {
         let mut bb = cuda.buf_b.borrow_mut();
-        cuda.stream.memcpy_htod(&k[..total_qk], &mut bb.buf.slice_mut(..total_qk)).expect("k H2D");
+        cuda.stream
+            .memcpy_htod(&k[..total_qk], &mut bb.buf.slice_mut(..total_qk))
+            .expect("k H2D");
     }
     {
         let mut bc = cuda.buf_c.borrow_mut();
-        cuda.stream.memcpy_htod(&v[..total_v], &mut bc.buf.slice_mut(..total_v)).expect("v H2D");
+        cuda.stream
+            .memcpy_htod(&v[..total_v], &mut bc.buf.slice_mut(..total_v))
+            .expect("v H2D");
     }
     {
         let mut bd = cuda.buf_d.borrow_mut();
-        cuda.stream.memcpy_htod(&beta[..total_bg], &mut bd.buf.slice_mut(..total_bg)).expect("beta H2D");
+        cuda.stream
+            .memcpy_htod(&beta[..total_bg], &mut bd.buf.slice_mut(..total_bg))
+            .expect("beta H2D");
     }
     {
         let mut be_buf = cuda.buf_e.borrow_mut();
-        cuda.stream.memcpy_htod(&g[..total_bg], &mut be_buf.buf.slice_mut(..total_bg)).expect("g H2D");
+        cuda.stream
+            .memcpy_htod(&g[..total_bg], &mut be_buf.buf.slice_mut(..total_bg))
+            .expect("g H2D");
     }
 
     // GPU バッファ: state, all_s_prev, all_e
     let state_size = num_heads * dk * dv;
-    let mut state_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(state_size).expect("state_buf 確保失敗");
-    let mut all_s_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_states).expect("all_s_prev 確保失敗");
+    let mut state_gpu: CudaSlice<f32> = cuda
+        .stream
+        .alloc_zeros(state_size)
+        .expect("state_buf 確保失敗");
+    let mut all_s_gpu: CudaSlice<f32> = cuda
+        .stream
+        .alloc_zeros(total_states)
+        .expect("all_s_prev 確保失敗");
     let mut all_e_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_e).expect("all_e 確保失敗");
 
     let shared_bytes = dk * 2 * 4;
@@ -4863,26 +4880,44 @@ pub fn cuda_deltanet_recurrence_train(
         builder.arg(&dv_i32);
 
         unsafe {
-            builder.launch(cfg).expect("deltanet_recurrence_train カーネル起動失敗");
+            builder
+                .launch(cfg)
+                .expect("deltanet_recurrence_train カーネル起動失敗");
         }
     }
 
     // D2H: output, all_s_prev, all_e
     {
         let bs = cuda.buf_scores.borrow();
-        cuda.stream.memcpy_dtoh(&bs.buf.slice(..total_v), &mut output[..total_v]).expect("output D2H");
+        cuda.stream
+            .memcpy_dtoh(&bs.buf.slice(..total_v), &mut output[..total_v])
+            .expect("output D2H");
     }
-    cuda.stream.memcpy_dtoh(&all_s_gpu.slice(..total_states), &mut all_s_prev[..total_states]).expect("all_s_prev D2H");
-    cuda.stream.memcpy_dtoh(&all_e_gpu.slice(..total_e), &mut all_e[..total_e]).expect("all_e D2H");
+    cuda.stream
+        .memcpy_dtoh(
+            &all_s_gpu.slice(..total_states),
+            &mut all_s_prev[..total_states],
+        )
+        .expect("all_s_prev D2H");
+    cuda.stream
+        .memcpy_dtoh(&all_e_gpu.slice(..total_e), &mut all_e[..total_e])
+        .expect("all_e D2H");
 }
 
 /// GPU DeltaNet Forward — 状態をVRAMに保持して返す（D2Hなし）
 /// 返り値の CudaSlice は backward で使う
 pub fn cuda_deltanet_forward_store(
     cuda: &CudaMatmul,
-    q: &[f32], k: &[f32], v: &[f32], beta: &[f32], g: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    beta: &[f32],
+    g: &[f32],
     output: &mut [f32],
-    num_heads: usize, seq_len: usize, dk: usize, dv: usize,
+    num_heads: usize,
+    seq_len: usize,
+    dk: usize,
+    dv: usize,
 ) -> CudaSlice<f32> {
     let total_qk = num_heads * seq_len * dk;
     let total_v = num_heads * seq_len * dv;
@@ -4896,11 +4931,36 @@ pub fn cuda_deltanet_forward_store(
     CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_e, total_bg);
     CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_scores, total_v);
 
-    { let mut ba = cuda.buf_a.borrow_mut(); cuda.stream.memcpy_htod(&q[..total_qk], &mut ba.buf.slice_mut(..total_qk)).expect("q"); }
-    { let mut bb = cuda.buf_b.borrow_mut(); cuda.stream.memcpy_htod(&k[..total_qk], &mut bb.buf.slice_mut(..total_qk)).expect("k"); }
-    { let mut bc = cuda.buf_c.borrow_mut(); cuda.stream.memcpy_htod(&v[..total_v], &mut bc.buf.slice_mut(..total_v)).expect("v"); }
-    { let mut bd = cuda.buf_d.borrow_mut(); cuda.stream.memcpy_htod(&beta[..total_bg], &mut bd.buf.slice_mut(..total_bg)).expect("beta"); }
-    { let mut be_buf = cuda.buf_e.borrow_mut(); cuda.stream.memcpy_htod(&g[..total_bg], &mut be_buf.buf.slice_mut(..total_bg)).expect("g"); }
+    {
+        let mut ba = cuda.buf_a.borrow_mut();
+        cuda.stream
+            .memcpy_htod(&q[..total_qk], &mut ba.buf.slice_mut(..total_qk))
+            .expect("q");
+    }
+    {
+        let mut bb = cuda.buf_b.borrow_mut();
+        cuda.stream
+            .memcpy_htod(&k[..total_qk], &mut bb.buf.slice_mut(..total_qk))
+            .expect("k");
+    }
+    {
+        let mut bc = cuda.buf_c.borrow_mut();
+        cuda.stream
+            .memcpy_htod(&v[..total_v], &mut bc.buf.slice_mut(..total_v))
+            .expect("v");
+    }
+    {
+        let mut bd = cuda.buf_d.borrow_mut();
+        cuda.stream
+            .memcpy_htod(&beta[..total_bg], &mut bd.buf.slice_mut(..total_bg))
+            .expect("beta");
+    }
+    {
+        let mut be_buf = cuda.buf_e.borrow_mut();
+        cuda.stream
+            .memcpy_htod(&g[..total_bg], &mut be_buf.buf.slice_mut(..total_bg))
+            .expect("g");
+    }
 
     let state_size = num_heads * dk * dv;
     let mut state_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(state_size).expect("state");
@@ -4922,19 +4982,32 @@ pub fn cuda_deltanet_forward_store(
         let mut bs = cuda.buf_scores.borrow_mut();
 
         let mut builder = cuda.stream.launch_builder(&cuda.deltanet_train_func);
-        builder.arg(&ba.buf); builder.arg(&bb.buf); builder.arg(&bc.buf);
-        builder.arg(&bd.buf); builder.arg(&be_buf.buf);
-        builder.arg(&mut bs.buf); builder.arg(&mut state_gpu);
-        builder.arg(&mut all_s_gpu); builder.arg(&mut all_e_gpu);
-        let sl = seq_len as i32; let dki = dk as i32; let dvi = dv as i32;
-        builder.arg(&sl); builder.arg(&dki); builder.arg(&dvi);
-        unsafe { builder.launch(cfg).expect("forward_store launch"); }
+        builder.arg(&ba.buf);
+        builder.arg(&bb.buf);
+        builder.arg(&bc.buf);
+        builder.arg(&bd.buf);
+        builder.arg(&be_buf.buf);
+        builder.arg(&mut bs.buf);
+        builder.arg(&mut state_gpu);
+        builder.arg(&mut all_s_gpu);
+        builder.arg(&mut all_e_gpu);
+        let sl = seq_len as i32;
+        let dki = dk as i32;
+        let dvi = dv as i32;
+        builder.arg(&sl);
+        builder.arg(&dki);
+        builder.arg(&dvi);
+        unsafe {
+            builder.launch(cfg).expect("forward_store launch");
+        }
     }
 
     // D2H: output のみ (all_s はVRAMに残す)
     {
         let bs = cuda.buf_scores.borrow();
-        cuda.stream.memcpy_dtoh(&bs.buf.slice(..total_v), &mut output[..total_v]).expect("output D2H");
+        cuda.stream
+            .memcpy_dtoh(&bs.buf.slice(..total_v), &mut output[..total_v])
+            .expect("output D2H");
     }
 
     all_s_gpu // VRAM handle を返す
@@ -4943,12 +5016,22 @@ pub fn cuda_deltanet_forward_store(
 /// GPU DeltaNet Backward — VRAM上の保存済み状態を使用
 pub fn cuda_deltanet_backward_from_vram(
     cuda: &CudaMatmul,
-    q: &[f32], k: &[f32], v: &[f32], beta: &[f32], g: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    beta: &[f32],
+    g: &[f32],
     d_out: &[f32],
     all_s_vram: &CudaSlice<f32>,
-    d_q: &mut [f32], d_k: &mut [f32], d_v: &mut [f32],
-    d_beta: &mut [f32], d_g: &mut [f32],
-    num_heads: usize, seq_len: usize, dk: usize, dv: usize,
+    d_q: &mut [f32],
+    d_k: &mut [f32],
+    d_v: &mut [f32],
+    d_beta: &mut [f32],
+    d_g: &mut [f32],
+    num_heads: usize,
+    seq_len: usize,
+    dk: usize,
+    dv: usize,
 ) {
     let total_qk = num_heads * seq_len * dk;
     let total_v = num_heads * seq_len * dv;
@@ -4960,14 +5043,41 @@ pub fn cuda_deltanet_backward_from_vram(
     CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_d, total_bg);
     CudaMatmul::ensure_buf(&cuda.stream, &cuda.buf_e, total_bg);
 
-    { let mut ba = cuda.buf_a.borrow_mut(); cuda.stream.memcpy_htod(&q[..total_qk], &mut ba.buf.slice_mut(..total_qk)).expect("q"); }
-    { let mut bb = cuda.buf_b.borrow_mut(); cuda.stream.memcpy_htod(&k[..total_qk], &mut bb.buf.slice_mut(..total_qk)).expect("k"); }
-    { let mut bc = cuda.buf_c.borrow_mut(); cuda.stream.memcpy_htod(&v[..total_v], &mut bc.buf.slice_mut(..total_v)).expect("v"); }
-    { let mut bd = cuda.buf_d.borrow_mut(); cuda.stream.memcpy_htod(&beta[..total_bg], &mut bd.buf.slice_mut(..total_bg)).expect("beta"); }
-    { let mut be_buf = cuda.buf_e.borrow_mut(); cuda.stream.memcpy_htod(&g[..total_bg], &mut be_buf.buf.slice_mut(..total_bg)).expect("g"); }
+    {
+        let mut ba = cuda.buf_a.borrow_mut();
+        cuda.stream
+            .memcpy_htod(&q[..total_qk], &mut ba.buf.slice_mut(..total_qk))
+            .expect("q");
+    }
+    {
+        let mut bb = cuda.buf_b.borrow_mut();
+        cuda.stream
+            .memcpy_htod(&k[..total_qk], &mut bb.buf.slice_mut(..total_qk))
+            .expect("k");
+    }
+    {
+        let mut bc = cuda.buf_c.borrow_mut();
+        cuda.stream
+            .memcpy_htod(&v[..total_v], &mut bc.buf.slice_mut(..total_v))
+            .expect("v");
+    }
+    {
+        let mut bd = cuda.buf_d.borrow_mut();
+        cuda.stream
+            .memcpy_htod(&beta[..total_bg], &mut bd.buf.slice_mut(..total_bg))
+            .expect("beta");
+    }
+    {
+        let mut be_buf = cuda.buf_e.borrow_mut();
+        cuda.stream
+            .memcpy_htod(&g[..total_bg], &mut be_buf.buf.slice_mut(..total_bg))
+            .expect("g");
+    }
 
     let mut d_out_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_v).expect("d_out");
-    cuda.stream.memcpy_htod(&d_out[..total_v], &mut d_out_gpu).expect("d_out H2D");
+    cuda.stream
+        .memcpy_htod(&d_out[..total_v], &mut d_out_gpu)
+        .expect("d_out H2D");
 
     let mut dq_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_qk).expect("dq");
     let mut dk_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_qk).expect("dk");
@@ -4990,38 +5100,59 @@ pub fn cuda_deltanet_backward_from_vram(
         let be_buf = cuda.buf_e.borrow();
 
         let mut builder = cuda.stream.launch_builder(&cuda.deltanet_bwd_func);
-        builder.arg(&ba.buf); builder.arg(&bb.buf); builder.arg(&bc.buf);
-        builder.arg(&bd.buf); builder.arg(&be_buf.buf);
-        builder.arg(&d_out_gpu); builder.arg(all_s_vram);
-        builder.arg(&mut dq_gpu); builder.arg(&mut dk_gpu); builder.arg(&mut dv_gpu);
-        builder.arg(&mut dbeta_gpu); builder.arg(&mut dg_gpu);
-        let sl = seq_len as i32; let dki = dk as i32; let dvi = dv as i32;
-        builder.arg(&sl); builder.arg(&dki); builder.arg(&dvi);
-        unsafe { builder.launch(cfg).expect("backward launch"); }
+        builder.arg(&ba.buf);
+        builder.arg(&bb.buf);
+        builder.arg(&bc.buf);
+        builder.arg(&bd.buf);
+        builder.arg(&be_buf.buf);
+        builder.arg(&d_out_gpu);
+        builder.arg(all_s_vram);
+        builder.arg(&mut dq_gpu);
+        builder.arg(&mut dk_gpu);
+        builder.arg(&mut dv_gpu);
+        builder.arg(&mut dbeta_gpu);
+        builder.arg(&mut dg_gpu);
+        let sl = seq_len as i32;
+        let dki = dk as i32;
+        let dvi = dv as i32;
+        builder.arg(&sl);
+        builder.arg(&dki);
+        builder.arg(&dvi);
+        unsafe {
+            builder.launch(cfg).expect("backward launch");
+        }
     }
 
-    cuda.stream.memcpy_dtoh(&dq_gpu.slice(..total_qk), &mut d_q[..total_qk]).expect("dq D2H");
-    cuda.stream.memcpy_dtoh(&dk_gpu.slice(..total_qk), &mut d_k[..total_qk]).expect("dk D2H");
-    cuda.stream.memcpy_dtoh(&dv_gpu.slice(..total_v), &mut d_v[..total_v]).expect("dv D2H");
-    cuda.stream.memcpy_dtoh(&dbeta_gpu.slice(..total_bg), &mut d_beta[..total_bg]).expect("dbeta D2H");
-    cuda.stream.memcpy_dtoh(&dg_gpu.slice(..total_bg), &mut d_g[..total_bg]).expect("dg D2H");
+    cuda.stream
+        .memcpy_dtoh(&dq_gpu.slice(..total_qk), &mut d_q[..total_qk])
+        .expect("dq D2H");
+    cuda.stream
+        .memcpy_dtoh(&dk_gpu.slice(..total_qk), &mut d_k[..total_qk])
+        .expect("dk D2H");
+    cuda.stream
+        .memcpy_dtoh(&dv_gpu.slice(..total_v), &mut d_v[..total_v])
+        .expect("dv D2H");
+    cuda.stream
+        .memcpy_dtoh(&dbeta_gpu.slice(..total_bg), &mut d_beta[..total_bg])
+        .expect("dbeta D2H");
+    cuda.stream
+        .memcpy_dtoh(&dg_gpu.slice(..total_bg), &mut d_g[..total_bg])
+        .expect("dg D2H");
 }
 
 /// GPU RMSNorm in-place: x[i] = x[i] / rms * weight[i]
-pub fn cuda_dn_rmsnorm(
-    cuda: &CudaMatmul,
-    x: &mut [f32],
-    weight: &[f32],
-    dim: usize,
-    eps: f32,
-) {
+pub fn cuda_dn_rmsnorm(cuda: &CudaMatmul, x: &mut [f32], weight: &[f32], dim: usize, eps: f32) {
     let seq_len = x.len() / dim;
     let block = dim.next_power_of_two();
 
     let mut x_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(x.len()).expect("rmsnorm x");
-    cuda.stream.memcpy_htod(x, &mut x_gpu).expect("rmsnorm x H2D");
+    cuda.stream
+        .memcpy_htod(x, &mut x_gpu)
+        .expect("rmsnorm x H2D");
     let mut w_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(weight.len()).expect("rmsnorm w");
-    cuda.stream.memcpy_htod(weight, &mut w_gpu).expect("rmsnorm w H2D");
+    cuda.stream
+        .memcpy_htod(weight, &mut w_gpu)
+        .expect("rmsnorm w H2D");
 
     let cfg = LaunchConfig {
         grid_dim: (seq_len as u32, 1, 1),
@@ -5030,11 +5161,17 @@ pub fn cuda_dn_rmsnorm(
     };
     let dim_i = dim as i32;
     let mut builder = cuda.stream.launch_builder(&cuda.dn_rmsnorm_func);
-    builder.arg(&mut x_gpu); builder.arg(&w_gpu);
-    builder.arg(&dim_i); builder.arg(&eps);
-    unsafe { builder.launch(cfg).expect("rmsnorm launch"); }
+    builder.arg(&mut x_gpu);
+    builder.arg(&w_gpu);
+    builder.arg(&dim_i);
+    builder.arg(&eps);
+    unsafe {
+        builder.launch(cfg).expect("rmsnorm launch");
+    }
 
-    cuda.stream.memcpy_dtoh(&x_gpu.slice(..x.len()), x).expect("rmsnorm D2H");
+    cuda.stream
+        .memcpy_dtoh(&x_gpu.slice(..x.len()), x)
+        .expect("rmsnorm D2H");
 }
 
 /// GPU Conv1d + SiLU forward
@@ -5048,9 +5185,13 @@ pub fn cuda_dn_conv1d_silu(
     kernel_size: usize,
 ) {
     let mut x_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(x.len()).expect("conv1d x");
-    cuda.stream.memcpy_htod(x, &mut x_gpu).expect("conv1d x H2D");
+    cuda.stream
+        .memcpy_htod(x, &mut x_gpu)
+        .expect("conv1d x H2D");
     let mut w_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(weight.len()).expect("conv1d w");
-    cuda.stream.memcpy_htod(weight, &mut w_gpu).expect("conv1d w H2D");
+    cuda.stream
+        .memcpy_htod(weight, &mut w_gpu)
+        .expect("conv1d w H2D");
     let mut out_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(out.len()).expect("conv1d out");
 
     let block = channels.next_power_of_two().min(1024);
@@ -5063,11 +5204,19 @@ pub fn cuda_dn_conv1d_silu(
     let sl = seq_len as i32;
     let ks = kernel_size as i32;
     let mut builder = cuda.stream.launch_builder(&cuda.dn_conv1d_silu_func);
-    builder.arg(&x_gpu); builder.arg(&w_gpu); builder.arg(&mut out_gpu);
-    builder.arg(&ch); builder.arg(&sl); builder.arg(&ks);
-    unsafe { builder.launch(cfg).expect("conv1d_silu launch"); }
+    builder.arg(&x_gpu);
+    builder.arg(&w_gpu);
+    builder.arg(&mut out_gpu);
+    builder.arg(&ch);
+    builder.arg(&sl);
+    builder.arg(&ks);
+    unsafe {
+        builder.launch(cfg).expect("conv1d_silu launch");
+    }
 
-    cuda.stream.memcpy_dtoh(&out_gpu.slice(..out.len()), out).expect("conv1d_silu D2H");
+    cuda.stream
+        .memcpy_dtoh(&out_gpu.slice(..out.len()), out)
+        .expect("conv1d_silu D2H");
 }
 
 /// GPU Conv1d Backward (SiLU grad 込み)
@@ -5084,13 +5233,22 @@ pub fn cuda_dn_conv1d_bwd(
 ) {
     let total = seq_len * channels;
     let mut dout_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total).expect("conv1d_bwd dout");
-    cuda.stream.memcpy_htod(&d_out[..total], &mut dout_gpu).expect("conv1d_bwd dout H2D");
+    cuda.stream
+        .memcpy_htod(&d_out[..total], &mut dout_gpu)
+        .expect("conv1d_bwd dout H2D");
     let mut x_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total).expect("conv1d_bwd x");
-    cuda.stream.memcpy_htod(&x[..total], &mut x_gpu).expect("conv1d_bwd x H2D");
+    cuda.stream
+        .memcpy_htod(&x[..total], &mut x_gpu)
+        .expect("conv1d_bwd x H2D");
     let mut w_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(weight.len()).expect("conv1d_bwd w");
-    cuda.stream.memcpy_htod(weight, &mut w_gpu).expect("conv1d_bwd w H2D");
+    cuda.stream
+        .memcpy_htod(weight, &mut w_gpu)
+        .expect("conv1d_bwd w H2D");
     let mut dx_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total).expect("conv1d_bwd dx");
-    let mut dw_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(weight.len()).expect("conv1d_bwd dw");
+    let mut dw_gpu: CudaSlice<f32> = cuda
+        .stream
+        .alloc_zeros(weight.len())
+        .expect("conv1d_bwd dw");
 
     let block = seq_len.next_power_of_two().min(1024);
     let cfg = LaunchConfig {
@@ -5102,13 +5260,24 @@ pub fn cuda_dn_conv1d_bwd(
     let sl = seq_len as i32;
     let ks = kernel_size as i32;
     let mut builder = cuda.stream.launch_builder(&cuda.dn_conv1d_bwd_func);
-    builder.arg(&dout_gpu); builder.arg(&x_gpu); builder.arg(&w_gpu);
-    builder.arg(&mut dx_gpu); builder.arg(&mut dw_gpu);
-    builder.arg(&ch); builder.arg(&sl); builder.arg(&ks);
-    unsafe { builder.launch(cfg).expect("conv1d_bwd launch"); }
+    builder.arg(&dout_gpu);
+    builder.arg(&x_gpu);
+    builder.arg(&w_gpu);
+    builder.arg(&mut dx_gpu);
+    builder.arg(&mut dw_gpu);
+    builder.arg(&ch);
+    builder.arg(&sl);
+    builder.arg(&ks);
+    unsafe {
+        builder.launch(cfg).expect("conv1d_bwd launch");
+    }
 
-    cuda.stream.memcpy_dtoh(&dx_gpu.slice(..total), &mut d_x[..total]).expect("conv1d_bwd dx D2H");
-    cuda.stream.memcpy_dtoh(&dw_gpu.slice(..weight.len()), d_weight).expect("conv1d_bwd dw D2H");
+    cuda.stream
+        .memcpy_dtoh(&dx_gpu.slice(..total), &mut d_x[..total])
+        .expect("conv1d_bwd dx D2H");
+    cuda.stream
+        .memcpy_dtoh(&dw_gpu.slice(..weight.len()), d_weight)
+        .expect("conv1d_bwd dw D2H");
 }
 
 /// GPU Gate Compute: sigmoid(b) → beta, -exp(a_log)*softplus(a+dt_bias) → g
@@ -5125,13 +5294,21 @@ pub fn cuda_dn_gate_compute(
 ) {
     let total = seq_len * n_heads;
     let mut b_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total).expect("gate b");
-    cuda.stream.memcpy_htod(&b_raw[..total], &mut b_gpu).expect("gate b H2D");
+    cuda.stream
+        .memcpy_htod(&b_raw[..total], &mut b_gpu)
+        .expect("gate b H2D");
     let mut a_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total).expect("gate a");
-    cuda.stream.memcpy_htod(&a_raw[..total], &mut a_gpu).expect("gate a H2D");
+    cuda.stream
+        .memcpy_htod(&a_raw[..total], &mut a_gpu)
+        .expect("gate a H2D");
     let mut alog_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(n_heads).expect("gate alog");
-    cuda.stream.memcpy_htod(&a_log[..n_heads], &mut alog_gpu).expect("gate alog H2D");
+    cuda.stream
+        .memcpy_htod(&a_log[..n_heads], &mut alog_gpu)
+        .expect("gate alog H2D");
     let mut dtb_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(n_heads).expect("gate dtb");
-    cuda.stream.memcpy_htod(&dt_bias[..n_heads], &mut dtb_gpu).expect("gate dtb H2D");
+    cuda.stream
+        .memcpy_htod(&dt_bias[..n_heads], &mut dtb_gpu)
+        .expect("gate dtb H2D");
     let mut beta_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total).expect("gate beta");
     let mut g_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total).expect("gate g");
 
@@ -5143,14 +5320,23 @@ pub fn cuda_dn_gate_compute(
     };
     let nh = n_heads as i32;
     let mut builder = cuda.stream.launch_builder(&cuda.dn_gate_compute_func);
-    builder.arg(&b_gpu); builder.arg(&a_gpu);
-    builder.arg(&alog_gpu); builder.arg(&dtb_gpu);
-    builder.arg(&mut beta_gpu); builder.arg(&mut g_gpu);
+    builder.arg(&b_gpu);
+    builder.arg(&a_gpu);
+    builder.arg(&alog_gpu);
+    builder.arg(&dtb_gpu);
+    builder.arg(&mut beta_gpu);
+    builder.arg(&mut g_gpu);
     builder.arg(&nh);
-    unsafe { builder.launch(cfg).expect("gate_compute launch"); }
+    unsafe {
+        builder.launch(cfg).expect("gate_compute launch");
+    }
 
-    cuda.stream.memcpy_dtoh(&beta_gpu.slice(..total), &mut beta[..total]).expect("gate beta D2H");
-    cuda.stream.memcpy_dtoh(&g_gpu.slice(..total), &mut g[..total]).expect("gate g D2H");
+    cuda.stream
+        .memcpy_dtoh(&beta_gpu.slice(..total), &mut beta[..total])
+        .expect("gate beta D2H");
+    cuda.stream
+        .memcpy_dtoh(&g_gpu.slice(..total), &mut g[..total])
+        .expect("gate g D2H");
 }
 
 /// GPU L2Norm + GQA Expand
@@ -5169,9 +5355,13 @@ pub fn cuda_dn_l2norm_gqa(
     let in_total = seq_len * n_k_heads * dk;
     let out_total = seq_len * n_v_heads * dk;
     let mut qi_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(in_total).expect("l2norm qi");
-    cuda.stream.memcpy_htod(&q_in[..in_total], &mut qi_gpu).expect("l2norm qi H2D");
+    cuda.stream
+        .memcpy_htod(&q_in[..in_total], &mut qi_gpu)
+        .expect("l2norm qi H2D");
     let mut ki_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(in_total).expect("l2norm ki");
-    cuda.stream.memcpy_htod(&k_in[..in_total], &mut ki_gpu).expect("l2norm ki H2D");
+    cuda.stream
+        .memcpy_htod(&k_in[..in_total], &mut ki_gpu)
+        .expect("l2norm ki H2D");
     let mut qo_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(out_total).expect("l2norm qo");
     let mut ko_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(out_total).expect("l2norm ko");
 
@@ -5186,13 +5376,24 @@ pub fn cuda_dn_l2norm_gqa(
     let nvh = n_v_heads as i32;
     let dki = dk as i32;
     let mut builder = cuda.stream.launch_builder(&cuda.dn_l2norm_gqa_func);
-    builder.arg(&qi_gpu); builder.arg(&ki_gpu);
-    builder.arg(&mut qo_gpu); builder.arg(&mut ko_gpu);
-    builder.arg(&nkh); builder.arg(&nvh); builder.arg(&dki); builder.arg(&eps);
-    unsafe { builder.launch(cfg).expect("l2norm_gqa launch"); }
+    builder.arg(&qi_gpu);
+    builder.arg(&ki_gpu);
+    builder.arg(&mut qo_gpu);
+    builder.arg(&mut ko_gpu);
+    builder.arg(&nkh);
+    builder.arg(&nvh);
+    builder.arg(&dki);
+    builder.arg(&eps);
+    unsafe {
+        builder.launch(cfg).expect("l2norm_gqa launch");
+    }
 
-    cuda.stream.memcpy_dtoh(&qo_gpu.slice(..out_total), &mut q_out[..out_total]).expect("l2norm qo D2H");
-    cuda.stream.memcpy_dtoh(&ko_gpu.slice(..out_total), &mut k_out[..out_total]).expect("l2norm ko D2H");
+    cuda.stream
+        .memcpy_dtoh(&qo_gpu.slice(..out_total), &mut q_out[..out_total])
+        .expect("l2norm qo D2H");
+    cuda.stream
+        .memcpy_dtoh(&ko_gpu.slice(..out_total), &mut k_out[..out_total])
+        .expect("l2norm ko D2H");
 }
 
 /// GPU Gated RMSNorm: out = RMSNorm(x) * SiLU(z)
@@ -5209,12 +5410,24 @@ pub fn cuda_dn_gated_rmsnorm(
     let block = dim.next_power_of_two().min(1024);
 
     let mut x_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(x.len()).expect("gated_rmsnorm x");
-    cuda.stream.memcpy_htod(x, &mut x_gpu).expect("gated_rmsnorm x H2D");
+    cuda.stream
+        .memcpy_htod(x, &mut x_gpu)
+        .expect("gated_rmsnorm x H2D");
     let mut z_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(z.len()).expect("gated_rmsnorm z");
-    cuda.stream.memcpy_htod(z, &mut z_gpu).expect("gated_rmsnorm z H2D");
-    let mut w_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(weight.len()).expect("gated_rmsnorm w");
-    cuda.stream.memcpy_htod(weight, &mut w_gpu).expect("gated_rmsnorm w H2D");
-    let mut out_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(out.len()).expect("gated_rmsnorm out");
+    cuda.stream
+        .memcpy_htod(z, &mut z_gpu)
+        .expect("gated_rmsnorm z H2D");
+    let mut w_gpu: CudaSlice<f32> = cuda
+        .stream
+        .alloc_zeros(weight.len())
+        .expect("gated_rmsnorm w");
+    cuda.stream
+        .memcpy_htod(weight, &mut w_gpu)
+        .expect("gated_rmsnorm w H2D");
+    let mut out_gpu: CudaSlice<f32> = cuda
+        .stream
+        .alloc_zeros(out.len())
+        .expect("gated_rmsnorm out");
 
     let cfg = LaunchConfig {
         grid_dim: (seq_len as u32, 1, 1),
@@ -5223,11 +5436,19 @@ pub fn cuda_dn_gated_rmsnorm(
     };
     let dim_i = dim as i32;
     let mut builder = cuda.stream.launch_builder(&cuda.dn_gated_rmsnorm_func);
-    builder.arg(&x_gpu); builder.arg(&z_gpu); builder.arg(&w_gpu);
-    builder.arg(&mut out_gpu); builder.arg(&dim_i); builder.arg(&eps);
-    unsafe { builder.launch(cfg).expect("gated_rmsnorm launch"); }
+    builder.arg(&x_gpu);
+    builder.arg(&z_gpu);
+    builder.arg(&w_gpu);
+    builder.arg(&mut out_gpu);
+    builder.arg(&dim_i);
+    builder.arg(&eps);
+    unsafe {
+        builder.launch(cfg).expect("gated_rmsnorm launch");
+    }
 
-    cuda.stream.memcpy_dtoh(&out_gpu.slice(..out.len()), out).expect("gated_rmsnorm D2H");
+    cuda.stream
+        .memcpy_dtoh(&out_gpu.slice(..out.len()), out)
+        .expect("gated_rmsnorm D2H");
 }
 
 /// GPU DeltaNet Fused Forward+Backward — 状態をVRAM内に保持、D2H転送ゼロ
@@ -5266,28 +5487,40 @@ pub fn cuda_deltanet_fused_fwd_bwd(
 
     {
         let mut ba = cuda.buf_a.borrow_mut();
-        cuda.stream.memcpy_htod(&q[..total_qk], &mut ba.buf.slice_mut(..total_qk)).expect("q H2D");
+        cuda.stream
+            .memcpy_htod(&q[..total_qk], &mut ba.buf.slice_mut(..total_qk))
+            .expect("q H2D");
     }
     {
         let mut bb = cuda.buf_b.borrow_mut();
-        cuda.stream.memcpy_htod(&k[..total_qk], &mut bb.buf.slice_mut(..total_qk)).expect("k H2D");
+        cuda.stream
+            .memcpy_htod(&k[..total_qk], &mut bb.buf.slice_mut(..total_qk))
+            .expect("k H2D");
     }
     {
         let mut bc = cuda.buf_c.borrow_mut();
-        cuda.stream.memcpy_htod(&v[..total_v], &mut bc.buf.slice_mut(..total_v)).expect("v H2D");
+        cuda.stream
+            .memcpy_htod(&v[..total_v], &mut bc.buf.slice_mut(..total_v))
+            .expect("v H2D");
     }
     {
         let mut bd = cuda.buf_d.borrow_mut();
-        cuda.stream.memcpy_htod(&beta[..total_bg], &mut bd.buf.slice_mut(..total_bg)).expect("beta H2D");
+        cuda.stream
+            .memcpy_htod(&beta[..total_bg], &mut bd.buf.slice_mut(..total_bg))
+            .expect("beta H2D");
     }
     {
         let mut be_buf = cuda.buf_e.borrow_mut();
-        cuda.stream.memcpy_htod(&g[..total_bg], &mut be_buf.buf.slice_mut(..total_bg)).expect("g H2D");
+        cuda.stream
+            .memcpy_htod(&g[..total_bg], &mut be_buf.buf.slice_mut(..total_bg))
+            .expect("g H2D");
     }
 
     // d_out H2D — 専用バッファ
     let mut d_out_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_v).expect("d_out 確保");
-    cuda.stream.memcpy_htod(&d_out[..total_v], &mut d_out_gpu).expect("d_out H2D");
+    cuda.stream
+        .memcpy_htod(&d_out[..total_v], &mut d_out_gpu)
+        .expect("d_out H2D");
 
     // Output + gradient バッファ
     let mut out_gpu: CudaSlice<f32> = cuda.stream.alloc_zeros(total_v).expect("output 確保");
@@ -5317,20 +5550,20 @@ pub fn cuda_deltanet_fused_fwd_bwd(
         let be_buf = cuda.buf_e.borrow();
 
         let mut builder = cuda.stream.launch_builder(&cuda.deltanet_fused_func);
-        builder.arg(&ba.buf);       // q
-        builder.arg(&bb.buf);       // k
-        builder.arg(&bc.buf);       // v
-        builder.arg(&bd.buf);       // beta
-        builder.arg(&be_buf.buf);   // g
-        builder.arg(&d_out_gpu);    // d_out
-        builder.arg(&mut out_gpu);  // output
-        builder.arg(&mut dq_gpu);   // d_q
-        builder.arg(&mut dk_gpu);   // d_k
-        builder.arg(&mut dv_gpu);   // d_v
-        builder.arg(&mut dbeta_gpu);// d_beta
-        builder.arg(&mut dg_gpu);   // d_g
-        builder.arg(&mut state_gpu);// state_buf
-        builder.arg(&mut all_s_gpu);// all_s workspace
+        builder.arg(&ba.buf); // q
+        builder.arg(&bb.buf); // k
+        builder.arg(&bc.buf); // v
+        builder.arg(&bd.buf); // beta
+        builder.arg(&be_buf.buf); // g
+        builder.arg(&d_out_gpu); // d_out
+        builder.arg(&mut out_gpu); // output
+        builder.arg(&mut dq_gpu); // d_q
+        builder.arg(&mut dk_gpu); // d_k
+        builder.arg(&mut dv_gpu); // d_v
+        builder.arg(&mut dbeta_gpu); // d_beta
+        builder.arg(&mut dg_gpu); // d_g
+        builder.arg(&mut state_gpu); // state_buf
+        builder.arg(&mut all_s_gpu); // all_s workspace
         let sl = seq_len as i32;
         let dki = dk as i32;
         let dvi = dv as i32;
@@ -5338,14 +5571,30 @@ pub fn cuda_deltanet_fused_fwd_bwd(
         builder.arg(&dki);
         builder.arg(&dvi);
 
-        unsafe { builder.launch(cfg).expect("deltanet_fused_fwd_bwd 起動失敗"); }
+        unsafe {
+            builder
+                .launch(cfg)
+                .expect("deltanet_fused_fwd_bwd 起動失敗");
+        }
     }
 
     // D2H: output + gradients のみ (状態はGPU内で完結)
-    cuda.stream.memcpy_dtoh(&out_gpu.slice(..total_v), &mut output[..total_v]).expect("output D2H");
-    cuda.stream.memcpy_dtoh(&dq_gpu.slice(..total_qk), &mut d_q[..total_qk]).expect("dq D2H");
-    cuda.stream.memcpy_dtoh(&dk_gpu.slice(..total_qk), &mut d_k[..total_qk]).expect("dk D2H");
-    cuda.stream.memcpy_dtoh(&dv_gpu.slice(..total_v), &mut d_v[..total_v]).expect("dv D2H");
-    cuda.stream.memcpy_dtoh(&dbeta_gpu.slice(..total_bg), &mut d_beta[..total_bg]).expect("dbeta D2H");
-    cuda.stream.memcpy_dtoh(&dg_gpu.slice(..total_bg), &mut d_g[..total_bg]).expect("dg D2H");
+    cuda.stream
+        .memcpy_dtoh(&out_gpu.slice(..total_v), &mut output[..total_v])
+        .expect("output D2H");
+    cuda.stream
+        .memcpy_dtoh(&dq_gpu.slice(..total_qk), &mut d_q[..total_qk])
+        .expect("dq D2H");
+    cuda.stream
+        .memcpy_dtoh(&dk_gpu.slice(..total_qk), &mut d_k[..total_qk])
+        .expect("dk D2H");
+    cuda.stream
+        .memcpy_dtoh(&dv_gpu.slice(..total_v), &mut d_v[..total_v])
+        .expect("dv D2H");
+    cuda.stream
+        .memcpy_dtoh(&dbeta_gpu.slice(..total_bg), &mut d_beta[..total_bg])
+        .expect("dbeta D2H");
+    cuda.stream
+        .memcpy_dtoh(&dg_gpu.slice(..total_bg), &mut d_g[..total_bg])
+        .expect("dg D2H");
 }

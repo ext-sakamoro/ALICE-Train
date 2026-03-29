@@ -765,9 +765,19 @@ pub fn deltanet_recurrence_forward_train_cuda(
         let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
         let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
         crate::cuda_matmul::cuda_deltanet_recurrence_train(
-            &cuda, &q_gpu, &k_gpu, &v_gpu, &beta_gpu, &g_gpu,
-            &mut out_gpu, &mut all_s_prev, &mut all_e_flat,
-            num_heads, seq_len, dk, dv,
+            &cuda,
+            &q_gpu,
+            &k_gpu,
+            &v_gpu,
+            &beta_gpu,
+            &g_gpu,
+            &mut out_gpu,
+            &mut all_s_prev,
+            &mut all_e_flat,
+            num_heads,
+            seq_len,
+            dk,
+            dv,
         );
     }
 
@@ -789,10 +799,14 @@ pub fn deltanet_recurrence_forward_train_cuda(
         for t in 0..seq_len {
             let s_off = h * seq_len * dk * dv + t * dk * dv;
             let s_prev = all_s_prev[s_off..s_off + dk * dv].to_vec();
-            let q_t: Vec<f32> = q_gpu[h * seq_len * dk + t * dk..h * seq_len * dk + (t + 1) * dk].to_vec();
-            let k_t: Vec<f32> = k_gpu[h * seq_len * dk + t * dk..h * seq_len * dk + (t + 1) * dk].to_vec();
-            let v_t: Vec<f32> = v_gpu[h * seq_len * dv + t * dv..h * seq_len * dv + (t + 1) * dv].to_vec();
-            let e_t: Vec<f32> = all_e_flat[h * seq_len * dv + t * dv..h * seq_len * dv + (t + 1) * dv].to_vec();
+            let q_t: Vec<f32> =
+                q_gpu[h * seq_len * dk + t * dk..h * seq_len * dk + (t + 1) * dk].to_vec();
+            let k_t: Vec<f32> =
+                k_gpu[h * seq_len * dk + t * dk..h * seq_len * dk + (t + 1) * dk].to_vec();
+            let v_t: Vec<f32> =
+                v_gpu[h * seq_len * dv + t * dv..h * seq_len * dv + (t + 1) * dv].to_vec();
+            let e_t: Vec<f32> =
+                all_e_flat[h * seq_len * dv + t * dv..h * seq_len * dv + (t + 1) * dv].to_vec();
             let beta_t = beta_gpu[h * seq_len + t];
             let g_t = g_gpu[h * seq_len + t];
 
@@ -814,7 +828,8 @@ pub fn deltanet_recurrence_forward_train_cuda(
         let mut fs = vec![0.0f32; dk * dv];
         for i in 0..dk {
             for j in 0..dv {
-                fs[i * dv + j] = last.exp_g * last.s_prev[i * dv + j] + last.beta * last.k[i] * last.e[j];
+                fs[i * dv + j] =
+                    last.exp_g * last.s_prev[i * dv + j] + last.beta * last.k[i] * last.e[j];
             }
         }
         final_states.push(fs);
@@ -828,13 +843,13 @@ pub fn deltanet_recurrence_forward_train_cuda(
 /// forward output + backward gradients を一発で計算。DeltaNetStepCache 不要。
 #[cfg(feature = "cuda")]
 pub fn deltanet_recurrence_fused_fwd_bwd_cuda(
-    q_all: &[f32],      // [seq_len × num_heads × dk]
+    q_all: &[f32], // [seq_len × num_heads × dk]
     k_all: &[f32],
     v_all: &[f32],
-    beta_all: &[f32],   // [seq_len × num_heads]
+    beta_all: &[f32], // [seq_len × num_heads]
     g_all: &[f32],
     d_output: &[f32],   // [seq_len × num_heads × dv]
-    output: &mut [f32],  // [seq_len × num_heads × dv]
+    output: &mut [f32], // [seq_len × num_heads × dv]
     num_heads: usize,
     dk: usize,
     dv: usize,
@@ -881,10 +896,23 @@ pub fn deltanet_recurrence_fused_fwd_bwd_cuda(
         let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
         let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
         crate::cuda_matmul::cuda_deltanet_fused_fwd_bwd(
-            &cuda, &q_gpu, &k_gpu, &v_gpu, &beta_gpu, &g_gpu, &do_gpu,
-            &mut out_gpu, &mut dq_gpu, &mut dk_gpu_out, &mut dv_gpu_out,
-            &mut dbeta_gpu, &mut dg_gpu,
-            num_heads, seq_len, dk, dv,
+            &cuda,
+            &q_gpu,
+            &k_gpu,
+            &v_gpu,
+            &beta_gpu,
+            &g_gpu,
+            &do_gpu,
+            &mut out_gpu,
+            &mut dq_gpu,
+            &mut dk_gpu_out,
+            &mut dv_gpu_out,
+            &mut dbeta_gpu,
+            &mut dg_gpu,
+            num_heads,
+            seq_len,
+            dk,
+            dv,
         );
     }
 

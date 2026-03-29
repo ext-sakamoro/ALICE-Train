@@ -185,23 +185,50 @@ fn deltanet_layer_forward(
     #[cfg(feature = "cuda")]
     let (step_caches, final_states) = if crate::blas::cuda_blas_available() {
         crate::deltanet::deltanet_recurrence_forward_train_cuda(
-            &q_expanded, &k_expanded, &v_all, &beta, &g,
-            &a_raw, &b_raw, &mut attn_out_raw,
-            n_v_heads, dk, dv, seq_len,
+            &q_expanded,
+            &k_expanded,
+            &v_all,
+            &beta,
+            &g,
+            &a_raw,
+            &b_raw,
+            &mut attn_out_raw,
+            n_v_heads,
+            dk,
+            dv,
+            seq_len,
         )
     } else {
         deltanet_recurrence_forward(
-            &q_expanded, &k_expanded, &v_all, &beta, &g,
-            &b_raw, &a_raw, &mut attn_out_raw,
-            n_v_heads, dk, dv, seq_len,
+            &q_expanded,
+            &k_expanded,
+            &v_all,
+            &beta,
+            &g,
+            &b_raw,
+            &a_raw,
+            &mut attn_out_raw,
+            n_v_heads,
+            dk,
+            dv,
+            seq_len,
         )
     };
 
     #[cfg(not(feature = "cuda"))]
     let (step_caches, final_states) = deltanet_recurrence_forward(
-        &q_expanded, &k_expanded, &v_all, &beta, &g,
-        &b_raw, &a_raw, &mut attn_out_raw,
-        n_v_heads, dk, dv, seq_len,
+        &q_expanded,
+        &k_expanded,
+        &v_all,
+        &beta,
+        &g,
+        &b_raw,
+        &a_raw,
+        &mut attn_out_raw,
+        n_v_heads,
+        dk,
+        dv,
+        seq_len,
     );
 
     // 8. Gated RMSNorm — Rayon並列

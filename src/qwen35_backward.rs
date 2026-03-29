@@ -381,7 +381,8 @@ pub fn deltanet_layer_backward(
             // post_attn_layernorm backward
             let normed = row[h] * inv_rms;
             weight_grads.d_post_attn_layernorm[h] += d_ffn_input[t * hidden + h] * normed;
-            d_attn_block[t * hidden + h] = d_ffn_input[t * hidden + h] * weights.post_attn_layernorm[h] * inv_rms;
+            d_attn_block[t * hidden + h] =
+                d_ffn_input[t * hidden + h] * weights.post_attn_layernorm[h] * inv_rms;
         }
     }
 
@@ -393,7 +394,14 @@ pub fn deltanet_layer_backward(
     // ── 3. out_proj backward ──
     // attn_out = attn_normed × out_proj^T → d_attn_normed = d_attn_block × out_proj
     let mut d_attn_normed = vec![0.0f32; seq_len * val_dim];
-    blas_matmul_nn(&d_attn_block, &weights.out_proj, &mut d_attn_normed, seq_len, val_dim, hidden);
+    blas_matmul_nn(
+        &d_attn_block,
+        &weights.out_proj,
+        &mut d_attn_normed,
+        seq_len,
+        val_dim,
+        hidden,
+    );
     // d_out_proj += d_attn_block^T × attn_normed (accumulated)
     {
         let mut d_block_t = vec![0.0f32; hidden * seq_len];
@@ -405,8 +413,12 @@ pub fn deltanet_layer_backward(
         // Need the attn_normed values — recompute from cache
         let mut attn_normed = vec![0.0f32; seq_len * val_dim];
         crate::deltanet::gated_rmsnorm(
-            &cache.attn_out_pre_norm, &cache.z, &weights.norm_weight,
-            &mut attn_normed, dv, config.rms_norm_eps,
+            &cache.attn_out_pre_norm,
+            &cache.z,
+            &weights.norm_weight,
+            &mut attn_normed,
+            dv,
+            config.rms_norm_eps,
         );
         let mut tmp = vec![0.0f32; hidden * val_dim];
         blas_matmul_nn(&d_block_t, &attn_normed, &mut tmp, hidden, val_dim, seq_len);
@@ -427,10 +439,12 @@ pub fn deltanet_layer_backward(
         for j in 0..dv {
             let sig_z = 1.0 / (1.0 + (-row_z[j]).exp());
             let silu_z = row_z[j] * sig_z;
-            d_recurrence_out[t * val_dim + j] = d_attn_normed[t * val_dim + j] * silu_z * weights.norm_weight[j % dv] * inv_rms;
+            d_recurrence_out[t * val_dim + j] =
+                d_attn_normed[t * val_dim + j] * silu_z * weights.norm_weight[j % dv] * inv_rms;
             // norm weight 勾配
             let normed_x = row_x[j] * inv_rms;
-            weight_grads.d_norm_weight[j % dv] += d_attn_normed[t * val_dim + j] * normed_x * silu_z;
+            weight_grads.d_norm_weight[j % dv] +=
+                d_attn_normed[t * val_dim + j] * normed_x * silu_z;
         }
     }
 
@@ -440,7 +454,10 @@ pub fn deltanet_layer_backward(
         &cache.step_caches,
         &weights.a_log,
         &weights.dt_bias,
-        n_v_heads, dk, dv, seq_len,
+        n_v_heads,
+        dk,
+        dv,
+        seq_len,
     );
     for h in 0..n_v_heads {
         weight_grads.d_a_log[h] += rec_grads.d_a_log[h];
@@ -497,11 +514,23 @@ pub fn deltanet_layer_backward(
 
     // in_proj_qkv backward: d_normed = d_qkv_pre_conv × in_proj_qkv
     let mut d_normed = vec![0.0f32; seq_len * hidden];
-    blas_matmul_nn(&d_qkv_pre_conv, &weights.in_proj_qkv, &mut d_normed, seq_len, hidden, qkv_dim);
+    blas_matmul_nn(
+        &d_qkv_pre_conv,
+        &weights.in_proj_qkv,
+        &mut d_normed,
+        seq_len,
+        hidden,
+        qkv_dim,
+    );
     // d_in_proj_qkv += d_qkv_pre_conv^T × normed_input (recompute normed)
     {
         let mut normed_input = cache.residual_attn.clone();
-        blas_rmsnorm(&mut normed_input, &weights.input_layernorm, hidden, config.rms_norm_eps);
+        blas_rmsnorm(
+            &mut normed_input,
+            &weights.input_layernorm,
+            hidden,
+            config.rms_norm_eps,
+        );
         let mut d_qkv_t = vec![0.0f32; qkv_dim * seq_len];
         for t in 0..seq_len {
             for j in 0..qkv_dim {
@@ -518,7 +547,12 @@ pub fn deltanet_layer_backward(
     // in_proj_b, in_proj_a backward (from rec_grads.d_b_logit, d_a_logit)
     {
         let mut normed_input = cache.residual_attn.clone();
-        blas_rmsnorm(&mut normed_input, &weights.input_layernorm, hidden, config.rms_norm_eps);
+        blas_rmsnorm(
+            &mut normed_input,
+            &weights.input_layernorm,
+            hidden,
+            config.rms_norm_eps,
+        );
         // d_in_proj_b += d_b_logit^T × normed
         let mut d_b_t = vec![0.0f32; n_v_heads * seq_len];
         let mut d_a_t = vec![0.0f32; n_v_heads * seq_len];
@@ -530,8 +564,22 @@ pub fn deltanet_layer_backward(
         }
         let mut tmp_b = vec![0.0f32; n_v_heads * hidden];
         let mut tmp_a = vec![0.0f32; n_v_heads * hidden];
-        blas_matmul_nn(&d_b_t, &normed_input, &mut tmp_b, n_v_heads, hidden, seq_len);
-        blas_matmul_nn(&d_a_t, &normed_input, &mut tmp_a, n_v_heads, hidden, seq_len);
+        blas_matmul_nn(
+            &d_b_t,
+            &normed_input,
+            &mut tmp_b,
+            n_v_heads,
+            hidden,
+            seq_len,
+        );
+        blas_matmul_nn(
+            &d_a_t,
+            &normed_input,
+            &mut tmp_a,
+            n_v_heads,
+            hidden,
+            seq_len,
+        );
         for i in 0..n_v_heads * hidden {
             weight_grads.d_in_proj_b[i] += tmp_b[i];
             weight_grads.d_in_proj_a[i] += tmp_a[i];
@@ -547,7 +595,8 @@ pub fn deltanet_layer_backward(
         for h in 0..hidden {
             let normed = row[h] * inv_rms;
             weight_grads.d_input_layernorm[h] += d_normed[t * hidden + h] * normed;
-            d_input[t * hidden + h] = d_normed[t * hidden + h] * weights.input_layernorm[h] * inv_rms;
+            d_input[t * hidden + h] =
+                d_normed[t * hidden + h] * weights.input_layernorm[h] * inv_rms;
         }
     }
 
@@ -630,20 +679,60 @@ pub fn deltanet_layer_gc_fused(
     // ═══ Phase 1: Pre-recurrence forward (projections, conv1d, gates) — GPU ═══
     let residual_attn = saved_input.to_vec();
     let mut normed = saved_input.to_vec();
-    blas_rmsnorm(&mut normed, &weights.input_layernorm, hidden, config.rms_norm_eps);
+    blas_rmsnorm(
+        &mut normed,
+        &weights.input_layernorm,
+        hidden,
+        config.rms_norm_eps,
+    );
 
     let mut qkv = vec![0.0f32; seq_len * qkv_dim];
-    blas_matmul_bt(&normed, &weights.in_proj_qkv, &mut qkv, seq_len, qkv_dim, hidden);
+    blas_matmul_bt(
+        &normed,
+        &weights.in_proj_qkv,
+        &mut qkv,
+        seq_len,
+        qkv_dim,
+        hidden,
+    );
     let mut z = vec![0.0f32; seq_len * val_dim];
-    blas_matmul_bt(&normed, &weights.in_proj_z, &mut z, seq_len, val_dim, hidden);
+    blas_matmul_bt(
+        &normed,
+        &weights.in_proj_z,
+        &mut z,
+        seq_len,
+        val_dim,
+        hidden,
+    );
     let mut b_raw = vec![0.0f32; seq_len * n_v_heads];
-    blas_matmul_bt(&normed, &weights.in_proj_b, &mut b_raw, seq_len, n_v_heads, hidden);
+    blas_matmul_bt(
+        &normed,
+        &weights.in_proj_b,
+        &mut b_raw,
+        seq_len,
+        n_v_heads,
+        hidden,
+    );
     let mut a_raw = vec![0.0f32; seq_len * n_v_heads];
-    blas_matmul_bt(&normed, &weights.in_proj_a, &mut a_raw, seq_len, n_v_heads, hidden);
+    blas_matmul_bt(
+        &normed,
+        &weights.in_proj_a,
+        &mut a_raw,
+        seq_len,
+        n_v_heads,
+        hidden,
+    );
 
     let pre_conv_qkv = qkv.clone();
     let mut qkv_conv = vec![0.0f32; seq_len * qkv_dim];
-    causal_conv1d_silu_row_major(&qkv, &weights.conv1d_weight, &mut qkv_conv, qkv_dim, seq_len, kernel_size);
+    causal_conv1d_silu_row_major(
+        &qkv,
+        &weights.conv1d_weight,
+        &mut qkv_conv,
+        qkv_dim,
+        seq_len,
+        kernel_size,
+    );
 
     let mut q_raw = vec![0.0f32; seq_len * key_dim];
     let mut k_raw = vec![0.0f32; seq_len * key_dim];
@@ -661,7 +750,18 @@ pub fn deltanet_layer_gc_fused(
         use crate::blas::CUDA_MATMUL;
         let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
         let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
-        crate::cuda_matmul::cuda_dn_l2norm_gqa(&cuda, &q_raw, &k_raw, &mut q_expanded, &mut k_expanded, seq_len, n_k_heads, n_v_heads, dk, 1e-6);
+        crate::cuda_matmul::cuda_dn_l2norm_gqa(
+            &cuda,
+            &q_raw,
+            &k_raw,
+            &mut q_expanded,
+            &mut k_expanded,
+            seq_len,
+            n_k_heads,
+            n_v_heads,
+            dk,
+            1e-6,
+        );
     }
 
     let mut beta = vec![0.0f32; seq_len * n_v_heads];
@@ -670,7 +770,17 @@ pub fn deltanet_layer_gc_fused(
         use crate::blas::CUDA_MATMUL;
         let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
         let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
-        crate::cuda_matmul::cuda_dn_gate_compute(&cuda, &b_raw, &a_raw, &weights.a_log, &weights.dt_bias, &mut beta, &mut g, seq_len, n_v_heads);
+        crate::cuda_matmul::cuda_dn_gate_compute(
+            &cuda,
+            &b_raw,
+            &a_raw,
+            &weights.a_log,
+            &weights.dt_bias,
+            &mut beta,
+            &mut g,
+            seq_len,
+            n_v_heads,
+        );
     }
 
     // ═══ Phase 2: GPU Forward (VRAM state保持) ═══
@@ -708,8 +818,17 @@ pub fn deltanet_layer_gc_fused(
             let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
             let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
             all_s_vram = crate::cuda_matmul::cuda_deltanet_forward_store(
-                &cuda, &q_gpu, &k_gpu, &v_gpu, &beta_gpu, &g_gpu,
-                &mut out_gpu, n_v_heads, seq_len, dk, dv,
+                &cuda,
+                &q_gpu,
+                &k_gpu,
+                &v_gpu,
+                &beta_gpu,
+                &g_gpu,
+                &mut out_gpu,
+                n_v_heads,
+                seq_len,
+                dk,
+                dv,
             );
         }
         // Layout back: [heads, seq, dv] → [seq, heads, dv]
@@ -729,33 +848,79 @@ pub fn deltanet_layer_gc_fused(
         use crate::blas::CUDA_MATMUL;
         let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
         let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
-        crate::cuda_matmul::cuda_dn_gated_rmsnorm(&cuda, &attn_out_raw, &z, &weights.norm_weight, &mut attn_normed, dv, config.rms_norm_eps);
+        crate::cuda_matmul::cuda_dn_gated_rmsnorm(
+            &cuda,
+            &attn_out_raw,
+            &z,
+            &weights.norm_weight,
+            &mut attn_normed,
+            dv,
+            config.rms_norm_eps,
+        );
     }
 
     let mut attn_out = vec![0.0f32; seq_len * hidden];
-    blas_matmul_bt(&attn_normed, &weights.out_proj, &mut attn_out, seq_len, hidden, val_dim);
+    blas_matmul_bt(
+        &attn_normed,
+        &weights.out_proj,
+        &mut attn_out,
+        seq_len,
+        hidden,
+        val_dim,
+    );
 
     let mut layer_out = saved_input.to_vec();
-    for i in 0..layer_out.len() { layer_out[i] = residual_attn[i] + attn_out[i]; }
+    for i in 0..layer_out.len() {
+        layer_out[i] = residual_attn[i] + attn_out[i];
+    }
 
     let residual_ffn = layer_out.clone();
     let mut normed_ffn = layer_out.clone();
-    blas_rmsnorm(&mut normed_ffn, &weights.post_attn_layernorm, hidden, config.rms_norm_eps);
+    blas_rmsnorm(
+        &mut normed_ffn,
+        &weights.post_attn_layernorm,
+        hidden,
+        config.rms_norm_eps,
+    );
     let normed_ffn_saved = normed_ffn.clone();
 
     let mut ffn_out = vec![0.0f32; seq_len * hidden];
     let mut gate_buf = vec![0.0f32; seq_len * inter];
     let mut up_buf = vec![0.0f32; seq_len * inter];
     let mut gate_silu_buf = vec![0.0f32; seq_len * inter];
-    blas_swiglu_ffn_training(&normed_ffn, &weights.gate_proj, &weights.up_proj, &weights.down_proj,
-        &mut ffn_out, &mut gate_buf, &mut up_buf, &mut gate_silu_buf, seq_len, hidden, inter);
+    blas_swiglu_ffn_training(
+        &normed_ffn,
+        &weights.gate_proj,
+        &weights.up_proj,
+        &weights.down_proj,
+        &mut ffn_out,
+        &mut gate_buf,
+        &mut up_buf,
+        &mut gate_silu_buf,
+        seq_len,
+        hidden,
+        inter,
+    );
 
     // ═══ Phase 4: Post-recurrence backward (FFN → gated rmsnorm → out_proj) ═══
     let mut d_ffn_input = vec![0.0f32; seq_len * hidden];
-    swiglu_ffn_backward(d_output, &normed_ffn_saved, &gate_buf, &up_buf, &gate_silu_buf,
-        &weights.gate_proj, &weights.up_proj, &weights.down_proj,
-        &mut d_ffn_input, &mut weight_grads.d_gate_proj, &mut weight_grads.d_up_proj,
-        &mut weight_grads.d_down_proj, seq_len, hidden, inter);
+    swiglu_ffn_backward(
+        d_output,
+        &normed_ffn_saved,
+        &gate_buf,
+        &up_buf,
+        &gate_silu_buf,
+        &weights.gate_proj,
+        &weights.up_proj,
+        &weights.down_proj,
+        &mut d_ffn_input,
+        &mut weight_grads.d_gate_proj,
+        &mut weight_grads.d_up_proj,
+        &mut weight_grads.d_down_proj,
+        seq_len,
+        hidden,
+        inter,
+    );
 
     let mut d_attn_block = vec![0.0f32; seq_len * hidden];
     for t in 0..seq_len {
@@ -765,19 +930,35 @@ pub fn deltanet_layer_gc_fused(
         for h in 0..hidden {
             let n = row[h] * inv_rms;
             weight_grads.d_post_attn_layernorm[h] += d_ffn_input[t * hidden + h] * n;
-            d_attn_block[t * hidden + h] = d_ffn_input[t * hidden + h] * weights.post_attn_layernorm[h] * inv_rms;
+            d_attn_block[t * hidden + h] =
+                d_ffn_input[t * hidden + h] * weights.post_attn_layernorm[h] * inv_rms;
         }
     }
-    for i in 0..seq_len * hidden { d_attn_block[i] += d_output[i]; }
+    for i in 0..seq_len * hidden {
+        d_attn_block[i] += d_output[i];
+    }
 
     let mut d_attn_normed = vec![0.0f32; seq_len * val_dim];
-    blas_matmul_nn(&d_attn_block, &weights.out_proj, &mut d_attn_normed, seq_len, val_dim, hidden);
+    blas_matmul_nn(
+        &d_attn_block,
+        &weights.out_proj,
+        &mut d_attn_normed,
+        seq_len,
+        val_dim,
+        hidden,
+    );
     {
         let mut d_block_t = vec![0.0f32; hidden * seq_len];
-        for t in 0..seq_len { for h in 0..hidden { d_block_t[h * seq_len + t] = d_attn_block[t * hidden + h]; } }
+        for t in 0..seq_len {
+            for h in 0..hidden {
+                d_block_t[h * seq_len + t] = d_attn_block[t * hidden + h];
+            }
+        }
         let mut tmp = vec![0.0f32; hidden * val_dim];
         blas_matmul_nn(&d_block_t, &attn_normed, &mut tmp, hidden, val_dim, seq_len);
-        for i in 0..hidden * val_dim { weight_grads.d_out_proj[i] += tmp[i]; }
+        for i in 0..hidden * val_dim {
+            weight_grads.d_out_proj[i] += tmp[i];
+        }
     }
 
     let mut d_recurrence_out = vec![0.0f32; seq_len * val_dim];
@@ -789,9 +970,11 @@ pub fn deltanet_layer_gc_fused(
         for j in 0..dv {
             let sig_z = 1.0 / (1.0 + (-row_z[j]).exp());
             let silu_z = row_z[j] * sig_z;
-            d_recurrence_out[t * val_dim + j] = d_attn_normed[t * val_dim + j] * silu_z * weights.norm_weight[j % dv] * inv_rms;
+            d_recurrence_out[t * val_dim + j] =
+                d_attn_normed[t * val_dim + j] * silu_z * weights.norm_weight[j % dv] * inv_rms;
             let normed_x = row_x[j] * inv_rms;
-            weight_grads.d_norm_weight[j % dv] += d_attn_normed[t * val_dim + j] * normed_x * silu_z;
+            weight_grads.d_norm_weight[j % dv] +=
+                d_attn_normed[t * val_dim + j] * normed_x * silu_z;
         }
     }
 
@@ -816,10 +999,23 @@ pub fn deltanet_layer_gc_fused(
         let cuda_mtx = CUDA_MATMUL.get().expect("CUDA 未初期化");
         let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
         crate::cuda_matmul::cuda_deltanet_backward_from_vram(
-            &cuda, &q_gpu, &k_gpu, &v_gpu, &beta_gpu, &g_gpu, &do_gpu,
+            &cuda,
+            &q_gpu,
+            &k_gpu,
+            &v_gpu,
+            &beta_gpu,
+            &g_gpu,
+            &do_gpu,
             &all_s_vram,
-            &mut dq_gpu, &mut dk_gpu_out, &mut dv_gpu_out, &mut dbeta_gpu, &mut dg_gpu,
-            n_v_heads, seq_len, dk, dv,
+            &mut dq_gpu,
+            &mut dk_gpu_out,
+            &mut dv_gpu_out,
+            &mut dbeta_gpu,
+            &mut dg_gpu,
+            n_v_heads,
+            seq_len,
+            dk,
+            dv,
         );
     }
     drop(all_s_vram); // VRAM解放
@@ -851,46 +1047,105 @@ pub fn deltanet_layer_gc_fused(
         for kh in 0..n_k_heads {
             for d in 0..dk {
                 let mut sum = 0.0f32;
-                for gg in 0..gqa_ratio { sum += d_q[t * n_v_heads * dk + (kh * gqa_ratio + gg) * dk + d]; }
+                for gg in 0..gqa_ratio {
+                    sum += d_q[t * n_v_heads * dk + (kh * gqa_ratio + gg) * dk + d];
+                }
                 d_qkv_conv[t * qkv_dim + kh * dk + d] = sum;
             }
         }
         for kh in 0..n_k_heads {
             for d in 0..dk {
                 let mut sum = 0.0f32;
-                for gg in 0..gqa_ratio { sum += d_k[t * n_v_heads * dk + (kh * gqa_ratio + gg) * dk + d]; }
+                for gg in 0..gqa_ratio {
+                    sum += d_k[t * n_v_heads * dk + (kh * gqa_ratio + gg) * dk + d];
+                }
                 d_qkv_conv[t * qkv_dim + key_dim + kh * dk + d] = sum;
             }
         }
-        for j in 0..val_dim { d_qkv_conv[t * qkv_dim + key_dim * 2 + j] = d_v[t * n_v_heads * dv + j]; }
+        for j in 0..val_dim {
+            d_qkv_conv[t * qkv_dim + key_dim * 2 + j] = d_v[t * n_v_heads * dv + j];
+        }
     }
 
     let mut d_qkv_pre_conv = vec![0.0f32; seq_len * qkv_dim];
-    causal_conv1d_backward(&d_qkv_conv, &pre_conv_qkv, &weights.conv1d_weight,
-        &mut d_qkv_pre_conv, &mut weight_grads.d_conv1d_weight, qkv_dim, seq_len, kernel_size);
+    causal_conv1d_backward(
+        &d_qkv_conv,
+        &pre_conv_qkv,
+        &weights.conv1d_weight,
+        &mut d_qkv_pre_conv,
+        &mut weight_grads.d_conv1d_weight,
+        qkv_dim,
+        seq_len,
+        kernel_size,
+    );
 
     let mut d_normed = vec![0.0f32; seq_len * hidden];
-    blas_matmul_nn(&d_qkv_pre_conv, &weights.in_proj_qkv, &mut d_normed, seq_len, hidden, qkv_dim);
+    blas_matmul_nn(
+        &d_qkv_pre_conv,
+        &weights.in_proj_qkv,
+        &mut d_normed,
+        seq_len,
+        hidden,
+        qkv_dim,
+    );
     {
         let mut normed_input = residual_attn.clone();
-        blas_rmsnorm(&mut normed_input, &weights.input_layernorm, hidden, config.rms_norm_eps);
+        blas_rmsnorm(
+            &mut normed_input,
+            &weights.input_layernorm,
+            hidden,
+            config.rms_norm_eps,
+        );
         let mut d_qkv_t = vec![0.0f32; qkv_dim * seq_len];
-        for t in 0..seq_len { for j in 0..qkv_dim { d_qkv_t[j * seq_len + t] = d_qkv_pre_conv[t * qkv_dim + j]; } }
+        for t in 0..seq_len {
+            for j in 0..qkv_dim {
+                d_qkv_t[j * seq_len + t] = d_qkv_pre_conv[t * qkv_dim + j];
+            }
+        }
         let mut tmp = vec![0.0f32; qkv_dim * hidden];
         blas_matmul_nn(&d_qkv_t, &normed_input, &mut tmp, qkv_dim, hidden, seq_len);
-        for i in 0..qkv_dim * hidden { weight_grads.d_in_proj_qkv[i] += tmp[i]; }
+        for i in 0..qkv_dim * hidden {
+            weight_grads.d_in_proj_qkv[i] += tmp[i];
+        }
     }
     {
         let mut normed_input = residual_attn.clone();
-        blas_rmsnorm(&mut normed_input, &weights.input_layernorm, hidden, config.rms_norm_eps);
+        blas_rmsnorm(
+            &mut normed_input,
+            &weights.input_layernorm,
+            hidden,
+            config.rms_norm_eps,
+        );
         let mut d_b_t = vec![0.0f32; n_v_heads * seq_len];
         let mut d_a_t = vec![0.0f32; n_v_heads * seq_len];
-        for t in 0..seq_len { for h in 0..n_v_heads { d_b_t[h * seq_len + t] = d_b_logit[t * n_v_heads + h]; d_a_t[h * seq_len + t] = d_a_logit[t * n_v_heads + h]; } }
+        for t in 0..seq_len {
+            for h in 0..n_v_heads {
+                d_b_t[h * seq_len + t] = d_b_logit[t * n_v_heads + h];
+                d_a_t[h * seq_len + t] = d_a_logit[t * n_v_heads + h];
+            }
+        }
         let mut tmp_b = vec![0.0f32; n_v_heads * hidden];
         let mut tmp_a = vec![0.0f32; n_v_heads * hidden];
-        blas_matmul_nn(&d_b_t, &normed_input, &mut tmp_b, n_v_heads, hidden, seq_len);
-        blas_matmul_nn(&d_a_t, &normed_input, &mut tmp_a, n_v_heads, hidden, seq_len);
-        for i in 0..n_v_heads * hidden { weight_grads.d_in_proj_b[i] += tmp_b[i]; weight_grads.d_in_proj_a[i] += tmp_a[i]; }
+        blas_matmul_nn(
+            &d_b_t,
+            &normed_input,
+            &mut tmp_b,
+            n_v_heads,
+            hidden,
+            seq_len,
+        );
+        blas_matmul_nn(
+            &d_a_t,
+            &normed_input,
+            &mut tmp_a,
+            n_v_heads,
+            hidden,
+            seq_len,
+        );
+        for i in 0..n_v_heads * hidden {
+            weight_grads.d_in_proj_b[i] += tmp_b[i];
+            weight_grads.d_in_proj_a[i] += tmp_a[i];
+        }
     }
 
     let mut d_input = vec![0.0f32; seq_len * hidden];
@@ -901,10 +1156,13 @@ pub fn deltanet_layer_gc_fused(
         for h in 0..hidden {
             let n = row[h] * inv_rms;
             weight_grads.d_input_layernorm[h] += d_normed[t * hidden + h] * n;
-            d_input[t * hidden + h] = d_normed[t * hidden + h] * weights.input_layernorm[h] * inv_rms;
+            d_input[t * hidden + h] =
+                d_normed[t * hidden + h] * weights.input_layernorm[h] * inv_rms;
         }
     }
-    for i in 0..seq_len * hidden { d_input[i] += d_output[i]; }
+    for i in 0..seq_len * hidden {
+        d_input[i] += d_output[i];
+    }
 
     d_input
 }
