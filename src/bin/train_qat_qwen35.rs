@@ -61,6 +61,79 @@ fn print_rss(label: &str) {
     let _ = label;
 }
 
+/// ホスト名取得。
+fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// GPU名取得 (nvidia-smi)。
+fn gpu_name() -> String {
+    std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// 現在時刻 (UTC ISO 8601)。
+fn chrono_now() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs();
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let h = rem / 3600;
+    let m = (rem % 3600) / 60;
+    let s = rem % 60;
+    // Simple epoch-days to Y-M-D (good enough for logging)
+    let mut y = 1970u64;
+    let mut remaining_days = days;
+    loop {
+        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        y += 1;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let month_days: [u64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut mo = 0;
+    for (i, &md) in month_days.iter().enumerate() {
+        if remaining_days < md {
+            mo = i + 1;
+            break;
+        }
+        remaining_days -= md;
+    }
+    let day = remaining_days + 1;
+    format!("{y}-{mo:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
 /// ALICE-Train QAT: Qwen3.5 → 1.1-bit Sparse Ternary
 #[derive(Parser, Debug)]
 #[command(author = "Moroya Sakamoto")]
@@ -599,6 +672,81 @@ fn main() {
             Vec::new()
         };
         println!();
+
+        // --- 実行環境記録 ---
+        {
+            let run_record = format!(
+                concat!(
+                    "{{",
+                    "\"timestamp\":\"{}\",",
+                    "\"config_file\":\"{}\",",
+                    "\"seq_len\":{},",
+                    "\"batch_size\":{},",
+                    "\"gradient_accumulation_steps\":{},",
+                    "\"learning_rate\":{},",
+                    "\"min_lr\":{},",
+                    "\"max_grad_norm\":{},",
+                    "\"total_steps\":{},",
+                    "\"warmup_steps\":{},",
+                    "\"weight_decay\":{},",
+                    "\"preload_all_layers\":{},",
+                    "\"bf16_delta\":{},",
+                    "\"hidden_size\":{},",
+                    "\"num_layers\":{},",
+                    "\"vocab_size\":{},",
+                    "\"hostname\":\"{}\",",
+                    "\"gpu\":\"{}\",",
+                    "\"cuda_features\":{},",
+                    "\"rust_version\":\"{}\",",
+                    "\"resume_step\":{}",
+                    "}}"
+                ),
+                chrono_now(),
+                cli.config,
+                config.seq_len,
+                config.batch_size,
+                config.gradient_accumulation_steps,
+                config.learning_rate,
+                config.min_lr,
+                config.max_grad_norm,
+                config.total_steps,
+                config.warmup_steps,
+                config.weight_decay,
+                config.preload_all_layers,
+                config.bf16_delta,
+                config.model.hidden_size,
+                config.model.num_hidden_layers,
+                config.model.vocab_size,
+                hostname(),
+                gpu_name(),
+                cfg!(feature = "cuda"),
+                env!("CARGO_PKG_VERSION"),
+                global_step,
+            );
+            let record_path = format!("{}/run_record.json", config.checkpoint_dir);
+            match fs::write(&record_path, &run_record) {
+                Ok(()) => println!("  実行環境記録: {record_path}"),
+                Err(e) => eprintln!("  実行環境記録失敗: {e}"),
+            }
+            // ログにも出力
+            println!("  config: {}", cli.config);
+            println!(
+                "  seq_len={} batch={} grad_accum={} lr={:.2e} max_grad_norm={} steps={}",
+                config.seq_len,
+                config.batch_size,
+                config.gradient_accumulation_steps,
+                config.learning_rate,
+                config.max_grad_norm,
+                config.total_steps,
+            );
+            println!(
+                "  gpu={} cuda={} preload={} hostname={}",
+                gpu_name(),
+                cfg!(feature = "cuda"),
+                config.preload_all_layers,
+                hostname(),
+            );
+        }
 
         // --- 学習ループ ---
         println!(
