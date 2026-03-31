@@ -909,6 +909,7 @@ fn main() {
                                                 seq_len,
                                                 &mut wg,
                                             );
+                                        wg.clip_grad_norm(config.max_grad_norm);
                                         wg.apply_sgd(w, lr * inv_tokens, config.weight_decay);
                                         (d_in, None)
                                     }
@@ -943,19 +944,21 @@ fn main() {
 
                         d_hidden = d_input;
 
-                        // FullAttention層のweight update
-                        if let Some(grads) = grads {
-                            match (grads, &mut layers[i]) {
+                        // FullAttention層のweight update (grad clipping付き)
+                        if let Some(mut grads) = grads {
+                            match (&mut grads, &mut layers[i]) {
                                 (
                                     Qwen35WeightGrads::DeltaNet(g),
                                     Qwen35LayerWeights::DeltaNet(w),
                                 ) => {
+                                    g.clip_grad_norm(config.max_grad_norm);
                                     g.apply_sgd(w, lr * inv_tokens, config.weight_decay);
                                 }
                                 (
                                     Qwen35WeightGrads::FullAttention(g),
                                     Qwen35LayerWeights::FullAttention(w),
                                 ) => {
+                                    g.clip_grad_norm(config.max_grad_norm);
                                     g.apply_sgd(w, lr * inv_tokens, config.weight_decay);
                                 }
                                 _ => {}
@@ -1088,16 +1091,21 @@ fn main() {
                         d_hidden = d_input;
                         drop(cache); // activation cache 即解放
 
-                        // Weight update + 書き戻し
+                        // Weight update + 書き戻し (grad clipping付き)
                         let mut layer_w = layer_w_orig;
                         match (grads, &mut layer_w) {
-                            (Qwen35WeightGrads::DeltaNet(g), Qwen35LayerWeights::DeltaNet(w)) => {
+                            (
+                                Qwen35WeightGrads::DeltaNet(mut g),
+                                Qwen35LayerWeights::DeltaNet(w),
+                            ) => {
+                                g.clip_grad_norm(config.max_grad_norm);
                                 g.apply_sgd(w, lr * inv_tokens, config.weight_decay);
                             }
                             (
-                                Qwen35WeightGrads::FullAttention(g),
+                                Qwen35WeightGrads::FullAttention(mut g),
                                 Qwen35LayerWeights::FullAttention(w),
                             ) => {
+                                g.clip_grad_norm(config.max_grad_norm);
                                 g.apply_sgd(w, lr * inv_tokens, config.weight_decay);
                             }
                             _ => {}

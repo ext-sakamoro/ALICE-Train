@@ -65,6 +65,92 @@ pub struct FullAttnWeightGrads {
     pub d_down_proj: Vec<f32>,
 }
 
+impl FullAttnWeightGrads {
+    /// 全勾配テンソルの L2 ノルムを計算。
+    pub fn grad_norm(&self) -> f32 {
+        let mut sum = 0.0f64;
+        for v in [
+            &self.d_q_proj,
+            &self.d_k_proj,
+            &self.d_v_proj,
+            &self.d_o_proj,
+            &self.d_gate_proj,
+            &self.d_up_proj,
+            &self.d_down_proj,
+        ] {
+            for &x in v.iter() {
+                sum += (x as f64) * (x as f64);
+            }
+        }
+        (sum as f32).sqrt()
+    }
+
+    /// 勾配ノルムが max_norm を超える場合、全勾配をスケーリング。
+    pub fn clip_grad_norm(&mut self, max_norm: f32) {
+        let norm = self.grad_norm();
+        if norm > max_norm && norm > 1e-10 {
+            let scale = max_norm / norm;
+            for v in [
+                &mut self.d_q_proj,
+                &mut self.d_k_proj,
+                &mut self.d_v_proj,
+                &mut self.d_o_proj,
+                &mut self.d_gate_proj,
+                &mut self.d_up_proj,
+                &mut self.d_down_proj,
+            ] {
+                for x in v.iter_mut() {
+                    *x *= scale;
+                }
+            }
+        }
+    }
+}
+
+impl DeltaNetWeightGrads {
+    /// 全勾配テンソルの L2 ノルムを計算。
+    pub fn grad_norm(&self) -> f32 {
+        let mut sum = 0.0f64;
+        for v in [
+            &self.d_in_proj_qkv,
+            &self.d_in_proj_z,
+            &self.d_in_proj_b,
+            &self.d_in_proj_a,
+            &self.d_out_proj,
+            &self.d_gate_proj,
+            &self.d_up_proj,
+            &self.d_down_proj,
+        ] {
+            for &x in v.iter() {
+                sum += (x as f64) * (x as f64);
+            }
+        }
+        (sum as f32).sqrt()
+    }
+
+    /// 勾配ノルムが max_norm を超える場合、全勾配をスケーリング。
+    pub fn clip_grad_norm(&mut self, max_norm: f32) {
+        let norm = self.grad_norm();
+        if norm > max_norm && norm > 1e-10 {
+            let scale = max_norm / norm;
+            for v in [
+                &mut self.d_in_proj_qkv,
+                &mut self.d_in_proj_z,
+                &mut self.d_in_proj_b,
+                &mut self.d_in_proj_a,
+                &mut self.d_out_proj,
+                &mut self.d_gate_proj,
+                &mut self.d_up_proj,
+                &mut self.d_down_proj,
+            ] {
+                for x in v.iter_mut() {
+                    *x *= scale;
+                }
+            }
+        }
+    }
+}
+
 /// ハイブリッドレイヤーの重み勾配。
 pub enum Qwen35WeightGrads {
     /// DeltaNet 層の勾配。
