@@ -222,6 +222,31 @@ impl BpeTokenizer {
         ids
     }
 
+    /// マルチターン ChatML フォーマット。
+    ///
+    /// 各 `(role, content)` を `<|im_start|>role\ncontent<|im_end|>\n` で結合し、
+    /// 最後に `<|im_start|>assistant\n` を付与して生成を開始させる。
+    ///
+    /// `tool` ロール（ツール結果）を含む任意のターン数に対応。
+    #[must_use]
+    pub fn format_multi_turn(&self, messages: &[(&str, &str)]) -> Vec<u32> {
+        let mut ids = Vec::new();
+
+        for &(role, content) in messages {
+            ids.push(self.im_start_id);
+            ids.extend(self.encode(&format!("{role}\n")));
+            ids.extend(self.encode(content));
+            ids.push(self.im_end_id);
+            ids.extend(self.encode("\n"));
+        }
+
+        // assistant prefix
+        ids.push(self.im_start_id);
+        ids.extend(self.encode("assistant\n"));
+
+        ids
+    }
+
     /// 特定のトークン文字列を ID に変換。
     #[must_use]
     pub fn token_id(&self, token: &str) -> Option<u32> {
@@ -417,5 +442,33 @@ mod tests {
         assert_eq!(tok.token_id("<|im_start|>"), Some(100));
         assert_eq!(tok.token_id("<|im_end|>"), Some(101));
         assert_eq!(tok.token_id("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_format_multi_turn() {
+        let tok = BpeTokenizer::from_json(&mini_tokenizer_json()).unwrap();
+        let messages = vec![
+            ("system", "hello"),
+            ("user", "hello"),
+            ("assistant", "hello"),
+            ("tool", "hello"),
+            ("user", "hello"),
+        ];
+        let ids = tok.format_multi_turn(&messages);
+        // 5ターン分の im_start (5) + 末尾の assistant prefix (1) = 6
+        let im_start_count = ids.iter().filter(|&&id| id == 100).count();
+        assert_eq!(im_start_count, 6);
+        // 5ターン分の im_end = 5
+        let im_end_count = ids.iter().filter(|&&id| id == 101).count();
+        assert_eq!(im_end_count, 5);
+    }
+
+    #[test]
+    fn test_format_multi_turn_empty() {
+        let tok = BpeTokenizer::from_json(&mini_tokenizer_json()).unwrap();
+        let ids = tok.format_multi_turn(&[]);
+        // assistant prefix のみ
+        assert!(ids.contains(&100)); // im_start
+        assert!(!ids.contains(&101)); // im_end なし
     }
 }

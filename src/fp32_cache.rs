@@ -189,6 +189,8 @@ pub fn build_cache(
         let lt = config.layer_type(i);
         let path = layer_path(base_dir, i, lt);
         let layer_prefix = format!("{weight_prefix}.layers.{i}");
+        // 既存キャッシュはスキップ（学習済み更新を保持）
+        if path.exists() { continue; }
 
         match lt {
             LayerType::LinearAttention => {
@@ -283,6 +285,21 @@ pub fn cache_size_bytes(config: &Qwen35Config) -> usize {
         };
     }
     total
+}
+
+/// チェックポイント保存後にページキャッシュを解放し、学習ループのメモリ効率低下を防ぐ。
+#[cfg(target_os = "linux")]
+pub fn drop_page_cache(base_dir: &str, config: &Qwen35Config) {
+    use std::os::unix::io::AsRawFd;
+    for i in 0..config.num_hidden_layers {
+        let lt = config.layer_type(i);
+        let path = layer_path(base_dir, i, lt);
+        if let Ok(f) = std::fs::File::open(&path) {
+            unsafe {
+                libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+            }
+        }
+    }
 }
 
 // ============================================================================

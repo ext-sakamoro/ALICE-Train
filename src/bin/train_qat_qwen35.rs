@@ -331,6 +331,7 @@ fn main() {
     );
     let mut log = TrainLog::new();
     let mut global_step: usize = 0;
+    let mut resume_start_step: usize = 0;
 
     // resume_state.json から step 復元
     let resume_path = format!("{}/resume_state.json", config.checkpoint_dir);
@@ -338,6 +339,7 @@ fn main() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
             if let Some(step) = v.get("step").and_then(|s| s.as_u64()) {
                 global_step = step as usize;
+                resume_start_step = global_step;
                 let prev_loss = v.get("loss").and_then(|l| l.as_f64()).unwrap_or(0.0);
                 println!("  Resume: step {global_step}, loss {prev_loss:.4}");
             }
@@ -457,7 +459,8 @@ fn main() {
 
             {
                 let elapsed = train_start.elapsed();
-                let steps_per_sec = (global_step + 1) as f64 / elapsed.as_secs_f64().max(0.001);
+                let steps_done = (global_step - resume_start_step).max(1) as f64;
+                let steps_per_sec = steps_done / elapsed.as_secs_f64().max(0.001);
                 let eta_secs = (config.total_steps - global_step) as f64 / steps_per_sec.max(0.001);
                 println!(
                     "  step {global_step:>5}/{} | loss: {avg_loss:.4} | lr: {lr:.2e} | {:.1}ms/step | ETA: {eta_secs:.0}s",
@@ -1223,7 +1226,8 @@ fn main() {
 
             {
                 let elapsed = train_start.elapsed();
-                let steps_per_sec = (global_step + 1) as f64 / elapsed.as_secs_f64().max(0.001);
+                let steps_done = (global_step - resume_start_step).max(1) as f64;
+                let steps_per_sec = steps_done / elapsed.as_secs_f64().max(0.001);
                 let eta_secs = (config.total_steps - global_step) as f64 / steps_per_sec.max(0.001);
                 println!(
                     "  step {global_step:>5}/{} | loss: {avg_loss:.4} | lr: {lr:.2e} | {:.1}ms/step | ETA: {eta_secs:.0}s",
@@ -1293,6 +1297,8 @@ fn main() {
                         "    FP32キャッシュ書き戻し完了 ({} layers)",
                         config.model.num_hidden_layers
                     );
+                    // ページキャッシュ解放 — 26GB書き込み後のメモリ効率低下を防止
+                    alice_train::fp32_cache::drop_page_cache(cache_base, &config.model);
                 }
 
                 let ckpt_path = format!("{}/step_{global_step}.bin", config.checkpoint_dir);
