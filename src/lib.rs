@@ -101,6 +101,7 @@ pub mod logger;
 pub mod mixed_precision;
 pub mod offload;
 pub mod pipeline;
+pub mod pth_loader;
 pub mod qat;
 pub mod qwen35;
 pub mod qwen35_backward;
