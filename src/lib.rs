@@ -110,6 +110,7 @@ pub mod safetensors_loader;
 pub mod scheduler;
 pub mod tokenizer;
 pub mod trainer;
+pub mod vision;
 
 // GPU モジュール (feature gate)
 #[cfg(feature = "gpu")]
