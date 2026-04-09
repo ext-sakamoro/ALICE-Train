@@ -977,7 +977,25 @@ fn main() {
                                 let accum_scale = 1.0 / accum_count as f32;
                                 g.scale(accum_scale);
                                 g.clip_grad_norm(config.max_grad_norm);
-                                g.apply_sgd(&mut layers[i], lr, config.weight_decay);
+
+                                // Layer 0: フリップ率計測 (STE の効果を可視化)
+                                if i == 0 {
+                                    // 更新前の Ternary 重み
+                                    let old_fq = layers[0].fake_quantize();
+                                    g.apply_sgd(&mut layers[0], lr, config.weight_decay);
+                                    // 更新後の Ternary 重み
+                                    let new_fq = layers[0].fake_quantize();
+                                    // in_proj_qkv でフリップ率を計算
+                                    if let (Qwen35LayerWeights::DeltaNet(ref o), Qwen35LayerWeights::DeltaNet(ref n)) = (&old_fq, &new_fq) {
+                                        let flipped = o.in_proj_qkv.iter().zip(n.in_proj_qkv.iter())
+                                            .filter(|(&a, &b)| (a - b).abs() > 1e-5).count();
+                                        let total = o.in_proj_qkv.len();
+                                        let ratio = flipped as f64 / total as f64 * 100.0;
+                                        eprintln!("    [Layer 0 qkv] Ternary Flip: {:.4}% ({}/{})", ratio, flipped, total);
+                                    }
+                                } else {
+                                    g.apply_sgd(&mut layers[i], lr, config.weight_decay);
+                                }
                             }
                         }
                         for g in accumulated_grads.iter_mut() { *g = None; }

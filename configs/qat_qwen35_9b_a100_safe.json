@@ -27,7 +27,7 @@
             "LinearAttention", "LinearAttention", "LinearAttention", "FullAttention"
         ]
     },
-    "learning_rate": 1e-4,
+    "learning_rate": 3e-3,
     "min_lr": 1e-6,
     "warmup_steps": 10,
     "total_steps": 5000,
