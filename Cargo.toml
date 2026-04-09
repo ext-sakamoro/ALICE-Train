@@ -39,6 +39,11 @@ path = "src/bin/alice_inference.rs"
 required-features = ["qat-cli"]
 
 [[bin]]
+name = "forward-diag"
+path = "src/bin/forward_diag.rs"
+required-features = ["qat-cli"]
+
+[[bin]]
 name = "train-debug"
 path = "src/bin/train_debug.rs"
 required-features = ["qat-cli"]

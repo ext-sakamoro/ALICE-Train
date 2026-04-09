@@ -215,6 +215,37 @@ impl DeltaNetWeightGrads {
         sgd_update(&mut weights.up_proj, &self.d_up_proj, lr, wd);
         sgd_update(&mut weights.down_proj, &self.d_down_proj, lr, wd);
     }
+
+    /// 勾配を累積する（要素ごとの加算）。
+    pub fn add_assign(&mut self, other: &Self) {
+        vec_add_assign(&mut self.d_input_layernorm, &other.d_input_layernorm);
+        vec_add_assign(&mut self.d_post_attn_layernorm, &other.d_post_attn_layernorm);
+        vec_add_assign(&mut self.d_in_proj_qkv, &other.d_in_proj_qkv);
+        vec_add_assign(&mut self.d_in_proj_z, &other.d_in_proj_z);
+        vec_add_assign(&mut self.d_in_proj_b, &other.d_in_proj_b);
+        vec_add_assign(&mut self.d_in_proj_a, &other.d_in_proj_a);
+        vec_add_assign(&mut self.d_a_log, &other.d_a_log);
+        vec_add_assign(&mut self.d_dt_bias, &other.d_dt_bias);
+        vec_add_assign(&mut self.d_conv1d_weight, &other.d_conv1d_weight);
+        vec_add_assign(&mut self.d_norm_weight, &other.d_norm_weight);
+        vec_add_assign(&mut self.d_out_proj, &other.d_out_proj);
+        vec_add_assign(&mut self.d_gate_proj, &other.d_gate_proj);
+        vec_add_assign(&mut self.d_up_proj, &other.d_up_proj);
+        vec_add_assign(&mut self.d_down_proj, &other.d_down_proj);
+    }
+
+    /// 全勾配をスケーリングする。
+    pub fn scale(&mut self, s: f32) {
+        for v in [
+            &mut self.d_in_proj_qkv, &mut self.d_in_proj_z, &mut self.d_in_proj_b,
+            &mut self.d_in_proj_a, &mut self.d_out_proj, &mut self.d_gate_proj,
+            &mut self.d_up_proj, &mut self.d_down_proj, &mut self.d_input_layernorm,
+            &mut self.d_post_attn_layernorm, &mut self.d_a_log, &mut self.d_dt_bias,
+            &mut self.d_conv1d_weight, &mut self.d_norm_weight,
+        ] {
+            for x in v.iter_mut() { *x *= s; }
+        }
+    }
 }
 
 impl FullAttnWeightGrads {
@@ -266,6 +297,33 @@ impl FullAttnWeightGrads {
         sgd_update(&mut weights.up_proj, &self.d_up_proj, lr, wd);
         sgd_update(&mut weights.down_proj, &self.d_down_proj, lr, wd);
     }
+
+    /// 勾配を累積する（要素ごとの加算）。
+    pub fn add_assign(&mut self, other: &Self) {
+        vec_add_assign(&mut self.d_input_layernorm, &other.d_input_layernorm);
+        vec_add_assign(&mut self.d_post_attn_layernorm, &other.d_post_attn_layernorm);
+        vec_add_assign(&mut self.d_q_proj, &other.d_q_proj);
+        vec_add_assign(&mut self.d_k_proj, &other.d_k_proj);
+        vec_add_assign(&mut self.d_v_proj, &other.d_v_proj);
+        vec_add_assign(&mut self.d_o_proj, &other.d_o_proj);
+        vec_add_assign(&mut self.d_q_norm, &other.d_q_norm);
+        vec_add_assign(&mut self.d_k_norm, &other.d_k_norm);
+        vec_add_assign(&mut self.d_gate_proj, &other.d_gate_proj);
+        vec_add_assign(&mut self.d_up_proj, &other.d_up_proj);
+        vec_add_assign(&mut self.d_down_proj, &other.d_down_proj);
+    }
+
+    /// 全勾配をスケーリングする。
+    pub fn scale(&mut self, s: f32) {
+        for v in [
+            &mut self.d_q_proj, &mut self.d_k_proj, &mut self.d_v_proj,
+            &mut self.d_o_proj, &mut self.d_gate_proj, &mut self.d_up_proj,
+            &mut self.d_down_proj, &mut self.d_input_layernorm,
+            &mut self.d_post_attn_layernorm, &mut self.d_q_norm, &mut self.d_k_norm,
+        ] {
+            for x in v.iter_mut() { *x *= s; }
+        }
+    }
 }
 
 impl Qwen35WeightGrads {
@@ -276,6 +334,51 @@ impl Qwen35WeightGrads {
             LayerType::LinearAttention => Self::DeltaNet(DeltaNetWeightGrads::zeros(config)),
             LayerType::FullAttention => Self::FullAttention(FullAttnWeightGrads::zeros(config)),
         }
+    }
+
+    /// 勾配を累積する（要素ごとの加算）。
+    pub fn add_assign(&mut self, other: &Self) {
+        match (self, other) {
+            (Self::DeltaNet(a), Self::DeltaNet(b)) => a.add_assign(b),
+            (Self::FullAttention(a), Self::FullAttention(b)) => a.add_assign(b),
+            _ => {}
+        }
+    }
+
+    /// 全勾配をスケーリングする。
+    pub fn scale(&mut self, s: f32) {
+        match self {
+            Self::DeltaNet(g) => g.scale(s),
+            Self::FullAttention(g) => g.scale(s),
+        }
+    }
+
+    /// clip_grad_norm。
+    pub fn clip_grad_norm(&mut self, max_norm: f32) {
+        match self {
+            Self::DeltaNet(g) => g.clip_grad_norm(max_norm),
+            Self::FullAttention(g) => g.clip_grad_norm(max_norm),
+        }
+    }
+
+    /// SGD で重みに反映する。
+    pub fn apply_sgd(&self, weights: &mut crate::qwen35::Qwen35LayerWeights, lr: f32, wd: f32) {
+        match (self, weights) {
+            (Self::DeltaNet(g), crate::qwen35::Qwen35LayerWeights::DeltaNet(w)) => {
+                g.apply_sgd(w, lr, wd);
+            }
+            (Self::FullAttention(g), crate::qwen35::Qwen35LayerWeights::FullAttention(w)) => {
+                g.apply_sgd(w, lr, wd);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 要素ごとの加算。
+fn vec_add_assign(dst: &mut [f32], src: &[f32]) {
+    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+        *d += s;
     }
 }
 
@@ -1557,5 +1660,133 @@ mod tests {
         assert!(d_input.iter().all(|v| v.is_finite()));
         assert!(d_gate_proj.iter().all(|v| v.is_finite()));
         assert!(d_input.iter().any(|v| v.abs() > 1e-10));
+    }
+
+    // ── add_assign テスト ──
+
+    #[test]
+    fn deltanet_grads_add_assign() {
+        let config = Qwen35Config::qwen35_9b();
+        let mut a = DeltaNetWeightGrads::zeros(&config);
+        let mut b = DeltaNetWeightGrads::zeros(&config);
+        // a の全要素を 1.0 に
+        for v in a.d_in_proj_qkv.iter_mut() { *v = 1.0; }
+        for v in a.d_gate_proj.iter_mut() { *v = 2.0; }
+        // b の全要素を 3.0 に
+        for v in b.d_in_proj_qkv.iter_mut() { *v = 3.0; }
+        for v in b.d_gate_proj.iter_mut() { *v = 4.0; }
+
+        a.add_assign(&b);
+        assert!((a.d_in_proj_qkv[0] - 4.0).abs() < 1e-6); // 1+3
+        assert!((a.d_gate_proj[0] - 6.0).abs() < 1e-6); // 2+4
+    }
+
+    #[test]
+    fn fullattn_grads_add_assign() {
+        let config = Qwen35Config::qwen35_9b();
+        let mut a = FullAttnWeightGrads::zeros(&config);
+        let mut b = FullAttnWeightGrads::zeros(&config);
+        for v in a.d_q_proj.iter_mut() { *v = 1.0; }
+        for v in b.d_q_proj.iter_mut() { *v = 5.0; }
+
+        a.add_assign(&b);
+        assert!((a.d_q_proj[0] - 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn deltanet_grads_scale() {
+        let config = Qwen35Config::qwen35_9b();
+        let mut g = DeltaNetWeightGrads::zeros(&config);
+        for v in g.d_in_proj_qkv.iter_mut() { *v = 4.0; }
+        for v in g.d_out_proj.iter_mut() { *v = 8.0; }
+
+        g.scale(0.25);
+        assert!((g.d_in_proj_qkv[0] - 1.0).abs() < 1e-6);
+        assert!((g.d_out_proj[0] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fullattn_grads_scale() {
+        let config = Qwen35Config::qwen35_9b();
+        let mut g = FullAttnWeightGrads::zeros(&config);
+        for v in g.d_q_proj.iter_mut() { *v = 10.0; }
+
+        g.scale(0.5);
+        assert!((g.d_q_proj[0] - 5.0).abs() < 1e-6);
+    }
+
+    // ── Qwen35WeightGrads enum テスト ──
+
+    #[test]
+    fn qwen35_grads_add_assign_deltanet() {
+        let config = Qwen35Config::qwen35_9b();
+        let mut a = Qwen35WeightGrads::zeros(&config, LayerType::LinearAttention);
+        let b = Qwen35WeightGrads::zeros(&config, LayerType::LinearAttention);
+        if let Qwen35WeightGrads::DeltaNet(ref mut g) = a {
+            for v in g.d_gate_proj.iter_mut() { *v = 1.0; }
+        }
+        a.add_assign(&b); // b is zeros, should stay 1.0
+        if let Qwen35WeightGrads::DeltaNet(ref g) = a {
+            assert!((g.d_gate_proj[0] - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn qwen35_grads_scale_fullattn() {
+        let config = Qwen35Config::qwen35_9b();
+        let mut g = Qwen35WeightGrads::zeros(&config, LayerType::FullAttention);
+        if let Qwen35WeightGrads::FullAttention(ref mut fa) = g {
+            for v in fa.d_down_proj.iter_mut() { *v = 6.0; }
+        }
+        g.scale(1.0 / 3.0);
+        if let Qwen35WeightGrads::FullAttention(ref fa) = g {
+            assert!((fa.d_down_proj[0] - 2.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn qwen35_grads_clip_and_apply_sgd() {
+        let config = Qwen35Config::qwen35_9b();
+        let mut g = Qwen35WeightGrads::zeros(&config, LayerType::LinearAttention);
+        // 大きな勾配を入れる
+        if let Qwen35WeightGrads::DeltaNet(ref mut dn) = g {
+            for v in dn.d_gate_proj.iter_mut() { *v = 100.0; }
+        }
+        g.clip_grad_norm(1.0);
+        // clip 後は norm ≈ 1.0
+        match &g {
+            Qwen35WeightGrads::DeltaNet(dn) => {
+                assert!(dn.grad_norm() <= 1.0 + 1e-5);
+            }
+            _ => panic!("expected DeltaNet"),
+        }
+    }
+
+    #[test]
+    fn gradient_accumulation_3steps() {
+        let config = Qwen35Config::qwen35_9b();
+        let mut acc = Qwen35WeightGrads::zeros(&config, LayerType::LinearAttention);
+        for step in 0..3 {
+            let mut g = Qwen35WeightGrads::zeros(&config, LayerType::LinearAttention);
+            if let Qwen35WeightGrads::DeltaNet(ref mut dn) = g {
+                for v in dn.d_gate_proj.iter_mut() { *v = (step + 1) as f32; }
+            }
+            acc.add_assign(&g);
+        }
+        // 合計: 1+2+3 = 6、平均: 6/3 = 2
+        acc.scale(1.0 / 3.0);
+        if let Qwen35WeightGrads::DeltaNet(ref dn) = acc {
+            assert!((dn.d_gate_proj[0] - 2.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn vec_add_assign_basic() {
+        let mut dst = vec![1.0, 2.0, 3.0];
+        let src = vec![4.0, 5.0, 6.0];
+        vec_add_assign(&mut dst, &src);
+        assert!((dst[0] - 5.0).abs() < 1e-6);
+        assert!((dst[1] - 7.0).abs() < 1e-6);
+        assert!((dst[2] - 9.0).abs() < 1e-6);
     }
 }

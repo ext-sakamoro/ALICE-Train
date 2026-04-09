@@ -314,6 +314,13 @@ fn main() {
     // --- コンポーネント初期化 ---
     println!("━━━ コンポーネント初期化 ━━━");
 
+    // THP無効化 — チェックポイント保存時のcompactionストールを防止
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0);
+        println!("  THP無効化: compactionストール防止");
+    }
+
     // CUDA cuBLAS 初期化 — 以降の全 blas_matmul_bt/nn が自動的に GPU を使用
     #[cfg(feature = "cuda")]
     {
@@ -445,13 +452,15 @@ fn main() {
             };
             let step_duration = step_start.elapsed();
 
-            let inv_tokens = 1.0 / token_count.max(1) as f32;
+            // Phase 1: 勾配を token_count で正規化（loss の平均と一致させる）
+            let grad_scale = 1.0 / token_count.max(1) as f32;
+
             for (w, g) in embedding.iter_mut().zip(grad_embedding.iter_mut()) {
-                *w -= lr * (*g * inv_tokens + config.weight_decay * *w);
+                *w -= lr * (*g * grad_scale + config.weight_decay * *w);
                 *g = 0.0;
             }
             for (w, g) in output_proj.iter_mut().zip(grad_output_proj.iter_mut()) {
-                *w -= lr * (*g * inv_tokens + config.weight_decay * *w);
+                *w -= lr * (*g * grad_scale + config.weight_decay * *w);
                 *g = 0.0;
             }
 
@@ -767,6 +776,11 @@ fn main() {
         let mut stuck_loss_count: usize = 0; // 同一loss連続カウント
         let mut stuck_loss_value: f32 = 0.0;
 
+        // Gradient accumulation 用アキュムレータ
+        let mut accumulated_grads: Vec<Option<Qwen35WeightGrads>> =
+            (0..config.model.num_hidden_layers).map(|_| None).collect();
+        let mut accum_count: usize = 0;
+
         while global_step < config.total_steps {
             let lr = scheduler.get_lr(global_step);
             let step_start = Instant::now();
@@ -811,9 +825,11 @@ fn main() {
                         saved_inputs.push(hidden_states.clone());
                         clone_ms_total += tc.elapsed().as_millis();
                         let tl = Instant::now();
+                        // FakeQuantize: FP32 → ternary → dequant (forward のみ)
+                        let layer_fq = layers[i].fake_quantize();
                         alice_train::qwen35_forward::qwen35_layer_forward_eval_inplace(
                             &mut hidden_states,
-                            &layers[i],
+                            &layer_fq,
                             &config.model,
                             seq_len,
                         );
@@ -847,16 +863,21 @@ fn main() {
                     drop(hidden_states);
                     let head_ms = t_head.elapsed().as_millis();
 
-                    // 4. Loss + d_logits
+                    // 4. Loss + d_logits (seq_len で正規化 — loss 平均と一致)
                     let t_loss = Instant::now();
                     let mut d_logits_all = vec![0.0f32; seq_len * vocab_size];
+                    let grad_scale = 1.0 / seq_len as f32;
                     for t in 0..seq_len {
                         let target = batch.target_ids[b * seq_len + t] as usize % vocab_size;
                         let tl = &logits[t * vocab_size..(t + 1) * vocab_size];
                         let (loss, dl) = cross_entropy_loss(tl, target);
                         total_loss += loss;
                         token_count += 1;
-                        d_logits_all[t * vocab_size..(t + 1) * vocab_size].copy_from_slice(&dl);
+                        for (dst, &src) in d_logits_all[t * vocab_size..(t + 1) * vocab_size]
+                            .iter_mut().zip(dl.iter())
+                        {
+                            *dst = src * grad_scale;
+                        }
                     }
                     drop(logits);
                     let loss_ms = t_loss.elapsed().as_millis();
@@ -882,13 +903,13 @@ fn main() {
                         );
                     }
 
-                    // 6. Gradient checkpointing backward:
+                    // 6. Gradient checkpointing backward with FakeQuantize:
                     let t_bwd_layers = Instant::now();
-                    // DeltaNet層: GPU fused (VRAM state保持、step_caches不要)
-                    // FullAttention層: 従来のforward再計算+backward
-                    let inv_tokens = 1.0 / token_count.max(1) as f32;
                     for i in (0..num_l).rev() {
                         let saved_input = saved_inputs.pop().unwrap();
+
+                        // FakeQuantize — backward の forward 再計算も fq 重みで
+                        let layer_fq = layers[i].fake_quantize();
 
                         #[cfg(feature = "cuda")]
                         let use_fused = alice_train::blas::cuda_blas_available()
@@ -900,21 +921,17 @@ fn main() {
                         let (d_input, grads) = if use_fused {
                             #[cfg(feature = "cuda")]
                             {
-                                match &mut layers[i] {
-                                    Qwen35LayerWeights::DeltaNet(w) => {
+                                match &layer_fq {
+                                    Qwen35LayerWeights::DeltaNet(w_fq) => {
                                         let mut wg = alice_train::qwen35_backward::DeltaNetWeightGrads::zeros(&config.model);
+                                        // CUDA fused は &mut w を要求するため、fq のコピーを渡す
+                                        let mut w_fq_mut = w_fq.clone();
                                         let d_in =
                                             alice_train::qwen35_backward::deltanet_layer_gc_fused(
-                                                &saved_input,
-                                                &d_hidden,
-                                                w,
-                                                &config.model,
-                                                seq_len,
-                                                &mut wg,
+                                                &saved_input, &d_hidden, &mut w_fq_mut,
+                                                &config.model, seq_len, &mut wg,
                                             );
-                                        wg.clip_grad_norm(config.max_grad_norm);
-                                        wg.apply_sgd(w, lr * inv_tokens, config.weight_decay);
-                                        (d_in, None)
+                                        (d_in, Some(Qwen35WeightGrads::DeltaNet(wg)))
                                     }
                                     _ => unreachable!(),
                                 }
@@ -924,22 +941,12 @@ fn main() {
                                 unreachable!()
                             }
                         } else {
-                            // FullAttention or CPU fallback
                             let mut recompute_input = saved_input;
                             let cache = qwen35_layer_forward(
-                                &mut recompute_input,
-                                &layers[i],
-                                &config.model,
-                                seq_len,
+                                &mut recompute_input, &layer_fq, &config.model, seq_len,
                             );
                             let (d_in, grads) = qwen35_layer_backward(
-                                &d_hidden,
-                                &cache,
-                                &layers[i],
-                                &config.model,
-                                seq_len,
-                                lr,
-                                config.weight_decay,
+                                &d_hidden, &cache, &layer_fq, &config.model, seq_len, lr, config.weight_decay,
                             );
                             drop(cache);
                             (d_in, Some(grads))
@@ -947,26 +954,29 @@ fn main() {
 
                         d_hidden = d_input;
 
-                        // FullAttention層のweight update (grad clipping付き)
-                        if let Some(mut grads) = grads {
-                            match (&mut grads, &mut layers[i]) {
-                                (
-                                    Qwen35WeightGrads::DeltaNet(g),
-                                    Qwen35LayerWeights::DeltaNet(w),
-                                ) => {
-                                    g.clip_grad_norm(config.max_grad_norm);
-                                    g.apply_sgd(w, lr * inv_tokens, config.weight_decay);
-                                }
-                                (
-                                    Qwen35WeightGrads::FullAttention(g),
-                                    Qwen35LayerWeights::FullAttention(w),
-                                ) => {
-                                    g.clip_grad_norm(config.max_grad_norm);
-                                    g.apply_sgd(w, lr * inv_tokens, config.weight_decay);
-                                }
-                                _ => {}
+                        // 勾配蓄積
+                        if let Some(grads) = grads {
+                            if let Some(acc) = &mut accumulated_grads[i] {
+                                acc.add_assign(&grads);
+                            } else {
+                                accumulated_grads[i] = Some(grads);
                             }
                         }
+                    }
+
+                    // gradient accumulation: 蓄積完了時に SGD を FP32 shadow weights に適用 (STE)
+                    accum_count += 1;
+                    if accum_count >= config.gradient_accumulation_steps {
+                        for i in 0..num_l {
+                            if let Some(ref mut g) = accumulated_grads[i] {
+                                let accum_scale = 1.0 / accum_count as f32;
+                                g.scale(accum_scale);
+                                g.clip_grad_norm(config.max_grad_norm);
+                                g.apply_sgd(&mut layers[i], lr, config.weight_decay);
+                            }
+                        }
+                        for g in accumulated_grads.iter_mut() { *g = None; }
+                        accum_count = 0;
                     }
                     if profile {
                         let bwd_layers_ms = t_bwd_layers.elapsed().as_millis();
@@ -977,10 +987,10 @@ fn main() {
                         );
                     }
                 } else {
-                    // ── Streaming gradient-checkpointing (FP32キャッシュ + CUDA) ──
-                    // Forward: eval mode (cache なし) → logits + hidden_states 各層保存
-                    // Backward: 逆順で forward 再計算 (cache 生成) → backward → weight update → 書き戻し
-                    // RAM: embedding 4GB + hidden_states 32層 × seq×hidden×4 + 1層重み ~800MB
+                    // ── Streaming QAT (FakeQuantize + gradient accumulation) ──
+                    // Forward: FP32重みを fake_quantize → eval forward
+                    // Backward: fake_quantize された重みで forward 再計算 → backward
+                    // SGD: 元の FP32 重み (shadow weights) に適用 (STE)
                     use alice_train::qwen35_forward::qwen35_layer_forward;
 
                     let cache_base = &config.checkpoint_dir;
@@ -994,134 +1004,116 @@ fn main() {
                             .copy_from_slice(&embedding_table[tok * hidden..(tok + 1) * hidden]);
                     }
 
-                    // 2. Streaming eval forward: 各層の入力 hidden_states を保存
-                    // activation cache は保存しない (gradient checkpointing)
+                    // 2. Streaming eval forward with FakeQuantize
                     let mut saved_inputs: Vec<Vec<f32>> = Vec::with_capacity(num_l);
                     for i in 0..num_l {
-                        saved_inputs.push(hidden_states.clone()); // 入力を保存
+                        saved_inputs.push(hidden_states.clone());
                         let layer_w = alice_train::fp32_cache::load_layer_from_cache(
-                            cache_base,
-                            i,
-                            &config.model,
-                        )
-                        .unwrap_or_else(|e| {
+                            cache_base, i, &config.model,
+                        ).unwrap_or_else(|e| {
                             eprintln!("[ALICE-Train] layer {i} 読み込み失敗: {e}");
                             std::process::exit(1);
                         });
-                        // eval forward (cache なし)
+                        // FakeQuantize: FP32 → ternary → dequant (forward のみ)
+                        let layer_w_fq = layer_w.fake_quantize();
                         alice_train::qwen35_forward::qwen35_layer_forward_eval_inplace(
-                            &mut hidden_states,
-                            &layer_w,
-                            &config.model,
-                            seq_len,
+                            &mut hidden_states, &layer_w_fq, &config.model, seq_len,
                         );
                     }
 
                     // 3. Output norm + lm_head
                     alice_train::blas::blas_rmsnorm(
-                        &mut hidden_states,
-                        &output_norm,
-                        hidden,
-                        config.model.rms_norm_eps,
+                        &mut hidden_states, &output_norm, hidden, config.model.rms_norm_eps,
                     );
                     let mut logits = vec![0.0f32; seq_len * vocab_size];
                     alice_train::blas::blas_matmul_bt(
-                        &hidden_states,
-                        &lm_head,
-                        &mut logits,
-                        seq_len,
-                        vocab_size,
-                        hidden,
+                        &hidden_states, &lm_head, &mut logits, seq_len, vocab_size, hidden,
                     );
 
-                    // 4. Loss + d_logits
+                    // 4. Loss + d_logits (seq_len で正規化)
                     let mut d_logits_all = vec![0.0f32; seq_len * vocab_size];
+                    let grad_scale = 1.0 / seq_len as f32;
                     for t in 0..seq_len {
                         let target = batch.target_ids[b * seq_len + t] as usize % vocab_size;
                         let tl = &logits[t * vocab_size..(t + 1) * vocab_size];
                         let (loss, dl) = cross_entropy_loss(tl, target);
                         total_loss += loss;
                         token_count += 1;
-                        d_logits_all[t * vocab_size..(t + 1) * vocab_size].copy_from_slice(&dl);
+                        for (dst, &src) in d_logits_all[t * vocab_size..(t + 1) * vocab_size]
+                            .iter_mut().zip(dl.iter())
+                        {
+                            *dst = src * grad_scale;
+                        }
                     }
                     drop(logits);
 
                     // 5. Backward through lm_head
                     let mut d_hidden = vec![0.0f32; seq_len * hidden];
                     alice_train::blas::blas_matmul_nn(
-                        &d_logits_all,
-                        &lm_head,
-                        &mut d_hidden,
-                        seq_len,
-                        hidden,
-                        vocab_size,
+                        &d_logits_all, &lm_head, &mut d_hidden, seq_len, hidden, vocab_size,
                     );
                     drop(d_logits_all);
 
-                    // 6. Streaming backward with gradient checkpointing:
-                    // 逆順で: saved_input → forward 再計算 (cache付き) → backward → weight update → 書き戻し
-                    let inv_tokens = 1.0 / token_count.max(1) as f32;
+                    // 6. Streaming backward (FakeQuantize + gradient accumulation)
+                    // backward は fake_quantize 済み重みで forward 再計算 → backward
+                    // 勾配は accumulated_grads に蓄積 (STE: 勾配を素通り)
                     for i in (0..num_l).rev() {
                         let layer_w_orig = alice_train::fp32_cache::load_layer_from_cache(
-                            cache_base,
-                            i,
-                            &config.model,
-                        )
-                        .unwrap_or_else(|e| {
+                            cache_base, i, &config.model,
+                        ).unwrap_or_else(|e| {
                             eprintln!("[ALICE-Train] backward layer {i} 読み込み失敗: {e}");
                             std::process::exit(1);
                         });
+                        // FakeQuantize — backward の forward 再計算も fq 重みで
+                        let layer_w_fq = layer_w_orig.fake_quantize();
 
-                        // Forward 再計算 (cache 生成)
                         let mut recompute_input = saved_inputs.pop().unwrap();
                         let cache = qwen35_layer_forward(
-                            &mut recompute_input,
-                            &layer_w_orig,
-                            &config.model,
-                            seq_len,
+                            &mut recompute_input, &layer_w_fq, &config.model, seq_len,
                         );
 
-                        // Backward
+                        // backward は fq 重みに対して計算 → STE で勾配素通り
                         let (d_input, grads) = qwen35_layer_backward(
-                            &d_hidden,
-                            &cache,
-                            &layer_w_orig,
-                            &config.model,
-                            seq_len,
-                            lr,
-                            config.weight_decay,
+                            &d_hidden, &cache, &layer_w_fq, &config.model, seq_len, lr, config.weight_decay,
                         );
                         d_hidden = d_input;
-                        drop(cache); // activation cache 即解放
+                        drop(cache);
 
-                        // Weight update + 書き戻し (grad clipping付き)
-                        let mut layer_w = layer_w_orig;
-                        match (grads, &mut layer_w) {
-                            (
-                                Qwen35WeightGrads::DeltaNet(mut g),
-                                Qwen35LayerWeights::DeltaNet(w),
-                            ) => {
-                                g.clip_grad_norm(config.max_grad_norm);
-                                g.apply_sgd(w, lr * inv_tokens, config.weight_decay);
-                            }
-                            (
-                                Qwen35WeightGrads::FullAttention(mut g),
-                                Qwen35LayerWeights::FullAttention(w),
-                            ) => {
-                                g.clip_grad_norm(config.max_grad_norm);
-                                g.apply_sgd(w, lr * inv_tokens, config.weight_decay);
-                            }
-                            _ => {}
+                        // 勾配蓄積 (gradient accumulation)
+                        if let Some(acc) = &mut accumulated_grads[i] {
+                            acc.add_assign(&grads);
+                        } else {
+                            accumulated_grads[i] = Some(grads);
                         }
-                        alice_train::fp32_cache::save_layer_to_cache(
-                            cache_base,
-                            i,
-                            &layer_w,
-                            &config.model,
-                        )
-                        .unwrap_or_else(|e| {
-                            eprintln!("[ALICE-Train] layer {i} 書き戻し失敗: {e}");
-                        });
+                    }
+
+                    // gradient accumulation: 蓄積完了時に SGD 適用
+                    accum_count += 1;
+                    if accum_count >= config.gradient_accumulation_steps {
+                        for i in 0..num_l {
+                            if let Some(ref mut g) = accumulated_grads[i] {
+                                let accum_scale = 1.0 / accum_count as f32;
+                                g.scale(accum_scale);
+                                g.clip_grad_norm(config.max_grad_norm);
+
+                                // FP32 shadow weights を読み込み → SGD → 書き戻し (STE)
+                                let mut layer_w = alice_train::fp32_cache::load_layer_from_cache(
+                                    cache_base, i, &config.model,
+                                ).unwrap_or_else(|e| {
+                                    eprintln!("[ALICE-Train] SGD layer {i} 読み込み失敗: {e}");
+                                    std::process::exit(1);
+                                });
+                                g.apply_sgd(&mut layer_w, lr, config.weight_decay);
+                                alice_train::fp32_cache::save_layer_to_cache(
+                                    cache_base, i, &layer_w, &config.model,
+                                ).unwrap_or_else(|e| {
+                                    eprintln!("[ALICE-Train] layer {i} 書き戻し失敗: {e}");
+                                });
+                            }
+                        }
+                        // リセット
+                        for g in accumulated_grads.iter_mut() { *g = None; }
+                        accum_count = 0;
                     }
                 }
             }
@@ -1133,11 +1125,6 @@ fn main() {
             };
             last_loss = avg_loss;
             let step_duration = step_start.elapsed();
-
-            // SGD weight update on projection weights (FakeQuantize + STE)
-            // Phase 2 初期版: forward-only loss 監視
-            // 完全 backward は hidden_states の保存 + レイヤー逆伝播が必要
-            // → CUDA 対応時に統合（CPU での 9B backward は実用速度に達しないため）
 
             log.append(LogEntry::new(0, global_step, avg_loss, lr, 0.0));
 
@@ -1178,6 +1165,12 @@ fn main() {
                     format!("{}/resume_state.json", config.checkpoint_dir),
                     &crash_json,
                 );
+                // 崩壊時: 全チェックポイント+FP32キャッシュをBoxに退避
+                let _ = std::process::Command::new("bash")
+                    .arg("scripts/upload_box.sh")
+                    .arg(&config.checkpoint_dir)
+                    .arg("--all-checkpoints")
+                    .status();
                 std::process::exit(1);
             }
             // Loss 緩やかな上昇検知 — 5ステップ猶予後に自動停止
@@ -1212,6 +1205,12 @@ fn main() {
                         format!("{}/resume_state.json", config.checkpoint_dir),
                         &crash_json,
                     );
+                    // 崩壊時: 全チェックポイント+FP32キャッシュをBoxに退避
+                    let _ = std::process::Command::new("bash")
+                        .arg("scripts/upload_box.sh")
+                        .arg(&config.checkpoint_dir)
+                        .arg("--all-checkpoints")
+                        .status();
                     std::process::exit(1);
                 }
             }
@@ -1298,7 +1297,11 @@ fn main() {
                         config.model.num_hidden_layers
                     );
                     // ページキャッシュ解放 — 26GB書き込み後のメモリ効率低下を防止
+                    #[cfg(target_os = "linux")]
                     alice_train::fp32_cache::drop_page_cache(cache_base, &config.model);
+                    // ヒープ圧縮 — checkpointファイル書き込み後のフラグメンテーション防止
+                    #[cfg(target_os = "linux")]
+                    unsafe { libc::malloc_trim(0); }
                 }
 
                 let ckpt_path = format!("{}/step_{global_step}.bin", config.checkpoint_dir);
@@ -1415,6 +1418,19 @@ fn main() {
                     eprintln!("  出力ファイル作成失敗: {output_path}: {e}");
                 }
             }
+        }
+
+        // ── Box SFTP アップロード ──
+        println!();
+        println!("━━━ Box SFTP アップロード ━━━");
+        let upload_status = std::process::Command::new("bash")
+            .arg("scripts/upload_box.sh")
+            .arg(&config.checkpoint_dir)
+            .status();
+        match upload_status {
+            Ok(s) if s.success() => println!("  Box アップロード完了"),
+            Ok(s) => eprintln!("  Box アップロード失敗 (exit={})", s.code().unwrap_or(-1)),
+            Err(e) => eprintln!("  Box アップロード実行失敗: {e}"),
         }
     }
 }

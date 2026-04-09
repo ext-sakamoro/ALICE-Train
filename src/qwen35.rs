@@ -214,6 +214,21 @@ impl Qwen35Config {
 
 // ── 重み構造体 ──────────────────────────────────────────────────────────────
 
+/// FP32 テンソルを ternary fake quantize する。
+///
+/// γ = mean(|W|), W_fq = round(W/γ).clamp(-1,1) × γ
+fn fq_vec(w: &[f32]) -> Vec<f32> {
+    if w.is_empty() {
+        return Vec::new();
+    }
+    let sum_abs: f64 = w.iter().map(|&v| v.abs() as f64).sum();
+    let gamma = (sum_abs / w.len() as f64) as f32;
+    let inv_gamma = if gamma > 1e-10 { 1.0 / gamma } else { 0.0 };
+    w.iter()
+        .map(|&v| (v * inv_gamma).round().clamp(-1.0, 1.0) * gamma)
+        .collect()
+}
+
 /// Gated DeltaNet レイヤーの FP32 重み。
 #[derive(Clone)]
 pub struct DeltaNetLayerWeights {
@@ -314,6 +329,45 @@ impl Qwen35LayerWeights {
                 ("up_proj", &mut w.up_proj),
                 ("down_proj", &mut w.down_proj),
             ],
+        }
+    }
+
+    /// FakeQuantize — 全 projection 重みを ternary 疑似量子化したクローンを返す。
+    ///
+    /// γ = mean(|W|) → round(W/γ).clamp(-1,1) × γ。
+    /// layernorm, a_log, dt_bias, conv1d, norm 等の非量子化重みはそのままコピー。
+    #[must_use]
+    pub fn fake_quantize(&self) -> Self {
+        match self {
+            Self::DeltaNet(w) => Self::DeltaNet(DeltaNetLayerWeights {
+                input_layernorm: w.input_layernorm.clone(),
+                post_attn_layernorm: w.post_attn_layernorm.clone(),
+                in_proj_qkv: fq_vec(&w.in_proj_qkv),
+                in_proj_z: fq_vec(&w.in_proj_z),
+                in_proj_b: fq_vec(&w.in_proj_b),
+                in_proj_a: fq_vec(&w.in_proj_a),
+                a_log: w.a_log.clone(),
+                dt_bias: w.dt_bias.clone(),
+                conv1d_weight: w.conv1d_weight.clone(),
+                norm_weight: w.norm_weight.clone(),
+                out_proj: fq_vec(&w.out_proj),
+                gate_proj: fq_vec(&w.gate_proj),
+                up_proj: fq_vec(&w.up_proj),
+                down_proj: fq_vec(&w.down_proj),
+            }),
+            Self::FullAttention(w) => Self::FullAttention(FullAttnLayerWeights {
+                input_layernorm: w.input_layernorm.clone(),
+                post_attn_layernorm: w.post_attn_layernorm.clone(),
+                q_proj: fq_vec(&w.q_proj),
+                k_proj: fq_vec(&w.k_proj),
+                v_proj: fq_vec(&w.v_proj),
+                o_proj: fq_vec(&w.o_proj),
+                q_norm: w.q_norm.clone(),
+                k_norm: w.k_norm.clone(),
+                gate_proj: fq_vec(&w.gate_proj),
+                up_proj: fq_vec(&w.up_proj),
+                down_proj: fq_vec(&w.down_proj),
+            }),
         }
     }
 
@@ -578,5 +632,137 @@ mod tests {
         };
         let mut layer = Qwen35LayerWeights::DeltaNet(w);
         assert_eq!(layer.proj_weights_mut().len(), 8);
+    }
+
+    // ── fq_vec テスト ──
+
+    #[test]
+    fn fq_vec_empty() {
+        assert!(fq_vec(&[]).is_empty());
+    }
+
+    #[test]
+    fn fq_vec_ternary_values_only() {
+        let w = vec![0.5, -0.3, 0.01, 0.8, -0.9, 0.0, -0.05, 0.7];
+        let fq = fq_vec(&w);
+        assert_eq!(fq.len(), w.len());
+        let gamma: f64 = w.iter().map(|v| v.abs() as f64).sum::<f64>() / w.len() as f64;
+        let g = gamma as f32;
+        for &v in &fq {
+            let norm = (v / g).round();
+            assert!(
+                (norm - -1.0).abs() < 0.01
+                    || (norm - 0.0).abs() < 0.01
+                    || (norm - 1.0).abs() < 0.01,
+                "fq value {v} not in {{-γ, 0, +γ}}, γ={g}"
+            );
+        }
+    }
+
+    #[test]
+    fn fq_vec_preserves_sign() {
+        let w = vec![1.0, -1.0, 0.5, -0.5];
+        let fq = fq_vec(&w);
+        assert!(fq[0] > 0.0);
+        assert!(fq[1] < 0.0);
+    }
+
+    #[test]
+    fn fq_vec_all_zeros() {
+        let w = vec![0.0; 10];
+        let fq = fq_vec(&w);
+        assert!(fq.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn fq_vec_scale_is_mean_abs() {
+        let w = vec![1.0, -1.0, 0.5, -0.5];
+        let fq = fq_vec(&w);
+        // gamma = mean(|W|) = 0.75
+        // round(1.0/0.75) = round(1.33) = 1, clamp → 1 → 1*0.75 = 0.75
+        assert!((fq[0] - 0.75).abs() < 1e-5);
+        assert!((fq[1] - (-0.75)).abs() < 1e-5);
+        // round(0.5/0.75) = round(0.67) = 1 → 0.75
+        assert!((fq[2] - 0.75).abs() < 1e-5);
+    }
+
+    // ── fake_quantize テスト ──
+
+    #[test]
+    fn fake_quantize_deltanet_preserves_norms() {
+        let c = Qwen35Config::qwen35_9b();
+        let w = DeltaNetLayerWeights {
+            input_layernorm: vec![1.5; c.hidden_size],
+            post_attn_layernorm: vec![2.0; c.hidden_size],
+            in_proj_qkv: vec![0.1; c.hidden_size * (c.linear_key_dim() * 2 + c.linear_value_dim())],
+            in_proj_z: vec![0.1; c.hidden_size * c.linear_value_dim()],
+            in_proj_b: vec![0.1; c.hidden_size * c.linear_num_value_heads],
+            in_proj_a: vec![0.1; c.hidden_size * c.linear_num_value_heads],
+            a_log: vec![0.5; c.linear_num_value_heads],
+            dt_bias: vec![0.3; c.linear_num_value_heads],
+            conv1d_weight: vec![0.2; c.conv_dim() * c.linear_conv_kernel_dim],
+            norm_weight: vec![1.0; c.linear_value_head_dim],
+            out_proj: vec![0.1; c.linear_value_dim() * c.hidden_size],
+            gate_proj: vec![0.1; c.intermediate_size * c.hidden_size],
+            up_proj: vec![0.1; c.intermediate_size * c.hidden_size],
+            down_proj: vec![0.1; c.hidden_size * c.intermediate_size],
+        };
+        let layer = Qwen35LayerWeights::DeltaNet(w);
+        let fq = layer.fake_quantize();
+        match &fq {
+            Qwen35LayerWeights::DeltaNet(wf) => {
+                // layernorm, a_log, dt_bias, conv1d, norm はそのまま
+                assert_eq!(wf.input_layernorm[0], 1.5);
+                assert_eq!(wf.post_attn_layernorm[0], 2.0);
+                assert_eq!(wf.a_log[0], 0.5);
+                assert_eq!(wf.dt_bias[0], 0.3);
+                assert_eq!(wf.norm_weight[0], 1.0);
+                // projection は量子化される（0.1 は gamma=0.1 で round(1.0)=1 → 0.1）
+                assert!((wf.in_proj_qkv[0] - 0.1).abs() < 1e-5);
+            }
+            _ => panic!("expected DeltaNet"),
+        }
+    }
+
+    #[test]
+    fn fake_quantize_fullattn_preserves_norms() {
+        let c = Qwen35Config::qwen35_9b();
+        let w = FullAttnLayerWeights {
+            input_layernorm: vec![1.5; c.hidden_size],
+            post_attn_layernorm: vec![2.0; c.hidden_size],
+            q_proj: vec![0.1; c.hidden_size * c.num_attention_heads * c.head_dim],
+            k_proj: vec![0.1; c.hidden_size * c.num_key_value_heads * c.head_dim],
+            v_proj: vec![0.1; c.hidden_size * c.num_key_value_heads * c.head_dim],
+            o_proj: vec![0.1; c.num_attention_heads * c.head_dim * c.hidden_size],
+            q_norm: vec![1.0; c.head_dim],
+            k_norm: vec![1.0; c.head_dim],
+            gate_proj: vec![0.1; c.intermediate_size * c.hidden_size],
+            up_proj: vec![0.1; c.intermediate_size * c.hidden_size],
+            down_proj: vec![0.1; c.hidden_size * c.intermediate_size],
+        };
+        let layer = Qwen35LayerWeights::FullAttention(w);
+        let fq = layer.fake_quantize();
+        match &fq {
+            Qwen35LayerWeights::FullAttention(wf) => {
+                assert_eq!(wf.input_layernorm[0], 1.5);
+                assert_eq!(wf.q_norm[0], 1.0);
+                assert_eq!(wf.k_norm[0], 1.0);
+            }
+            _ => panic!("expected FullAttention"),
+        }
+    }
+
+    #[test]
+    fn fake_quantize_mixed_weights() {
+        let w = vec![0.5, -0.3, 0.01, 0.8, -0.9];
+        let fq = fq_vec(&w);
+        // gamma = (0.5+0.3+0.01+0.8+0.9)/5 = 0.502
+        let gamma = 0.502;
+        // 0.5/0.502 = 0.996 → round=1 → 0.502
+        assert!((fq[0] - gamma).abs() < 0.01);
+        // -0.3/0.502 = -0.598 → round=-1 → -0.502
+        assert!((fq[1] - (-gamma)).abs() < 0.01);
+        // 0.01/0.502 = 0.02 → round=0 → 0
+        assert!(fq[2].abs() < 0.01);
     }
 }
