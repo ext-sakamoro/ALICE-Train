@@ -781,6 +781,13 @@ fn main() {
             (0..config.model.num_hidden_layers).map(|_| None).collect();
         let mut accum_count: usize = 0;
 
+        // FakeQuantize バッファ — 事前確保してゼロアロケーション (preload mode 用)
+        let mut fq_buffers: Vec<Qwen35LayerWeights> = if config.preload_all_layers {
+            layers.iter().map(|l| l.clone()).collect()
+        } else {
+            Vec::new()
+        };
+
         while global_step < config.total_steps {
             let lr = scheduler.get_lr(global_step);
             let step_start = Instant::now();
@@ -825,11 +832,11 @@ fn main() {
                         saved_inputs.push(hidden_states.clone());
                         clone_ms_total += tc.elapsed().as_millis();
                         let tl = Instant::now();
-                        // FakeQuantize: FP32 → ternary → dequant (forward のみ)
-                        let layer_fq = layers[i].fake_quantize();
+                        // FakeQuantize: in-place (ゼロアロケーション)
+                        layers[i].fake_quantize_into(&mut fq_buffers[i]);
                         alice_train::qwen35_forward::qwen35_layer_forward_eval_inplace(
                             &mut hidden_states,
-                            &layer_fq,
+                            &fq_buffers[i],
                             &config.model,
                             seq_len,
                         );
@@ -908,8 +915,8 @@ fn main() {
                     for i in (0..num_l).rev() {
                         let saved_input = saved_inputs.pop().unwrap();
 
-                        // FakeQuantize — backward の forward 再計算も fq 重みで
-                        let layer_fq = layers[i].fake_quantize();
+                        // FakeQuantize — backward の forward 再計算も fq 重みで (in-place)
+                        layers[i].fake_quantize_into(&mut fq_buffers[i]);
 
                         #[cfg(feature = "cuda")]
                         let use_fused = alice_train::blas::cuda_blas_available()
@@ -921,14 +928,12 @@ fn main() {
                         let (d_input, grads) = if use_fused {
                             #[cfg(feature = "cuda")]
                             {
-                                match &layer_fq {
+                                match &mut fq_buffers[i] {
                                     Qwen35LayerWeights::DeltaNet(w_fq) => {
                                         let mut wg = alice_train::qwen35_backward::DeltaNetWeightGrads::zeros(&config.model);
-                                        // CUDA fused は &mut w を要求するため、fq のコピーを渡す
-                                        let mut w_fq_mut = w_fq.clone();
                                         let d_in =
                                             alice_train::qwen35_backward::deltanet_layer_gc_fused(
-                                                &saved_input, &d_hidden, &mut w_fq_mut,
+                                                &saved_input, &d_hidden, w_fq,
                                                 &config.model, seq_len, &mut wg,
                                             );
                                         (d_in, Some(Qwen35WeightGrads::DeltaNet(wg)))
@@ -943,10 +948,10 @@ fn main() {
                         } else {
                             let mut recompute_input = saved_input;
                             let cache = qwen35_layer_forward(
-                                &mut recompute_input, &layer_fq, &config.model, seq_len,
+                                &mut recompute_input, &fq_buffers[i], &config.model, seq_len,
                             );
                             let (d_in, grads) = qwen35_layer_backward(
-                                &d_hidden, &cache, &layer_fq, &config.model, seq_len, lr, config.weight_decay,
+                                &d_hidden, &cache, &fq_buffers[i], &config.model, seq_len, lr, config.weight_decay,
                             );
                             drop(cache);
                             (d_in, Some(grads))
@@ -1004,8 +1009,11 @@ fn main() {
                             .copy_from_slice(&embedding_table[tok * hidden..(tok + 1) * hidden]);
                     }
 
-                    // 2. Streaming eval forward with FakeQuantize
+                    // 2. Streaming eval forward with FakeQuantize (in-place)
                     let mut saved_inputs: Vec<Vec<f32>> = Vec::with_capacity(num_l);
+                    // FQ バッファ: DeltaNet/FullAttn 各1つずつ事前確保
+                    let mut fq_dn: Option<Qwen35LayerWeights> = None;
+                    let mut fq_fa: Option<Qwen35LayerWeights> = None;
                     for i in 0..num_l {
                         saved_inputs.push(hidden_states.clone());
                         let layer_w = alice_train::fp32_cache::load_layer_from_cache(
@@ -1014,10 +1022,18 @@ fn main() {
                             eprintln!("[ALICE-Train] layer {i} 読み込み失敗: {e}");
                             std::process::exit(1);
                         });
-                        // FakeQuantize: FP32 → ternary → dequant (forward のみ)
-                        let layer_w_fq = layer_w.fake_quantize();
+                        // FakeQuantize: in-place (variant別バッファ)
+                        let fq_buf = match &layer_w {
+                            Qwen35LayerWeights::DeltaNet(_) => &mut fq_dn,
+                            Qwen35LayerWeights::FullAttention(_) => &mut fq_fa,
+                        };
+                        if let Some(ref mut buf) = fq_buf {
+                            layer_w.fake_quantize_into(buf);
+                        } else {
+                            *fq_buf = Some(layer_w.fake_quantize());
+                        }
                         alice_train::qwen35_forward::qwen35_layer_forward_eval_inplace(
-                            &mut hidden_states, &layer_w_fq, &config.model, seq_len,
+                            &mut hidden_states, fq_buf.as_ref().unwrap(), &config.model, seq_len,
                         );
                     }
 
@@ -1064,17 +1080,26 @@ fn main() {
                             eprintln!("[ALICE-Train] backward layer {i} 読み込み失敗: {e}");
                             std::process::exit(1);
                         });
-                        // FakeQuantize — backward の forward 再計算も fq 重みで
-                        let layer_w_fq = layer_w_orig.fake_quantize();
+                        // FakeQuantize — backward の forward 再計算も fq 重みで (in-place)
+                        let fq_buf = match &layer_w_orig {
+                            Qwen35LayerWeights::DeltaNet(_) => &mut fq_dn,
+                            Qwen35LayerWeights::FullAttention(_) => &mut fq_fa,
+                        };
+                        if let Some(ref mut buf) = fq_buf {
+                            layer_w_orig.fake_quantize_into(buf);
+                        } else {
+                            *fq_buf = Some(layer_w_orig.fake_quantize());
+                        }
+                        let fq_ref = fq_buf.as_ref().unwrap();
 
                         let mut recompute_input = saved_inputs.pop().unwrap();
                         let cache = qwen35_layer_forward(
-                            &mut recompute_input, &layer_w_fq, &config.model, seq_len,
+                            &mut recompute_input, fq_ref, &config.model, seq_len,
                         );
 
                         // backward は fq 重みに対して計算 → STE で勾配素通り
                         let (d_input, grads) = qwen35_layer_backward(
-                            &d_hidden, &cache, &layer_w_fq, &config.model, seq_len, lr, config.weight_decay,
+                            &d_hidden, &cache, fq_ref, &config.model, seq_len, lr, config.weight_decay,
                         );
                         d_hidden = d_input;
                         drop(cache);

@@ -214,7 +214,7 @@ impl Qwen35Config {
 
 // ── 重み構造体 ──────────────────────────────────────────────────────────────
 
-/// FP32 テンソルを ternary fake quantize する。
+/// FP32 テンソルを ternary fake quantize する (新規 Vec 確保版、テスト用)。
 ///
 /// γ = mean(|W|), W_fq = round(W/γ).clamp(-1,1) × γ
 fn fq_vec(w: &[f32]) -> Vec<f32> {
@@ -227,6 +227,27 @@ fn fq_vec(w: &[f32]) -> Vec<f32> {
     w.iter()
         .map(|&v| (v * inv_gamma).round().clamp(-1.0, 1.0) * gamma)
         .collect()
+}
+
+/// FP32 テンソルを ternary fake quantize する (in-place 版、ゼロアロケーション)。
+///
+/// `src` から読み、`dst` に上書き。`dst` は `src` と同じ長さでなければならない。
+fn fq_vec_inplace(src: &[f32], dst: &mut [f32]) {
+    if src.is_empty() {
+        return;
+    }
+    debug_assert_eq!(src.len(), dst.len());
+    let sum_abs: f64 = src.iter().map(|&v| v.abs() as f64).sum();
+    let gamma = (sum_abs / src.len() as f64) as f32;
+    let inv_gamma = if gamma > 1e-10 { 1.0 / gamma } else { 0.0 };
+    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+        *d = (s * inv_gamma).round().clamp(-1.0, 1.0) * gamma;
+    }
+}
+
+/// FP32 テンソルを in-place で fake quantize（非量子化重みはコピー）。
+fn copy_slice(src: &[f32], dst: &mut [f32]) {
+    dst.copy_from_slice(src);
 }
 
 /// Gated DeltaNet レイヤーの FP32 重み。
@@ -368,6 +389,45 @@ impl Qwen35LayerWeights {
                 up_proj: fq_vec(&w.up_proj),
                 down_proj: fq_vec(&w.down_proj),
             }),
+        }
+    }
+
+    /// In-place FakeQuantize — 事前確保済みバッファに上書き（ゼロアロケーション）。
+    ///
+    /// `dst` は `self` と同じ構造・同じサイズで事前確保されていること。
+    /// projection は ternary 化、非量子化重みはコピー。
+    pub fn fake_quantize_into(&self, dst: &mut Self) {
+        match (self, dst) {
+            (Self::DeltaNet(src), Self::DeltaNet(d)) => {
+                copy_slice(&src.input_layernorm, &mut d.input_layernorm);
+                copy_slice(&src.post_attn_layernorm, &mut d.post_attn_layernorm);
+                fq_vec_inplace(&src.in_proj_qkv, &mut d.in_proj_qkv);
+                fq_vec_inplace(&src.in_proj_z, &mut d.in_proj_z);
+                fq_vec_inplace(&src.in_proj_b, &mut d.in_proj_b);
+                fq_vec_inplace(&src.in_proj_a, &mut d.in_proj_a);
+                copy_slice(&src.a_log, &mut d.a_log);
+                copy_slice(&src.dt_bias, &mut d.dt_bias);
+                copy_slice(&src.conv1d_weight, &mut d.conv1d_weight);
+                copy_slice(&src.norm_weight, &mut d.norm_weight);
+                fq_vec_inplace(&src.out_proj, &mut d.out_proj);
+                fq_vec_inplace(&src.gate_proj, &mut d.gate_proj);
+                fq_vec_inplace(&src.up_proj, &mut d.up_proj);
+                fq_vec_inplace(&src.down_proj, &mut d.down_proj);
+            }
+            (Self::FullAttention(src), Self::FullAttention(d)) => {
+                copy_slice(&src.input_layernorm, &mut d.input_layernorm);
+                copy_slice(&src.post_attn_layernorm, &mut d.post_attn_layernorm);
+                fq_vec_inplace(&src.q_proj, &mut d.q_proj);
+                fq_vec_inplace(&src.k_proj, &mut d.k_proj);
+                fq_vec_inplace(&src.v_proj, &mut d.v_proj);
+                fq_vec_inplace(&src.o_proj, &mut d.o_proj);
+                copy_slice(&src.q_norm, &mut d.q_norm);
+                copy_slice(&src.k_norm, &mut d.k_norm);
+                fq_vec_inplace(&src.gate_proj, &mut d.gate_proj);
+                fq_vec_inplace(&src.up_proj, &mut d.up_proj);
+                fq_vec_inplace(&src.down_proj, &mut d.down_proj);
+            }
+            _ => {}
         }
     }
 
@@ -764,5 +824,62 @@ mod tests {
         assert!((fq[1] - (-gamma)).abs() < 0.01);
         // 0.01/0.502 = 0.02 → round=0 → 0
         assert!(fq[2].abs() < 0.01);
+    }
+
+    // ── fq_vec_inplace テスト ──
+
+    #[test]
+    fn fq_vec_inplace_matches_fq_vec() {
+        let w = vec![0.5, -0.3, 0.01, 0.8, -0.9, 0.0, -0.05, 0.7];
+        let fq_alloc = fq_vec(&w);
+        let mut fq_inplace = vec![0.0; w.len()];
+        fq_vec_inplace(&w, &mut fq_inplace);
+        for (a, b) in fq_alloc.iter().zip(fq_inplace.iter()) {
+            assert!((a - b).abs() < 1e-10, "mismatch: alloc={a} inplace={b}");
+        }
+    }
+
+    #[test]
+    fn fq_vec_inplace_empty() {
+        let mut dst = vec![];
+        fq_vec_inplace(&[], &mut dst);
+    }
+
+    // ── fake_quantize_into テスト ──
+
+    #[test]
+    fn fake_quantize_into_matches_fake_quantize() {
+        let c = Qwen35Config::qwen35_9b();
+        let w = DeltaNetLayerWeights {
+            input_layernorm: vec![1.5; c.hidden_size],
+            post_attn_layernorm: vec![2.0; c.hidden_size],
+            in_proj_qkv: vec![0.1; c.hidden_size * (c.linear_key_dim() * 2 + c.linear_value_dim())],
+            in_proj_z: vec![0.1; c.hidden_size * c.linear_value_dim()],
+            in_proj_b: vec![0.1; c.hidden_size * c.linear_num_value_heads],
+            in_proj_a: vec![0.1; c.hidden_size * c.linear_num_value_heads],
+            a_log: vec![0.5; c.linear_num_value_heads],
+            dt_bias: vec![0.3; c.linear_num_value_heads],
+            conv1d_weight: vec![0.2; c.conv_dim() * c.linear_conv_kernel_dim],
+            norm_weight: vec![1.0; c.linear_value_head_dim],
+            out_proj: vec![0.1; c.linear_value_dim() * c.hidden_size],
+            gate_proj: vec![0.1; c.intermediate_size * c.hidden_size],
+            up_proj: vec![0.1; c.intermediate_size * c.hidden_size],
+            down_proj: vec![0.1; c.hidden_size * c.intermediate_size],
+        };
+        let layer = Qwen35LayerWeights::DeltaNet(w);
+        let fq_alloc = layer.fake_quantize();
+        let mut fq_inplace = layer.clone();
+        layer.fake_quantize_into(&mut fq_inplace);
+        // projection の値が一致
+        match (&fq_alloc, &fq_inplace) {
+            (Qwen35LayerWeights::DeltaNet(a), Qwen35LayerWeights::DeltaNet(b)) => {
+                assert_eq!(a.in_proj_qkv.len(), b.in_proj_qkv.len());
+                for (x, y) in a.in_proj_qkv.iter().zip(b.in_proj_qkv.iter()) {
+                    assert!((x - y).abs() < 1e-10);
+                }
+                assert_eq!(a.input_layernorm, b.input_layernorm);
+            }
+            _ => panic!("variant mismatch"),
+        }
     }
 }
