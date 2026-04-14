@@ -1319,8 +1319,8 @@ fn main() {
                 }
             }
 
-            // チェックポイント (15分間隔、2世代保持)
-            const CKPT_INTERVAL_SECS: u64 = 15 * 60;
+            // チェックポイント (2.5時間間隔、10世代保持)
+            const CKPT_INTERVAL_SECS: u64 = 150 * 60;
             if global_step > 0 && last_ckpt_time.elapsed().as_secs() >= CKPT_INTERVAL_SECS {
                 // preloadモード: 更新済み重みをFP32キャッシュに書き戻し (resume用)
                 if config.preload_all_layers {
