@@ -8,8 +8,8 @@ use crate::export::{
 };
 use crate::qwen35::{LayerType, Qwen35Config, Qwen35LayerWeights};
 use crate::tokenizer::BpeTokenizer;
-use std::io::{self, BufReader, Read};
-use std::path::Path;
+use std::io::{self, BufReader, Read, Seek};
+use std::path::{Path, PathBuf};
 
 /// ロード済みモデル。
 pub struct AliceModel {
@@ -899,6 +899,695 @@ fn apply_rope_with_offset(
             row[i] = x0 * cos_a - x1 * sin_a;
             row[i + half_rot] = x0 * sin_a + x1 * cos_a;
         }
+    }
+}
+
+// ── mmap + JIT Ternary 推論 ──────────────────────────────────────────────
+
+/// mmap 上の packed ternary projection の位置情報。
+#[derive(Clone, Debug)]
+struct PackedRef {
+    /// mmap 内の scale (f32 LE) の開始バイト。
+    scale_off: usize,
+    /// mmap 内の packed ternary data の開始バイト。
+    packed_off: usize,
+    /// packed bytes 数。
+    packed_len: usize,
+    /// 要素数。
+    count: usize,
+}
+
+/// mmap 上の FP32 スライスの位置情報。
+#[derive(Clone, Debug)]
+struct F32Ref {
+    off: usize,
+    count: usize,
+}
+
+/// DeltaNet 層の mmap オフセット。
+#[derive(Clone, Debug)]
+struct MmapDeltaNet {
+    in_proj_qkv: PackedRef,
+    in_proj_z: PackedRef,
+    in_proj_b: PackedRef,
+    in_proj_a: PackedRef,
+    out_proj: PackedRef,
+    gate_proj: PackedRef,
+    up_proj: PackedRef,
+    down_proj: PackedRef,
+    input_layernorm: F32Ref,
+    post_attn_layernorm: F32Ref,
+    a_log: F32Ref,
+    dt_bias: F32Ref,
+    conv1d_weight: F32Ref,
+    norm_weight: F32Ref,
+}
+
+/// FullAttn 層の mmap オフセット。
+#[derive(Clone, Debug)]
+struct MmapFullAttn {
+    q_proj: PackedRef,
+    k_proj: PackedRef,
+    v_proj: PackedRef,
+    o_proj: PackedRef,
+    gate_proj: PackedRef,
+    up_proj: PackedRef,
+    down_proj: PackedRef,
+    input_layernorm: F32Ref,
+    post_attn_layernorm: F32Ref,
+    q_norm: F32Ref,
+    k_norm: F32Ref,
+}
+
+/// レイヤーの mmap インデックス。
+#[derive(Clone, Debug)]
+enum MmapLayer {
+    DeltaNet(MmapDeltaNet),
+    FullAttn(MmapFullAttn),
+}
+
+/// ストリーミング推論モデル — mmap + JIT ternary unpacking。
+///
+/// ternary packed データを FP32 に展開**せず** mmap 上に保持。
+/// matmul の瞬間にのみ 2-bit→{-1,0,+1}×γ をレジスタ内で実行。
+///
+/// RAM: embedding (~4GB) + lm\_head (~4GB or tied) + mmap (OS管理) + buffers (~100MB)。
+/// FP32 展開の ~35GB は一切発生しない。
+pub struct StreamingAliceModel {
+    /// メタデータ。
+    pub meta: AliceModelMeta,
+    /// Embedding テーブル (FP32)。
+    pub embedding: Vec<f32>,
+    /// Output layernorm (FP32)。
+    pub output_norm: Vec<f32>,
+    /// lm\_head (FP32)。None = tied (embedding と共有)。
+    lm_head_storage: Option<Vec<f32>>,
+    /// mmap されたファイル全体。
+    mmap: memmap2::Mmap,
+    /// 各レイヤーのオフセットインデックス。
+    layer_index: Vec<MmapLayer>,
+}
+
+impl std::fmt::Debug for StreamingAliceModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingAliceModel")
+            .field("layers", &self.meta.config.num_hidden_layers)
+            .field("hidden", &self.meta.config.hidden_size)
+            .field("vocab", &self.meta.config.vocab_size)
+            .field("tied", &self.lm_head_storage.is_none())
+            .field("mmap_size", &self.mmap.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// 現在のオフセットから packed projection のインデックスを構築し、オフセットを進める。
+fn build_packed_ref(cursor: &mut usize, count: usize) -> PackedRef {
+    let scale_off = *cursor;
+    *cursor += 4; // f32 scale
+    let packed_len = count.div_ceil(4);
+    let packed_off = *cursor;
+    *cursor += packed_len;
+    PackedRef { scale_off, packed_off, packed_len, count }
+}
+
+/// 現在のオフセットから FP32 スライスのインデックスを構築し、オフセットを進める。
+fn build_f32_ref(cursor: &mut usize, count: usize) -> F32Ref {
+    let off = *cursor;
+    *cursor += count * 4;
+    F32Ref { off, count }
+}
+
+impl StreamingAliceModel {
+    /// `.alice` ファイルを mmap でオープンし、JIT 推論モデルを構築。
+    ///
+    /// embedding + output\_norm + lm\_head のみ FP32 でメモリに配置。
+    /// レイヤー重みは mmap 上に packed ternary のまま保持。
+    ///
+    /// # Errors
+    ///
+    /// ファイル読み込みまたはフォーマットエラー時。
+    pub fn from_file<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let path = path.as_ref();
+
+        // 1. mmap
+        let file = std::fs::File::open(path)?;
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+
+        // 2. ヘッダー読み込み (mmap からカーソルで読む)
+        let mut reader = io::Cursor::new(&mmap[..]);
+        let meta = read_alice_meta(&mut reader)?;
+        let config = &meta.config;
+
+        eprintln!("  [mmap] ヘッダー読み込み完了");
+        eprintln!(
+            "    config: {}層, hidden={}, vocab={}",
+            config.num_hidden_layers, config.hidden_size, config.vocab_size
+        );
+
+        // 3. embedding / output_norm / lm_head — FP32 展開 (計算で毎回必要)
+        eprintln!("    embedding...");
+        let embedding = read_embedding(&mut reader, config.vocab_size, config.hidden_size)?;
+        let output_norm = read_output_norm(&mut reader, config.hidden_size)?;
+        let lm_head_storage = read_lm_head(
+            &mut reader,
+            meta.tied_embeddings,
+            config.vocab_size,
+            config.hidden_size,
+        )?;
+
+        // 4. レイヤーオフセットインデックス構築 (mmap バイト走査、データコピーなし)
+        let mut cursor = reader.position() as usize;
+        let mut layer_index = Vec::with_capacity(config.num_hidden_layers);
+
+        for i in 0..config.num_hidden_layers {
+            let h = config.hidden_size;
+            let inter = config.intermediate_size;
+
+            match config.layer_type(i) {
+                LayerType::LinearAttention => {
+                    let kd = config.linear_key_dim();
+                    let vd = config.linear_value_dim();
+                    let nv = config.linear_num_value_heads;
+                    let conv_dim = config.conv_dim();
+                    let ks = config.linear_conv_kernel_dim;
+                    let vhd = config.linear_value_head_dim;
+
+                    let idx = MmapDeltaNet {
+                        in_proj_qkv: build_packed_ref(&mut cursor, h * (kd * 2 + vd)),
+                        in_proj_z: build_packed_ref(&mut cursor, h * vd),
+                        in_proj_b: build_packed_ref(&mut cursor, h * nv),
+                        in_proj_a: build_packed_ref(&mut cursor, h * nv),
+                        out_proj: build_packed_ref(&mut cursor, vd * h),
+                        gate_proj: build_packed_ref(&mut cursor, inter * h),
+                        up_proj: build_packed_ref(&mut cursor, inter * h),
+                        down_proj: build_packed_ref(&mut cursor, h * inter),
+                        input_layernorm: build_f32_ref(&mut cursor, h),
+                        post_attn_layernorm: build_f32_ref(&mut cursor, h),
+                        a_log: build_f32_ref(&mut cursor, nv),
+                        dt_bias: build_f32_ref(&mut cursor, nv),
+                        conv1d_weight: build_f32_ref(&mut cursor, conv_dim * ks),
+                        norm_weight: build_f32_ref(&mut cursor, vhd),
+                    };
+                    layer_index.push(MmapLayer::DeltaNet(idx));
+                }
+                LayerType::FullAttention => {
+                    let nh = config.num_attention_heads;
+                    let nkv = config.num_key_value_heads;
+                    let hd = config.head_dim;
+
+                    let idx = MmapFullAttn {
+                        q_proj: build_packed_ref(&mut cursor, h * nh * hd),
+                        k_proj: build_packed_ref(&mut cursor, h * nkv * hd),
+                        v_proj: build_packed_ref(&mut cursor, h * nkv * hd),
+                        o_proj: build_packed_ref(&mut cursor, nh * hd * h),
+                        gate_proj: build_packed_ref(&mut cursor, inter * h),
+                        up_proj: build_packed_ref(&mut cursor, inter * h),
+                        down_proj: build_packed_ref(&mut cursor, h * inter),
+                        input_layernorm: build_f32_ref(&mut cursor, h),
+                        post_attn_layernorm: build_f32_ref(&mut cursor, h),
+                        q_norm: build_f32_ref(&mut cursor, hd),
+                        k_norm: build_f32_ref(&mut cursor, hd),
+                    };
+                    layer_index.push(MmapLayer::FullAttn(idx));
+                }
+            }
+        }
+
+        let emb_mb = (embedding.len() * 4) as f64 / 1e6;
+        let lm_mb = lm_head_storage.as_ref().map_or(0.0, |v| (v.len() * 4) as f64 / 1e6);
+        let layer_data_bytes = mmap.len() - reader.position() as usize;
+        eprintln!(
+            "  [mmap] RAM: embedding={:.0}MB, lm_head={:.0}MB, mmap={}MB (packed ternary, OS管理)",
+            emb_mb, lm_mb, mmap.len() / 1_000_000
+        );
+        eprintln!(
+            "  [mmap] layer data: {:.0}MB packed (FP32展開なし), index: {} layers",
+            layer_data_bytes as f64 / 1e6,
+            layer_index.len()
+        );
+
+        Ok(Self {
+            meta,
+            embedding,
+            output_norm,
+            lm_head_storage,
+            mmap,
+            layer_index,
+        })
+    }
+
+    /// Config への参照。
+    #[must_use]
+    pub fn config(&self) -> &Qwen35Config {
+        &self.meta.config
+    }
+
+    /// lm\_head 重みへの参照 (tied なら embedding を返す)。
+    #[must_use]
+    pub fn lm_head(&self) -> &[f32] {
+        self.lm_head_storage.as_deref().unwrap_or(&self.embedding)
+    }
+
+    /// mmap から packed ternary data のスライスを取得。
+    fn packed(&self, p: &PackedRef) -> (&[u8], f32) {
+        let scale_bytes = &self.mmap[p.scale_off..p.scale_off + 4];
+        let scale = f32::from_le_bytes([scale_bytes[0], scale_bytes[1], scale_bytes[2], scale_bytes[3]]);
+        let packed = &self.mmap[p.packed_off..p.packed_off + p.packed_len];
+        (packed, scale)
+    }
+
+    /// mmap から FP32 スライスを取得 (ゼロコピー reinterpret)。
+    fn f32_slice(&self, r: &F32Ref) -> Vec<f32> {
+        let bytes = &self.mmap[r.off..r.off + r.count * 4];
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    /// `InferenceCache` を初期化。KV cache は遅延確保 (capacity=0)。
+    #[must_use]
+    pub fn create_cache(&self) -> InferenceCache {
+        let config = self.config();
+        let num_layers = config.num_hidden_layers;
+        let dk = config.linear_key_head_dim;
+        let dv = config.linear_value_head_dim;
+        let n_v_heads = config.linear_num_value_heads;
+
+        let mut deltanet_states = Vec::with_capacity(num_layers);
+        let mut full_attn_k_cache = Vec::with_capacity(num_layers);
+        let mut full_attn_v_cache = Vec::with_capacity(num_layers);
+
+        for i in 0..num_layers {
+            match config.layer_type(i) {
+                LayerType::LinearAttention => {
+                    let states: Vec<Vec<f32>> =
+                        (0..n_v_heads).map(|_| vec![0.0f32; dk * dv]).collect();
+                    deltanet_states.push(states);
+                    full_attn_k_cache.push(Vec::new());
+                    full_attn_v_cache.push(Vec::new());
+                }
+                LayerType::FullAttention => {
+                    deltanet_states.push(Vec::new());
+                    // 遅延確保: capacity=0、extend_from_slice で自動 grow
+                    full_attn_k_cache.push(Vec::new());
+                    full_attn_v_cache.push(Vec::new());
+                }
+            }
+        }
+
+        InferenceCache {
+            deltanet_states,
+            full_attn_k_cache,
+            full_attn_v_cache,
+            seq_len: 0,
+        }
+    }
+
+    /// 1トークンの incremental forward (mmap + JIT ternary)。
+    ///
+    /// Ping-Pong バッファで hidden\_states を使い回し。
+    /// ternary projection は mmap 上の packed data を直接参照、FP32 展開なし。
+    pub fn forward_incremental_streaming(
+        &self,
+        token_id: u32,
+        cache: &mut InferenceCache,
+    ) -> io::Result<Vec<f32>> {
+        use crate::blas::{blas_matmul_bt, blas_rmsnorm, ternary_matmul_bt, ternary_swiglu_ffn};
+
+        let config = self.config();
+        let hidden = config.hidden_size;
+        let vocab_size = config.vocab_size;
+        let inter = config.intermediate_size;
+        let pos = cache.seq_len;
+
+        // Embedding lookup → buf_a
+        let tok = (token_id as usize) % vocab_size;
+        let mut buf_a = self.embedding[tok * hidden..(tok + 1) * hidden].to_vec();
+        let mut buf_b = vec![0.0f32; hidden];
+
+        // Reusable FFN buffers
+        let mut gate_buf = vec![0.0f32; inter];
+        let mut up_buf = vec![0.0f32; inter];
+
+        for (layer_idx, layer_ref) in self.layer_index.iter().enumerate() {
+            match layer_ref {
+                MmapLayer::DeltaNet(idx) => {
+                    self.jit_deltanet_incremental(
+                        &mut buf_a, &mut buf_b, idx, config,
+                        &mut cache.deltanet_states[layer_idx],
+                        &mut gate_buf, &mut up_buf,
+                    );
+                    // buf_a に結果が入っている
+                }
+                MmapLayer::FullAttn(idx) => {
+                    self.jit_fullattn_incremental(
+                        &mut buf_a, &mut buf_b, idx, config,
+                        &mut cache.full_attn_k_cache[layer_idx],
+                        &mut cache.full_attn_v_cache[layer_idx],
+                        pos,
+                        &mut gate_buf, &mut up_buf,
+                    );
+                }
+            }
+        }
+
+        // Output norm
+        blas_rmsnorm(&mut buf_a, &self.output_norm, hidden, config.rms_norm_eps);
+
+        // lm_head (FP32、BLAS)
+        let mut logits = vec![0.0f32; vocab_size];
+        blas_matmul_bt(&buf_a, self.lm_head(), &mut logits, 1, vocab_size, hidden);
+
+        cache.seq_len += 1;
+        Ok(logits)
+    }
+
+    /// DeltaNet incremental (JIT ternary)。buf_a: 入力兼出力。
+    #[allow(clippy::too_many_arguments)]
+    fn jit_deltanet_incremental(
+        &self,
+        buf_a: &mut Vec<f32>,
+        buf_b: &mut Vec<f32>,
+        idx: &MmapDeltaNet,
+        config: &Qwen35Config,
+        states: &mut Vec<Vec<f32>>,
+        gate_buf: &mut [f32],
+        up_buf: &mut [f32],
+    ) {
+        use crate::blas::{blas_rmsnorm, ternary_matmul_bt, ternary_swiglu_ffn};
+        use crate::deltanet::{
+            causal_conv1d_silu_row_major, compute_gates_fused, gated_rmsnorm,
+            head_recurrence_forward_eval, l2norm_and_gqa_expand,
+        };
+
+        let hidden = config.hidden_size;
+        let key_dim = config.linear_key_dim();
+        let val_dim = config.linear_value_dim();
+        let n_k_heads = config.linear_num_key_heads;
+        let n_v_heads = config.linear_num_value_heads;
+        let dk = config.linear_key_head_dim;
+        let dv = config.linear_value_head_dim;
+        let kernel_size = config.linear_conv_kernel_dim;
+        let qkv_dim = key_dim * 2 + val_dim;
+        let inter = config.intermediate_size;
+
+        // residual = buf_a のコピー
+        let residual: Vec<f32> = buf_a.clone();
+
+        // LayerNorm (FP32、mmap から小さいスライスをコピー)
+        let ln = self.f32_slice(&idx.input_layernorm);
+        blas_rmsnorm(buf_a, &ln, hidden, config.rms_norm_eps);
+
+        // Ternary projections — JIT matmul
+        let mut qkv = vec![0.0f32; qkv_dim];
+        let (p, s) = self.packed(&idx.in_proj_qkv);
+        ternary_matmul_bt(buf_a, p, s, &mut qkv, 1, qkv_dim, hidden);
+
+        let mut z = vec![0.0f32; val_dim];
+        let (p, s) = self.packed(&idx.in_proj_z);
+        ternary_matmul_bt(buf_a, p, s, &mut z, 1, val_dim, hidden);
+
+        let mut b_raw = vec![0.0f32; n_v_heads];
+        let (p, s) = self.packed(&idx.in_proj_b);
+        ternary_matmul_bt(buf_a, p, s, &mut b_raw, 1, n_v_heads, hidden);
+
+        let mut a_raw = vec![0.0f32; n_v_heads];
+        let (p, s) = self.packed(&idx.in_proj_a);
+        ternary_matmul_bt(buf_a, p, s, &mut a_raw, 1, n_v_heads, hidden);
+
+        // conv1d
+        let conv_w = self.f32_slice(&idx.conv1d_weight);
+        let mut qkv_conv = vec![0.0f32; qkv_dim];
+        causal_conv1d_silu_row_major(&qkv, &conv_w, &mut qkv_conv, qkv_dim, 1, kernel_size);
+
+        let q_raw = &qkv_conv[..key_dim];
+        let k_raw = &qkv_conv[key_dim..key_dim * 2];
+        let v_all = &qkv_conv[key_dim * 2..qkv_dim];
+
+        let mut q_expanded = vec![0.0f32; n_v_heads * dk];
+        let mut k_expanded = vec![0.0f32; n_v_heads * dk];
+        l2norm_and_gqa_expand(q_raw, k_raw, &mut q_expanded, &mut k_expanded, 1, n_k_heads, n_v_heads, dk, 1e-6);
+
+        let a_log = self.f32_slice(&idx.a_log);
+        let dt_bias = self.f32_slice(&idx.dt_bias);
+        let mut beta = vec![0.0f32; n_v_heads];
+        let mut g = vec![0.0f32; n_v_heads];
+        compute_gates_fused(&b_raw, &a_raw, &a_log, &dt_bias, &mut beta, &mut g, 1, n_v_heads);
+
+        let mut attn_out_raw = vec![0.0f32; n_v_heads * dv];
+        for h in 0..n_v_heads {
+            head_recurrence_forward_eval(
+                &q_expanded[h * dk..(h + 1) * dk],
+                &k_expanded[h * dk..(h + 1) * dk],
+                &v_all[h * dv..(h + 1) * dv],
+                &[beta[h]], &[g[h]],
+                &mut attn_out_raw[h * dv..(h + 1) * dv],
+                &mut states[h], dk, dv, 1,
+            );
+        }
+
+        let norm_w = self.f32_slice(&idx.norm_weight);
+        let mut attn_normed = vec![0.0f32; val_dim];
+        gated_rmsnorm(&attn_out_raw, &z, &norm_w, &mut attn_normed, dv, config.rms_norm_eps);
+
+        // out_proj — JIT ternary
+        buf_b.fill(0.0);
+        buf_b.resize(hidden, 0.0);
+        let (p, s) = self.packed(&idx.out_proj);
+        ternary_matmul_bt(&attn_normed, p, s, buf_b, 1, hidden, val_dim);
+
+        // residual add → buf_a
+        for i in 0..hidden {
+            buf_a[i] = residual[i] + buf_b[i];
+        }
+
+        // FFN — JIT ternary SwiGLU
+        let residual_ffn: Vec<f32> = buf_a.clone();
+        let post_ln = self.f32_slice(&idx.post_attn_layernorm);
+        blas_rmsnorm(buf_a, &post_ln, hidden, config.rms_norm_eps);
+
+        buf_b.fill(0.0);
+        buf_b.resize(hidden, 0.0);
+        let (gp, gs) = self.packed(&idx.gate_proj);
+        let (up, us) = self.packed(&idx.up_proj);
+        let (dp, ds) = self.packed(&idx.down_proj);
+        ternary_swiglu_ffn(buf_a, gp, gs, up, us, dp, ds, buf_b, gate_buf, up_buf, 1, hidden, inter);
+
+        // residual add → buf_a
+        for i in 0..hidden {
+            buf_a[i] = residual_ffn[i] + buf_b[i];
+        }
+    }
+
+    /// FullAttn incremental (JIT ternary)。buf_a: 入力兼出力。
+    #[allow(clippy::too_many_arguments)]
+    fn jit_fullattn_incremental(
+        &self,
+        buf_a: &mut Vec<f32>,
+        buf_b: &mut Vec<f32>,
+        idx: &MmapFullAttn,
+        config: &Qwen35Config,
+        k_cache: &mut Vec<f32>,
+        v_cache: &mut Vec<f32>,
+        position: usize,
+        gate_buf: &mut [f32],
+        up_buf: &mut [f32],
+    ) {
+        use crate::blas::{blas_rmsnorm, ternary_matmul_bt, ternary_swiglu_ffn};
+        use crate::deltanet::qk_norm;
+
+        let hidden = config.hidden_size;
+        let num_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
+        let head_dim = config.head_dim;
+        let rotary_dim = config.rotary_dim();
+        let inter = config.intermediate_size;
+
+        let residual: Vec<f32> = buf_a.clone();
+
+        let ln = self.f32_slice(&idx.input_layernorm);
+        blas_rmsnorm(buf_a, &ln, hidden, config.rms_norm_eps);
+
+        // QKV projections — JIT ternary
+        let mut q = vec![0.0f32; num_heads * head_dim];
+        let mut k_new = vec![0.0f32; num_kv_heads * head_dim];
+        let mut v_new = vec![0.0f32; num_kv_heads * head_dim];
+
+        let (p, s) = self.packed(&idx.q_proj);
+        ternary_matmul_bt(buf_a, p, s, &mut q, 1, num_heads * head_dim, hidden);
+        let (p, s) = self.packed(&idx.k_proj);
+        ternary_matmul_bt(buf_a, p, s, &mut k_new, 1, num_kv_heads * head_dim, hidden);
+        let (p, s) = self.packed(&idx.v_proj);
+        ternary_matmul_bt(buf_a, p, s, &mut v_new, 1, num_kv_heads * head_dim, hidden);
+
+        let q_norm_w = self.f32_slice(&idx.q_norm);
+        let k_norm_w = self.f32_slice(&idx.k_norm);
+        qk_norm(&mut q, &q_norm_w, num_heads, head_dim, config.rms_norm_eps);
+        qk_norm(&mut k_new, &k_norm_w, num_kv_heads, head_dim, config.rms_norm_eps);
+
+        apply_rope_with_offset(&mut q, num_heads, head_dim, rotary_dim, position, config.rope_theta);
+        apply_rope_with_offset(&mut k_new, num_kv_heads, head_dim, rotary_dim, position, config.rope_theta);
+
+        // KV cache grow (遅延確保)
+        k_cache.extend_from_slice(&k_new);
+        v_cache.extend_from_slice(&v_new);
+
+        let cache_len = k_cache.len() / (num_kv_heads * head_dim);
+        let kv_groups = num_heads / num_kv_heads;
+        let scale = (head_dim as f32).sqrt().recip();
+        let mut attn_out_raw = vec![0.0f32; num_heads * head_dim];
+
+        for h in 0..num_heads {
+            let kv_h = h / kv_groups;
+            let q_h = &q[h * head_dim..(h + 1) * head_dim];
+            let out_h = &mut attn_out_raw[h * head_dim..(h + 1) * head_dim];
+
+            let mut scores = vec![0.0f32; cache_len];
+            for t in 0..cache_len {
+                let k_t = &k_cache[(t * num_kv_heads + kv_h) * head_dim..
+                                   (t * num_kv_heads + kv_h + 1) * head_dim];
+                let dot: f32 = q_h.iter().zip(k_t.iter()).map(|(a, b)| a * b).sum();
+                scores[t] = dot * scale;
+            }
+
+            let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for s in &mut scores { *s = (*s - max_s).exp(); sum += *s; }
+            let inv_sum = sum.recip();
+            for s in &mut scores { *s *= inv_sum; }
+
+            for t in 0..cache_len {
+                let v_t = &v_cache[(t * num_kv_heads + kv_h) * head_dim..
+                                   (t * num_kv_heads + kv_h + 1) * head_dim];
+                let w = scores[t];
+                for d in 0..head_dim { out_h[d] += w * v_t[d]; }
+            }
+        }
+
+        // O projection — JIT ternary
+        buf_b.fill(0.0);
+        buf_b.resize(hidden, 0.0);
+        let (p, s) = self.packed(&idx.o_proj);
+        ternary_matmul_bt(&attn_out_raw, p, s, buf_b, 1, hidden, num_heads * head_dim);
+
+        for i in 0..hidden { buf_a[i] = residual[i] + buf_b[i]; }
+
+        // FFN — JIT ternary SwiGLU
+        let residual_ffn: Vec<f32> = buf_a.clone();
+        let post_ln = self.f32_slice(&idx.post_attn_layernorm);
+        blas_rmsnorm(buf_a, &post_ln, hidden, config.rms_norm_eps);
+
+        buf_b.fill(0.0);
+        buf_b.resize(hidden, 0.0);
+        let (gp, gs) = self.packed(&idx.gate_proj);
+        let (up, us) = self.packed(&idx.up_proj);
+        let (dp, ds) = self.packed(&idx.down_proj);
+        ternary_swiglu_ffn(buf_a, gp, gs, up, us, dp, ds, buf_b, gate_buf, up_buf, 1, hidden, inter);
+
+        for i in 0..hidden { buf_a[i] = residual_ffn[i] + buf_b[i]; }
+    }
+
+    /// キャッシュ付きストリーミング生成。
+    ///
+    /// # Errors
+    ///
+    /// ファイル I/O エラー時。
+    pub fn generate_streaming(
+        &self,
+        prompt_ids: &[u32],
+        gen_config: &GenerationConfig,
+        eos_token_id: u32,
+    ) -> io::Result<Vec<u32>> {
+        let mut cache = self.create_cache();
+
+        eprintln!("  [mmap] prefill {} tokens...", prompt_ids.len());
+        for (i, &tok) in prompt_ids.iter().enumerate() {
+            let _ = self.forward_incremental_streaming(tok, &mut cache)?;
+            if (i + 1) % 10 == 0 || i == prompt_ids.len() - 1 {
+                eprintln!("    prefill: {}/{}", i + 1, prompt_ids.len());
+            }
+        }
+
+        eprintln!("  [mmap] generating...");
+        let mut generated = Vec::new();
+        let mut all_ids: Vec<u32> = prompt_ids.to_vec();
+        let mut last_token = *prompt_ids.last().unwrap_or(&0);
+
+        for step in 0..gen_config.max_tokens {
+            let mut logits = self.forward_incremental_streaming(last_token, &mut cache)?;
+
+            if (gen_config.repetition_penalty - 1.0).abs() > f32::EPSILON {
+                apply_repetition_penalty(&mut logits, &all_ids, gen_config.repetition_penalty);
+            }
+
+            let next_token = if gen_config.temperature <= 0.0 {
+                argmax(&logits)
+            } else {
+                sample_top_k(&mut logits, gen_config.temperature, gen_config.top_k)
+            };
+
+            if next_token == eos_token_id {
+                eprintln!("    EOS at step {step}");
+                break;
+            }
+
+            generated.push(next_token);
+            all_ids.push(next_token);
+            last_token = next_token;
+        }
+
+        Ok(generated)
+    }
+
+    /// 1トークンずつストリーミング生成し、コールバックで出力。
+    ///
+    /// # Errors
+    ///
+    /// ファイル I/O エラー時。
+    pub fn generate_streaming_callback<F>(
+        &self,
+        prompt_ids: &[u32],
+        gen_config: &GenerationConfig,
+        eos_token_id: u32,
+        tokenizer: &BpeTokenizer,
+        mut callback: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let mut cache = self.create_cache();
+
+        for &tok in prompt_ids {
+            let _ = self.forward_incremental_streaming(tok, &mut cache)?;
+        }
+
+        let mut all_ids: Vec<u32> = prompt_ids.to_vec();
+        let mut last_token = *prompt_ids.last().unwrap_or(&0);
+
+        for _ in 0..gen_config.max_tokens {
+            let mut logits = self.forward_incremental_streaming(last_token, &mut cache)?;
+
+            if (gen_config.repetition_penalty - 1.0).abs() > f32::EPSILON {
+                apply_repetition_penalty(&mut logits, &all_ids, gen_config.repetition_penalty);
+            }
+
+            let next_token = if gen_config.temperature <= 0.0 {
+                argmax(&logits)
+            } else {
+                sample_top_k(&mut logits, gen_config.temperature, gen_config.top_k)
+            };
+
+            if next_token == eos_token_id { break; }
+
+            let text = tokenizer.decode(&[next_token]);
+            if !callback(&text) { break; }
+
+            all_ids.push(next_token);
+            last_token = next_token;
+        }
+
+        Ok(())
     }
 }
 

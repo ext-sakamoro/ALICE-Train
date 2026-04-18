@@ -389,6 +389,110 @@ pub fn blas_rmsnorm(x: &mut [f32], weight: &[f32], dim: usize, eps: f32) {
     });
 }
 
+// ── JIT Ternary Matmul ──────────────────────────────────────────────────
+
+/// JIT ternary matmul: C += scale × A × unpack(B_packed)^T
+///
+/// packed ternary の B を FP32 に展開**せず**、ループ内で 2-bit を直接解釈。
+/// メモリ帯域: FP32 matmul の ~1/8 (packed 0.25B/elem vs FP32 4B/elem)。
+///
+/// - `a`: `[m × k]` FP32 input
+/// - `packed_b`: `[n × packed_k]` 2-bit packed ternary (row-major, LSB-first)
+/// - `scale`: γ (quantization scale)
+/// - `c`: `[m × n]` FP32 output (**加算**、事前ゼロ初期化必須)
+pub fn ternary_matmul_bt(
+    a: &[f32],
+    packed_b: &[u8],
+    scale: f32,
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    let packed_k = k.div_ceil(4);
+
+    for i in 0..m {
+        let a_row = &a[i * k..];
+        let c_row = &mut c[i * n..i * n + n];
+
+        for j in 0..n {
+            let b_row = j * packed_k;
+            let mut sum = 0.0f32;
+
+            // 4 values per byte, unrolled
+            let full_bytes = k / 4;
+            for byte_idx in 0..full_bytes {
+                let byte = packed_b[b_row + byte_idx];
+                let col = byte_idx * 4;
+
+                // 4要素を一括処理
+                let c0 = byte & 0b11;
+                let c1 = (byte >> 2) & 0b11;
+                let c2 = (byte >> 4) & 0b11;
+                let c3 = (byte >> 6) & 0b11;
+
+                // branchless: lookup table [0, +1, -1, 0] for codes [0b00, 0b01, 0b10, 0b11]
+                const LUT: [f32; 4] = [0.0, 1.0, -1.0, 0.0];
+                sum += LUT[c0 as usize] * a_row[col];
+                sum += LUT[c1 as usize] * a_row[col + 1];
+                sum += LUT[c2 as usize] * a_row[col + 2];
+                sum += LUT[c3 as usize] * a_row[col + 3];
+            }
+
+            // 端数処理
+            let rem = k % 4;
+            if rem > 0 {
+                let byte = packed_b[b_row + full_bytes];
+                let col = full_bytes * 4;
+                const LUT: [f32; 4] = [0.0, 1.0, -1.0, 0.0];
+                for bit in 0..rem {
+                    let code = (byte >> (bit * 2)) & 0b11;
+                    sum += LUT[code as usize] * a_row[col + bit];
+                }
+            }
+
+            c_row[j] += sum * scale;
+        }
+    }
+}
+
+/// JIT ternary SwiGLU FFN: gate × SiLU + up → down projection。
+///
+/// FP32 展開不要。3つの ternary matmul + SiLU を実行。
+pub fn ternary_swiglu_ffn(
+    input: &[f32],
+    gate_packed: &[u8],
+    gate_scale: f32,
+    up_packed: &[u8],
+    up_scale: f32,
+    down_packed: &[u8],
+    down_scale: f32,
+    output: &mut [f32],
+    gate_buf: &mut [f32],
+    up_buf: &mut [f32],
+    seq_len: usize,
+    hidden_dim: usize,
+    intermediate_dim: usize,
+) {
+    // gate = input × gate_proj^T
+    gate_buf.fill(0.0);
+    ternary_matmul_bt(input, gate_packed, gate_scale, gate_buf, seq_len, intermediate_dim, hidden_dim);
+
+    // up = input × up_proj^T
+    up_buf.fill(0.0);
+    ternary_matmul_bt(input, up_packed, up_scale, up_buf, seq_len, intermediate_dim, hidden_dim);
+
+    // SiLU(gate) * up
+    for i in 0..seq_len * intermediate_dim {
+        let x = gate_buf[i];
+        gate_buf[i] = (x / (1.0 + (-x).exp())) * up_buf[i];
+    }
+
+    // output = gate_silu × down_proj^T
+    output.fill(0.0);
+    ternary_matmul_bt(gate_buf, down_packed, down_scale, output, seq_len, hidden_dim, intermediate_dim);
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
