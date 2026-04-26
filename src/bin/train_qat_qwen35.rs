@@ -775,6 +775,9 @@ fn main() {
         let mut last_loss = 0.0f32;
         let mut stuck_loss_count: usize = 0; // 同一loss連続カウント
         let mut stuck_loss_value: f32 = 0.0;
+        let mut eval_loss_history: Vec<f32> = Vec::new(); // eval_loss 履歴 (過学習監視)
+        let mut best_eval_loss: f32 = f32::MAX; // best eval loss (過学習検知用)
+        const EARLY_STOP_PATIENCE: usize = 5; // eval_loss 連続悪化でearly stopping
 
         // Gradient accumulation 用アキュムレータ
         let mut accumulated_grads: Vec<Option<Qwen35WeightGrads>> =
@@ -1280,7 +1283,7 @@ fn main() {
                 let _ = std::io::stdout().flush();
             }
 
-            // Eval (オプション)
+            // Eval (オプション) — fake-quantized 重みで過学習監視
             if global_step > 0 && global_step % config.eval_interval == 0 && eval_dataset.is_some()
             {
                 let eval_ds = eval_dataset.as_ref().unwrap();
@@ -1292,6 +1295,19 @@ fn main() {
                 let eval_loader = DataLoader::new(eval_ds, eval_dl_config);
                 let eval_batches = eval_loader.num_batches().min(10);
 
+                // fake-quantize 最新の重みを eval 用に適用
+                if config.preload_all_layers {
+                    for i in 0..config.model.num_hidden_layers {
+                        layers[i].fake_quantize_into(&mut fq_buffers[i]);
+                    }
+                }
+
+                let eval_weights: &[Qwen35LayerWeights] = if config.preload_all_layers {
+                    &fq_buffers
+                } else {
+                    &layers
+                };
+
                 let mut eval_loss = 0.0f32;
                 let mut eval_tokens = 0usize;
                 for eb in 0..eval_batches {
@@ -1300,7 +1316,7 @@ fn main() {
                     let eval_logits = qwen35_model_forward_eval(
                         &eval_ids,
                         &embedding_table,
-                        &layers,
+                        eval_weights,
                         &output_norm,
                         &lm_head,
                         &config.model,
@@ -1315,7 +1331,67 @@ fn main() {
                 }
                 if eval_tokens > 0 {
                     let avg_eval = eval_loss / eval_tokens as f32;
-                    println!("    eval_loss: {avg_eval:.4} ({eval_tokens} tokens)");
+                    println!("  [EVAL] step {global_step} | eval_loss: {avg_eval:.4} | eval_ppl: {:.1} | train_loss: {avg_loss:.4}",
+                        (avg_eval as f64).exp());
+
+                    eval_loss_history.push(avg_eval);
+
+                    // Best Checkpoint 自動退避
+                    if avg_eval < best_eval_loss {
+                        best_eval_loss = avg_eval;
+                        let best_dir = format!("{}/best_eval", config.checkpoint_dir);
+                        let _ = fs::create_dir_all(&best_dir);
+                        println!("  🏆 [EVAL] Best eval_loss 更新: {avg_eval:.4} — best_eval/ に退避中...");
+
+                        // FP32キャッシュを best_eval/ にコピー
+                        if config.preload_all_layers {
+                            for li in 0..config.model.num_hidden_layers {
+                                if let Err(e) = alice_train::fp32_cache::save_layer_to_cache(
+                                    &best_dir, li, &layers[li], &config.model,
+                                ) {
+                                    eprintln!("    best_eval 保存失敗 (layer {li}): {e}");
+                                }
+                            }
+                            println!("    best_eval/ FP32キャッシュ保存完了 ({} layers)", config.model.num_hidden_layers);
+                        }
+
+                        // resume_state も保存
+                        let resume_json = format!(
+                            "{{\"step\":{global_step},\"loss\":{avg_loss},\"lr\":{lr:.6e},\"eval_loss\":{avg_eval}}}",
+                        );
+                        let _ = fs::write(format!("{best_dir}/resume_state.json"), &resume_json);
+                    }
+
+                    // Early Stopping: PATIENCE 連続で eval_loss 悪化 → 学習終了
+                    let consecutive_worse = {
+                        let n = eval_loss_history.len();
+                        if n < 2 {
+                            0
+                        } else {
+                            let mut count = 0usize;
+                            for j in (1..n).rev() {
+                                if eval_loss_history[j] > eval_loss_history[j - 1] {
+                                    count += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            count
+                        }
+                    };
+
+                    if consecutive_worse >= 2 {
+                        println!("  ⚠️ [EVAL] eval_loss {consecutive_worse}連続上昇 — 過学習の兆候 (patience: {consecutive_worse}/{EARLY_STOP_PATIENCE})");
+                    }
+
+                    if consecutive_worse >= EARLY_STOP_PATIENCE {
+                        println!("  🛑 [EVAL] Early Stopping 発動! eval_loss {EARLY_STOP_PATIENCE}連続悪化");
+                        println!("    best_eval_loss: {best_eval_loss:.4} (best_eval/ に退避済み)");
+                        println!("    最新 eval_loss: {avg_eval:.4}");
+                        // 学習ループ脱出フラグ
+                        collapse_countdown = 0;
+                        break;
+                    }
                 }
             }
 

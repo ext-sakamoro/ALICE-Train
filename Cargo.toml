@@ -53,6 +53,11 @@ name = "prepare-data"
 path = "src/bin/prepare_data.rs"
 required-features = ["qat-cli"]
 
+[[bin]]
+name = "eval-ppl"
+path = "src/bin/eval_ppl.rs"
+required-features = ["qat-cli"]
+
 [dependencies]
 alice-ml = { path = "../ALICE-ML", default-features = true }
 memmap2 = "0.9"

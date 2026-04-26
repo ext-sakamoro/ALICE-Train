@@ -1,35 +1,65 @@
 #!/usr/bin/env python3
-"""HuggingFace からテキストデータをダウンロードし、Llama-3 tokenizer でトークナイズして train.bin を生成。
+"""HuggingFace からテキストデータをダウンロードし、トークナイズして train.bin を生成。
+
+SlimPajama (100M+ tokens) 対応: ストリーミングモードで大規模コーパスから取得。
 
 Usage:
+    # wikitext (小規模テスト用)
     python3 scripts/prepare_real_data.py \
-        --model_path models/meta-llama--Llama-3.1-8B-Instruct \
-        --output data/general/train.bin \
-        --max_tokens 1000000
+        --model_path models/Qwen--Qwen3.5-9B \
+        --output data/qwen35/train.bin \
+        --max_tokens 2000000
+
+    # SlimPajama (本番用 100M tokens)
+    python3 scripts/prepare_real_data.py \
+        --model_path models/Qwen--Qwen3.5-9B \
+        --output data/qwen35/train.bin \
+        --max_tokens 100000000 \
+        --dataset cerebras/SlimPajama-627B \
+        --streaming
+
+    # eval データ生成 (別 split)
+    python3 scripts/prepare_real_data.py \
+        --model_path models/Qwen--Qwen3.5-9B \
+        --output data/qwen35/eval.bin \
+        --max_tokens 10000 \
+        --dataset cerebras/SlimPajama-627B \
+        --streaming \
+        --split validation
 """
 import argparse
 import struct
 import os
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare real training data for ALICE-Train QAT")
-    parser.add_argument("--model_path", type=str, default="models/meta-llama--Llama-3.1-8B-Instruct",
-                        help="Path to Llama model dir (contains tokenizer.json)")
-    parser.add_argument("--output", type=str, default="data/general/train.bin",
+    parser = argparse.ArgumentParser(description="Prepare training data for ALICE-Train QAT")
+    parser.add_argument("--model_path", type=str, default="models/Qwen--Qwen3.5-9B",
+                        help="Path to model dir (contains tokenizer.json)")
+    parser.add_argument("--output", type=str, default="data/qwen35/train.bin",
                         help="Output path for raw u32 LE token binary")
     parser.add_argument("--max_tokens", type=int, default=500_000,
                         help="Maximum number of tokens to generate")
     parser.add_argument("--dataset", type=str, default="wikitext",
                         help="HuggingFace dataset name")
-    parser.add_argument("--dataset_config", type=str, default="wikitext-103-raw-v1",
-                        help="Dataset config name")
+    parser.add_argument("--dataset_config", type=str, default=None,
+                        help="Dataset config name (e.g. wikitext-103-raw-v1)")
     parser.add_argument("--split", type=str, default="train",
                         help="Dataset split")
+    parser.add_argument("--streaming", action="store_true",
+                        help="Use streaming mode (required for large datasets like SlimPajama)")
+    parser.add_argument("--text_field", type=str, default=None,
+                        help="Name of text field in dataset (auto-detected if not set)")
     args = parser.parse_args()
 
-    print(f"=== ALICE-Train: Real Data Preparation ===")
+    # wikitext のデフォルト config
+    if args.dataset == "wikitext" and args.dataset_config is None:
+        args.dataset_config = "wikitext-103-raw-v1"
+
+    print(f"=== ALICE-Train: Data Preparation ===")
     print(f"  Model: {args.model_path}")
-    print(f"  Dataset: {args.dataset}/{args.dataset_config} ({args.split})")
+    print(f"  Dataset: {args.dataset}" + (f"/{args.dataset_config}" if args.dataset_config else ""))
+    print(f"  Split: {args.split}")
+    print(f"  Streaming: {args.streaming}")
     print(f"  Max tokens: {args.max_tokens:,}")
     print()
 
@@ -44,15 +74,52 @@ def main():
     # Dataset
     print("Loading dataset...")
     from datasets import load_dataset
-    ds = load_dataset(args.dataset, args.dataset_config, split=args.split, trust_remote_code=True)
-    print(f"  Samples: {len(ds)}")
+    load_kwargs = {
+        "split": args.split,
+    }
+    if args.streaming:
+        load_kwargs["streaming"] = True
+    if args.dataset_config:
+        ds = load_dataset(args.dataset, args.dataset_config, **load_kwargs)
+    else:
+        ds = load_dataset(args.dataset, **load_kwargs)
+
+    if not args.streaming:
+        print(f"  Samples: {len(ds)}")
+    else:
+        print(f"  Streaming mode (samples counted during tokenization)")
     print()
+
+    # テキストフィールド自動検出
+    text_field = args.text_field
+    if text_field is None:
+        # 最初のサンプルを見て推定
+        if args.streaming:
+            first = next(iter(ds))
+        else:
+            first = ds[0]
+        for candidate in ["text", "content", "document", "passage"]:
+            if candidate in first:
+                text_field = candidate
+                break
+        if text_field is None:
+            # 最初の string フィールド
+            for k, v in first.items():
+                if isinstance(v, str):
+                    text_field = k
+                    break
+        if text_field is None:
+            print("ERROR: テキストフィールドが見つかりません")
+            print(f"  Available fields: {list(first.keys())}")
+            exit(1)
+        print(f"  Text field: '{text_field}'")
 
     # Tokenize
     print("Tokenizing...")
     all_tokens = []
+    sample_count = 0
     for i, sample in enumerate(ds):
-        text = sample.get("text", "")
+        text = sample.get(text_field, "")
         if not text or len(text.strip()) < 10:
             continue
 
@@ -64,6 +131,8 @@ def main():
         if tokenizer.eos_token_id is not None:
             all_tokens.append(tokenizer.eos_token_id)
 
+        sample_count += 1
+
         if len(all_tokens) >= args.max_tokens:
             all_tokens = all_tokens[:args.max_tokens]
             break
@@ -71,7 +140,7 @@ def main():
         if (i + 1) % 10000 == 0:
             print(f"  {i+1} samples processed, {len(all_tokens):,} tokens so far...")
 
-    print(f"  Total: {len(all_tokens):,} tokens")
+    print(f"  Total: {sample_count:,} samples, {len(all_tokens):,} tokens")
     print()
 
     # Save as raw u32 LE
