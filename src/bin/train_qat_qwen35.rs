@@ -884,7 +884,8 @@ fn main() {
                         total_loss += loss;
                         token_count += 1;
                         for (dst, &src) in d_logits_all[t * vocab_size..(t + 1) * vocab_size]
-                            .iter_mut().zip(dl.iter())
+                            .iter_mut()
+                            .zip(dl.iter())
                         {
                             *dst = src * grad_scale;
                         }
@@ -936,8 +937,12 @@ fn main() {
                                         let mut wg = alice_train::qwen35_backward::DeltaNetWeightGrads::zeros(&config.model);
                                         let d_in =
                                             alice_train::qwen35_backward::deltanet_layer_gc_fused(
-                                                &saved_input, &d_hidden, w_fq,
-                                                &config.model, seq_len, &mut wg,
+                                                &saved_input,
+                                                &d_hidden,
+                                                w_fq,
+                                                &config.model,
+                                                seq_len,
+                                                &mut wg,
                                             );
                                         (d_in, Some(Qwen35WeightGrads::DeltaNet(wg)))
                                     }
@@ -951,10 +956,19 @@ fn main() {
                         } else {
                             let mut recompute_input = saved_input;
                             let cache = qwen35_layer_forward(
-                                &mut recompute_input, &fq_buffers[i], &config.model, seq_len,
+                                &mut recompute_input,
+                                &fq_buffers[i],
+                                &config.model,
+                                seq_len,
                             );
                             let (d_in, grads) = qwen35_layer_backward(
-                                &d_hidden, &cache, &fq_buffers[i], &config.model, seq_len, lr, config.weight_decay,
+                                &d_hidden,
+                                &cache,
+                                &fq_buffers[i],
+                                &config.model,
+                                seq_len,
+                                lr,
+                                config.weight_decay,
                             );
                             drop(cache);
                             (d_in, Some(grads))
@@ -989,19 +1003,32 @@ fn main() {
                                     // 更新後の Ternary 重み
                                     let new_fq = layers[0].fake_quantize();
                                     // in_proj_qkv でフリップ率を計算
-                                    if let (Qwen35LayerWeights::DeltaNet(ref o), Qwen35LayerWeights::DeltaNet(ref n)) = (&old_fq, &new_fq) {
-                                        let flipped = o.in_proj_qkv.iter().zip(n.in_proj_qkv.iter())
-                                            .filter(|(&a, &b)| (a - b).abs() > 1e-5).count();
+                                    if let (
+                                        Qwen35LayerWeights::DeltaNet(ref o),
+                                        Qwen35LayerWeights::DeltaNet(ref n),
+                                    ) = (&old_fq, &new_fq)
+                                    {
+                                        let flipped = o
+                                            .in_proj_qkv
+                                            .iter()
+                                            .zip(n.in_proj_qkv.iter())
+                                            .filter(|(&a, &b)| (a - b).abs() > 1e-5)
+                                            .count();
                                         let total = o.in_proj_qkv.len();
                                         let ratio = flipped as f64 / total as f64 * 100.0;
-                                        eprintln!("    [Layer 0 qkv] Ternary Flip: {:.4}% ({}/{})", ratio, flipped, total);
+                                        eprintln!(
+                                            "    [Layer 0 qkv] Ternary Flip: {:.4}% ({}/{})",
+                                            ratio, flipped, total
+                                        );
                                     }
                                 } else {
                                     g.apply_sgd(&mut layers[i], lr, config.weight_decay);
                                 }
                             }
                         }
-                        for g in accumulated_grads.iter_mut() { *g = None; }
+                        for g in accumulated_grads.iter_mut() {
+                            *g = None;
+                        }
                         accum_count = 0;
                     }
                     if profile {
@@ -1038,8 +1065,11 @@ fn main() {
                     for i in 0..num_l {
                         saved_inputs.push(hidden_states.clone());
                         let layer_w = alice_train::fp32_cache::load_layer_from_cache(
-                            cache_base, i, &config.model,
-                        ).unwrap_or_else(|e| {
+                            cache_base,
+                            i,
+                            &config.model,
+                        )
+                        .unwrap_or_else(|e| {
                             eprintln!("[ALICE-Train] layer {i} 読み込み失敗: {e}");
                             std::process::exit(1);
                         });
@@ -1054,17 +1084,28 @@ fn main() {
                             *fq_buf = Some(layer_w.fake_quantize());
                         }
                         alice_train::qwen35_forward::qwen35_layer_forward_eval_inplace(
-                            &mut hidden_states, fq_buf.as_ref().unwrap(), &config.model, seq_len,
+                            &mut hidden_states,
+                            fq_buf.as_ref().unwrap(),
+                            &config.model,
+                            seq_len,
                         );
                     }
 
                     // 3. Output norm + lm_head
                     alice_train::blas::blas_rmsnorm(
-                        &mut hidden_states, &output_norm, hidden, config.model.rms_norm_eps,
+                        &mut hidden_states,
+                        &output_norm,
+                        hidden,
+                        config.model.rms_norm_eps,
                     );
                     let mut logits = vec![0.0f32; seq_len * vocab_size];
                     alice_train::blas::blas_matmul_bt(
-                        &hidden_states, &lm_head, &mut logits, seq_len, vocab_size, hidden,
+                        &hidden_states,
+                        &lm_head,
+                        &mut logits,
+                        seq_len,
+                        vocab_size,
+                        hidden,
                     );
 
                     // 4. Loss + d_logits (seq_len で正規化)
@@ -1077,7 +1118,8 @@ fn main() {
                         total_loss += loss;
                         token_count += 1;
                         for (dst, &src) in d_logits_all[t * vocab_size..(t + 1) * vocab_size]
-                            .iter_mut().zip(dl.iter())
+                            .iter_mut()
+                            .zip(dl.iter())
                         {
                             *dst = src * grad_scale;
                         }
@@ -1087,7 +1129,12 @@ fn main() {
                     // 5. Backward through lm_head
                     let mut d_hidden = vec![0.0f32; seq_len * hidden];
                     alice_train::blas::blas_matmul_nn(
-                        &d_logits_all, &lm_head, &mut d_hidden, seq_len, hidden, vocab_size,
+                        &d_logits_all,
+                        &lm_head,
+                        &mut d_hidden,
+                        seq_len,
+                        hidden,
+                        vocab_size,
                     );
                     drop(d_logits_all);
 
@@ -1096,8 +1143,11 @@ fn main() {
                     // 勾配は accumulated_grads に蓄積 (STE: 勾配を素通り)
                     for i in (0..num_l).rev() {
                         let layer_w_orig = alice_train::fp32_cache::load_layer_from_cache(
-                            cache_base, i, &config.model,
-                        ).unwrap_or_else(|e| {
+                            cache_base,
+                            i,
+                            &config.model,
+                        )
+                        .unwrap_or_else(|e| {
                             eprintln!("[ALICE-Train] backward layer {i} 読み込み失敗: {e}");
                             std::process::exit(1);
                         });
@@ -1115,12 +1165,21 @@ fn main() {
 
                         let mut recompute_input = saved_inputs.pop().unwrap();
                         let cache = qwen35_layer_forward(
-                            &mut recompute_input, fq_ref, &config.model, seq_len,
+                            &mut recompute_input,
+                            fq_ref,
+                            &config.model,
+                            seq_len,
                         );
 
                         // backward は fq 重みに対して計算 → STE で勾配素通り
                         let (d_input, grads) = qwen35_layer_backward(
-                            &d_hidden, &cache, fq_ref, &config.model, seq_len, lr, config.weight_decay,
+                            &d_hidden,
+                            &cache,
+                            fq_ref,
+                            &config.model,
+                            seq_len,
+                            lr,
+                            config.weight_decay,
                         );
                         d_hidden = d_input;
                         drop(cache);
@@ -1144,21 +1203,30 @@ fn main() {
 
                                 // FP32 shadow weights を読み込み → SGD → 書き戻し (STE)
                                 let mut layer_w = alice_train::fp32_cache::load_layer_from_cache(
-                                    cache_base, i, &config.model,
-                                ).unwrap_or_else(|e| {
+                                    cache_base,
+                                    i,
+                                    &config.model,
+                                )
+                                .unwrap_or_else(|e| {
                                     eprintln!("[ALICE-Train] SGD layer {i} 読み込み失敗: {e}");
                                     std::process::exit(1);
                                 });
                                 g.apply_sgd(&mut layer_w, lr, config.weight_decay);
                                 alice_train::fp32_cache::save_layer_to_cache(
-                                    cache_base, i, &layer_w, &config.model,
-                                ).unwrap_or_else(|e| {
+                                    cache_base,
+                                    i,
+                                    &layer_w,
+                                    &config.model,
+                                )
+                                .unwrap_or_else(|e| {
                                     eprintln!("[ALICE-Train] layer {i} 書き戻し失敗: {e}");
                                 });
                             }
                         }
                         // リセット
-                        for g in accumulated_grads.iter_mut() { *g = None; }
+                        for g in accumulated_grads.iter_mut() {
+                            *g = None;
+                        }
                         accum_count = 0;
                     }
                 }
@@ -1347,12 +1415,18 @@ fn main() {
                         if config.preload_all_layers {
                             for li in 0..config.model.num_hidden_layers {
                                 if let Err(e) = alice_train::fp32_cache::save_layer_to_cache(
-                                    &best_dir, li, &layers[li], &config.model,
+                                    &best_dir,
+                                    li,
+                                    &layers[li],
+                                    &config.model,
                                 ) {
                                     eprintln!("    best_eval 保存失敗 (layer {li}): {e}");
                                 }
                             }
-                            println!("    best_eval/ FP32キャッシュ保存完了 ({} layers)", config.model.num_hidden_layers);
+                            println!(
+                                "    best_eval/ FP32キャッシュ保存完了 ({} layers)",
+                                config.model.num_hidden_layers
+                            );
                         }
 
                         // resume_state も保存
@@ -1420,7 +1494,9 @@ fn main() {
                     alice_train::fp32_cache::drop_page_cache(cache_base, &config.model);
                     // ヒープ圧縮 — checkpointファイル書き込み後のフラグメンテーション防止
                     #[cfg(target_os = "linux")]
-                    unsafe { libc::malloc_trim(0); }
+                    unsafe {
+                        libc::malloc_trim(0);
+                    }
                 }
 
                 let ckpt_path = format!("{}/step_{global_step}.bin", config.checkpoint_dir);

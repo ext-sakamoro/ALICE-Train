@@ -209,8 +209,8 @@ fn read_zip_entry(data: &[u8], entry_name: &str) -> Option<Vec<u8>> {
 /// `.pth` ZIP を解析し、テンソルメタデータを抽出する。
 fn parse_pth(data: &[u8]) -> io::Result<HashMap<String, TensorMeta>> {
     let cursor = std::io::Cursor::new(data);
-    let mut archive = zip::ZipArchive::new(cursor)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut archive =
+        zip::ZipArchive::new(cursor).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     // data.pkl を読み込む
     let pkl_bytes = {
@@ -225,8 +225,12 @@ fn parse_pth(data: &[u8]) -> io::Result<HashMap<String, TensorMeta>> {
         buf
     };
 
-    parse_pickle(&pkl_bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("pickle パースエラー: {e}")))
+    parse_pickle(&pkl_bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("pickle パースエラー: {e}"),
+        )
+    })
 }
 
 /// pickle バイト列を解析してテンソルメタデータを抽出する。
@@ -317,12 +321,21 @@ enum Value {
     Tuple(Vec<Value>),
     Dict(Vec<(Value, Value)>),
     /// `GLOBAL` または `INST` で生成されたオブジェクト参照。
-    Global { module: String, name: String },
+    Global {
+        module: String,
+        name: String,
+    },
     /// `REDUCE` / `NEWOBJ` で生成された呼び出し結果。
     /// PyTorch のテンソル storage は (global, (storage_key, location, dtype_str, numel)) の形式。
-    Reduced { func: Box<Value>, args: Box<Value> },
+    Reduced {
+        func: Box<Value>,
+        args: Box<Value>,
+    },
     /// `BUILD` で付加された state を持つオブジェクト。
-    Built { obj: Box<Value>, state: Box<Value> },
+    Built {
+        obj: Box<Value>,
+        state: Box<Value>,
+    },
     /// マーク。
     Mark,
 }
@@ -355,7 +368,12 @@ impl<'a> PickleParser<'a> {
 
     fn read_bytes(&mut self, n: usize) -> Result<&[u8], String> {
         if self.pos + n > self.data.len() {
-            return Err(format!("データ不足: pos={} n={} len={}", self.pos, n, self.data.len()));
+            return Err(format!(
+                "データ不足: pos={} n={} len={}",
+                self.pos,
+                n,
+                self.data.len()
+            ));
         }
         let s = &self.data[self.pos..self.pos + n];
         self.pos += n;
@@ -401,11 +419,15 @@ impl<'a> PickleParser<'a> {
     }
 
     fn pop(&mut self) -> Result<Value, String> {
-        self.stack.pop().ok_or_else(|| "スタックが空です".to_string())
+        self.stack
+            .pop()
+            .ok_or_else(|| "スタックが空です".to_string())
     }
 
     fn peek(&self) -> Result<&Value, String> {
-        self.stack.last().ok_or_else(|| "スタックが空です".to_string())
+        self.stack
+            .last()
+            .ok_or_else(|| "スタックが空です".to_string())
     }
 
     /// MARK までのスタック要素を取り出す。
@@ -653,24 +675,30 @@ impl<'a> PickleParser<'a> {
                 }
                 opcode::BINGET => {
                     let idx = self.read_u8()? as u32;
-                    let v = self.memo.get(&idx).cloned().ok_or_else(|| {
-                        format!("memo[{idx}] が見つかりません")
-                    })?;
+                    let v = self
+                        .memo
+                        .get(&idx)
+                        .cloned()
+                        .ok_or_else(|| format!("memo[{idx}] が見つかりません"))?;
                     self.stack.push(v);
                 }
                 opcode::LONG_BINGET => {
                     let idx = self.read_u32_le()?;
-                    let v = self.memo.get(&idx).cloned().ok_or_else(|| {
-                        format!("memo[{idx}] が見つかりません")
-                    })?;
+                    let v = self
+                        .memo
+                        .get(&idx)
+                        .cloned()
+                        .ok_or_else(|| format!("memo[{idx}] が見つかりません"))?;
                     self.stack.push(v);
                 }
                 opcode::GET => {
                     let s = self.read_line()?;
                     let idx: u32 = s.trim().parse().unwrap_or(0);
-                    let v = self.memo.get(&idx).cloned().ok_or_else(|| {
-                        format!("memo[{idx}] が見つかりません")
-                    })?;
+                    let v = self
+                        .memo
+                        .get(&idx)
+                        .cloned()
+                        .ok_or_else(|| format!("memo[{idx}] が見つかりません"))?;
                     self.stack.push(v);
                 }
                 opcode::POP => {
@@ -805,9 +833,7 @@ fn try_extract_tensor(val: &Value) -> Option<TensorMeta> {
 
     // func が _rebuild_tensor_v2 か確認
     let is_rebuild = match func {
-        Value::Global { module, name } => {
-            module == "torch._utils" && name == "_rebuild_tensor_v2"
-        }
+        Value::Global { module, name } => module == "torch._utils" && name == "_rebuild_tensor_v2",
         _ => false,
     };
     if !is_rebuild {
@@ -1298,13 +1324,12 @@ mod tests {
     fn pickle_parse_dict_setitem() {
         // PROTO 2, EMPTY_DICT, MARK, str("a"), int(1), SETITEMS, STOP
         let pkl = [
-            0x80, 2,
-            b'}',         // EMPTY_DICT
-            b'(',         // MARK
+            0x80, 2, b'}', // EMPTY_DICT
+            b'(', // MARK
             0x8C, 1, b'a', // SHORT_BINUNICODE "a"
-            b'K', 1,      // BININT1(1)
-            b'u',         // SETITEMS
-            b'.',         // STOP
+            b'K', 1,    // BININT1(1)
+            b'u', // SETITEMS
+            b'.', // STOP
         ];
         let mut parser = PickleParser::new(&pkl);
         let result = parser.run().unwrap();
@@ -1321,13 +1346,12 @@ mod tests {
     fn pickle_parse_list_append() {
         // PROTO 2, EMPTY_LIST, MARK, int(1), int(2), APPENDS, STOP
         let pkl = [
-            0x80, 2,
-            b']',         // EMPTY_LIST
-            b'(',         // MARK
-            b'K', 1,      // BININT1(1)
-            b'K', 2,      // BININT1(2)
-            b'e',         // APPENDS
-            b'.',         // STOP
+            0x80, 2, b']', // EMPTY_LIST
+            b'(', // MARK
+            b'K', 1, // BININT1(1)
+            b'K', 2,    // BININT1(2)
+            b'e', // APPENDS
+            b'.', // STOP
         ];
         let mut parser = PickleParser::new(&pkl);
         let result = parser.run().unwrap();
@@ -1344,14 +1368,38 @@ mod tests {
 
     #[test]
     fn storage_class_to_dtype() {
-        assert_eq!(dtype_from_storage_class("FloatStorage"), Some(PthDtype::Float32));
-        assert_eq!(dtype_from_storage_class("BFloat16Storage"), Some(PthDtype::BFloat16));
-        assert_eq!(dtype_from_storage_class("HalfStorage"), Some(PthDtype::Float16));
-        assert_eq!(dtype_from_storage_class("DoubleStorage"), Some(PthDtype::Float64));
-        assert_eq!(dtype_from_storage_class("LongStorage"), Some(PthDtype::Int64));
-        assert_eq!(dtype_from_storage_class("IntStorage"), Some(PthDtype::Int32));
-        assert_eq!(dtype_from_storage_class("CharStorage"), Some(PthDtype::Int8));
-        assert_eq!(dtype_from_storage_class("ByteStorage"), Some(PthDtype::Uint8));
+        assert_eq!(
+            dtype_from_storage_class("FloatStorage"),
+            Some(PthDtype::Float32)
+        );
+        assert_eq!(
+            dtype_from_storage_class("BFloat16Storage"),
+            Some(PthDtype::BFloat16)
+        );
+        assert_eq!(
+            dtype_from_storage_class("HalfStorage"),
+            Some(PthDtype::Float16)
+        );
+        assert_eq!(
+            dtype_from_storage_class("DoubleStorage"),
+            Some(PthDtype::Float64)
+        );
+        assert_eq!(
+            dtype_from_storage_class("LongStorage"),
+            Some(PthDtype::Int64)
+        );
+        assert_eq!(
+            dtype_from_storage_class("IntStorage"),
+            Some(PthDtype::Int32)
+        );
+        assert_eq!(
+            dtype_from_storage_class("CharStorage"),
+            Some(PthDtype::Int8)
+        );
+        assert_eq!(
+            dtype_from_storage_class("ByteStorage"),
+            Some(PthDtype::Uint8)
+        );
     }
 
     // -----------------------------------------------------------------------

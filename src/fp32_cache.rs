@@ -190,7 +190,9 @@ pub fn build_cache(
         let path = layer_path(base_dir, i, lt);
         let layer_prefix = format!("{weight_prefix}.layers.{i}");
         // 既存キャッシュはスキップ（学習済み更新を保持）
-        if path.exists() { continue; }
+        if path.exists() {
+            continue;
+        }
 
         match lt {
             LayerType::LinearAttention => {

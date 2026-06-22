@@ -531,11 +531,23 @@ impl AliceModel {
         }
 
         // 3. Output norm
-        blas_rmsnorm(&mut hidden_states, &self.output_norm, hidden, config.rms_norm_eps);
+        blas_rmsnorm(
+            &mut hidden_states,
+            &self.output_norm,
+            hidden,
+            config.rms_norm_eps,
+        );
 
         // 4. lm_head
         let mut logits = vec![0.0f32; vocab_size];
-        blas_matmul_bt(&hidden_states, &self.lm_head, &mut logits, 1, vocab_size, hidden);
+        blas_matmul_bt(
+            &hidden_states,
+            &self.lm_head,
+            &mut logits,
+            1,
+            vocab_size,
+            hidden,
+        );
 
         cache.seq_len += 1;
         logits
@@ -567,7 +579,12 @@ impl AliceModel {
         let seq_len = 1;
 
         let residual = input.clone();
-        blas_rmsnorm(&mut input, &weights.input_layernorm, hidden, config.rms_norm_eps);
+        blas_rmsnorm(
+            &mut input,
+            &weights.input_layernorm,
+            hidden,
+            config.rms_norm_eps,
+        );
         let normed = input.clone();
 
         let mut qkv = vec![0.0f32; qkv_dim];
@@ -577,10 +594,24 @@ impl AliceModel {
         blas_matmul_bt(&normed, &weights.in_proj_z, &mut z, 1, val_dim, hidden);
 
         let mut b_raw = vec![0.0f32; n_v_heads];
-        blas_matmul_bt(&normed, &weights.in_proj_b, &mut b_raw, 1, n_v_heads, hidden);
+        blas_matmul_bt(
+            &normed,
+            &weights.in_proj_b,
+            &mut b_raw,
+            1,
+            n_v_heads,
+            hidden,
+        );
 
         let mut a_raw = vec![0.0f32; n_v_heads];
-        blas_matmul_bt(&normed, &weights.in_proj_a, &mut a_raw, 1, n_v_heads, hidden);
+        blas_matmul_bt(
+            &normed,
+            &weights.in_proj_a,
+            &mut a_raw,
+            1,
+            n_v_heads,
+            hidden,
+        );
 
         // causal conv1d (seq_len=1 では past_context なしの単純適用)
         let mut qkv_conv = vec![0.0f32; qkv_dim];
@@ -661,15 +692,31 @@ impl AliceModel {
 
         // Output projection
         let mut attn_out = vec![0.0f32; hidden];
-        blas_matmul_bt(&attn_normed, &weights.out_proj, &mut attn_out, 1, hidden, val_dim);
+        blas_matmul_bt(
+            &attn_normed,
+            &weights.out_proj,
+            &mut attn_out,
+            1,
+            hidden,
+            val_dim,
+        );
 
         // Residual add
-        let mut output: Vec<f32> = residual.iter().zip(attn_out.iter()).map(|(r, a)| r + a).collect();
+        let mut output: Vec<f32> = residual
+            .iter()
+            .zip(attn_out.iter())
+            .map(|(r, a)| r + a)
+            .collect();
 
         // FFN
         let residual_ffn = output.clone();
         let mut normed_ffn = output.clone();
-        blas_rmsnorm(&mut normed_ffn, &weights.post_attn_layernorm, hidden, config.rms_norm_eps);
+        blas_rmsnorm(
+            &mut normed_ffn,
+            &weights.post_attn_layernorm,
+            hidden,
+            config.rms_norm_eps,
+        );
 
         let inter = config.intermediate_size;
         let mut ffn_out = vec![0.0f32; hidden];
@@ -720,7 +767,12 @@ impl AliceModel {
         let inter = config.intermediate_size;
 
         let residual = input.clone();
-        blas_rmsnorm(&mut input, &weights.input_layernorm, hidden, config.rms_norm_eps);
+        blas_rmsnorm(
+            &mut input,
+            &weights.input_layernorm,
+            hidden,
+            config.rms_norm_eps,
+        );
         let normed = input.clone();
 
         // Q/K/V projection (1トークン)
@@ -728,17 +780,64 @@ impl AliceModel {
         let mut k_new = vec![0.0f32; num_kv_heads * head_dim];
         let mut v_new = vec![0.0f32; num_kv_heads * head_dim];
 
-        blas_matmul_bt(&normed, &weights.q_proj, &mut q, 1, num_heads * head_dim, hidden);
-        blas_matmul_bt(&normed, &weights.k_proj, &mut k_new, 1, num_kv_heads * head_dim, hidden);
-        blas_matmul_bt(&normed, &weights.v_proj, &mut v_new, 1, num_kv_heads * head_dim, hidden);
+        blas_matmul_bt(
+            &normed,
+            &weights.q_proj,
+            &mut q,
+            1,
+            num_heads * head_dim,
+            hidden,
+        );
+        blas_matmul_bt(
+            &normed,
+            &weights.k_proj,
+            &mut k_new,
+            1,
+            num_kv_heads * head_dim,
+            hidden,
+        );
+        blas_matmul_bt(
+            &normed,
+            &weights.v_proj,
+            &mut v_new,
+            1,
+            num_kv_heads * head_dim,
+            hidden,
+        );
 
         // QK-norm
-        qk_norm(&mut q, &weights.q_norm, num_heads, head_dim, config.rms_norm_eps);
-        qk_norm(&mut k_new, &weights.k_norm, num_kv_heads, head_dim, config.rms_norm_eps);
+        qk_norm(
+            &mut q,
+            &weights.q_norm,
+            num_heads,
+            head_dim,
+            config.rms_norm_eps,
+        );
+        qk_norm(
+            &mut k_new,
+            &weights.k_norm,
+            num_kv_heads,
+            head_dim,
+            config.rms_norm_eps,
+        );
 
         // RoPE (position offset 付き)
-        apply_rope_with_offset(&mut q, num_heads, head_dim, rotary_dim, position, config.rope_theta);
-        apply_rope_with_offset(&mut k_new, num_kv_heads, head_dim, rotary_dim, position, config.rope_theta);
+        apply_rope_with_offset(
+            &mut q,
+            num_heads,
+            head_dim,
+            rotary_dim,
+            position,
+            config.rope_theta,
+        );
+        apply_rope_with_offset(
+            &mut k_new,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            position,
+            config.rope_theta,
+        );
 
         // K/V cache に append
         k_cache.extend_from_slice(&k_new);
@@ -759,8 +858,8 @@ impl AliceModel {
             // score[t] = q · k[t] * scale
             let mut scores = vec![0.0f32; cache_len];
             for t in 0..cache_len {
-                let k_t = &k_cache[(t * num_kv_heads + kv_h) * head_dim..
-                                   (t * num_kv_heads + kv_h + 1) * head_dim];
+                let k_t = &k_cache[(t * num_kv_heads + kv_h) * head_dim
+                    ..(t * num_kv_heads + kv_h + 1) * head_dim];
                 let dot: f32 = q_h.iter().zip(k_t.iter()).map(|(a, b)| a * b).sum();
                 scores[t] = dot * scale;
             }
@@ -779,8 +878,8 @@ impl AliceModel {
 
             // weighted sum of V
             for t in 0..cache_len {
-                let v_t = &v_cache[(t * num_kv_heads + kv_h) * head_dim..
-                                   (t * num_kv_heads + kv_h + 1) * head_dim];
+                let v_t = &v_cache[(t * num_kv_heads + kv_h) * head_dim
+                    ..(t * num_kv_heads + kv_h + 1) * head_dim];
                 let w = scores[t];
                 for d in 0..head_dim {
                     out_h[d] += w * v_t[d];
@@ -790,15 +889,31 @@ impl AliceModel {
 
         // O projection
         let mut attn_out = vec![0.0f32; hidden];
-        blas_matmul_bt(&attn_out_raw, &weights.o_proj, &mut attn_out, 1, hidden, num_heads * head_dim);
+        blas_matmul_bt(
+            &attn_out_raw,
+            &weights.o_proj,
+            &mut attn_out,
+            1,
+            hidden,
+            num_heads * head_dim,
+        );
 
         // Residual
-        let mut output: Vec<f32> = residual.iter().zip(attn_out.iter()).map(|(r, a)| r + a).collect();
+        let mut output: Vec<f32> = residual
+            .iter()
+            .zip(attn_out.iter())
+            .map(|(r, a)| r + a)
+            .collect();
 
         // FFN
         let residual_ffn = output.clone();
         let mut normed_ffn = output.clone();
-        blas_rmsnorm(&mut normed_ffn, &weights.post_attn_layernorm, hidden, config.rms_norm_eps);
+        blas_rmsnorm(
+            &mut normed_ffn,
+            &weights.post_attn_layernorm,
+            hidden,
+            config.rms_norm_eps,
+        );
 
         let mut ffn_out = vec![0.0f32; hidden];
         let mut gate_buf = vec![0.0f32; inter];
@@ -1007,7 +1122,12 @@ fn build_packed_ref(cursor: &mut usize, count: usize) -> PackedRef {
     let packed_len = count.div_ceil(4);
     let packed_off = *cursor;
     *cursor += packed_len;
-    PackedRef { scale_off, packed_off, packed_len, count }
+    PackedRef {
+        scale_off,
+        packed_off,
+        packed_len,
+        count,
+    }
 }
 
 /// 現在のオフセットから FP32 スライスのインデックスを構築し、オフセットを進める。
@@ -1114,11 +1234,15 @@ impl StreamingAliceModel {
         }
 
         let emb_mb = (embedding.len() * 4) as f64 / 1e6;
-        let lm_mb = lm_head_storage.as_ref().map_or(0.0, |v| (v.len() * 4) as f64 / 1e6);
+        let lm_mb = lm_head_storage
+            .as_ref()
+            .map_or(0.0, |v| (v.len() * 4) as f64 / 1e6);
         let layer_data_bytes = mmap.len() - reader.position() as usize;
         eprintln!(
             "  [mmap] RAM: embedding={:.0}MB, lm_head={:.0}MB, mmap={}MB (packed ternary, OS管理)",
-            emb_mb, lm_mb, mmap.len() / 1_000_000
+            emb_mb,
+            lm_mb,
+            mmap.len() / 1_000_000
         );
         eprintln!(
             "  [mmap] layer data: {:.0}MB packed (FP32展開なし), index: {} layers",
@@ -1151,7 +1275,12 @@ impl StreamingAliceModel {
     /// mmap から packed ternary data のスライスを取得。
     fn packed(&self, p: &PackedRef) -> (&[u8], f32) {
         let scale_bytes = &self.mmap[p.scale_off..p.scale_off + 4];
-        let scale = f32::from_le_bytes([scale_bytes[0], scale_bytes[1], scale_bytes[2], scale_bytes[3]]);
+        let scale = f32::from_le_bytes([
+            scale_bytes[0],
+            scale_bytes[1],
+            scale_bytes[2],
+            scale_bytes[3],
+        ]);
         let packed = &self.mmap[p.packed_off..p.packed_off + p.packed_len];
         (packed, scale)
     }
@@ -1234,19 +1363,27 @@ impl StreamingAliceModel {
             match layer_ref {
                 MmapLayer::DeltaNet(idx) => {
                     self.jit_deltanet_incremental(
-                        &mut buf_a, &mut buf_b, idx, config,
+                        &mut buf_a,
+                        &mut buf_b,
+                        idx,
+                        config,
                         &mut cache.deltanet_states[layer_idx],
-                        &mut gate_buf, &mut up_buf,
+                        &mut gate_buf,
+                        &mut up_buf,
                     );
                     // buf_a に結果が入っている
                 }
                 MmapLayer::FullAttn(idx) => {
                     self.jit_fullattn_incremental(
-                        &mut buf_a, &mut buf_b, idx, config,
+                        &mut buf_a,
+                        &mut buf_b,
+                        idx,
+                        config,
                         &mut cache.full_attn_k_cache[layer_idx],
                         &mut cache.full_attn_v_cache[layer_idx],
                         pos,
-                        &mut gate_buf, &mut up_buf,
+                        &mut gate_buf,
+                        &mut up_buf,
                     );
                 }
             }
@@ -1327,13 +1464,25 @@ impl StreamingAliceModel {
 
         let mut q_expanded = vec![0.0f32; n_v_heads * dk];
         let mut k_expanded = vec![0.0f32; n_v_heads * dk];
-        l2norm_and_gqa_expand(q_raw, k_raw, &mut q_expanded, &mut k_expanded, 1, n_k_heads, n_v_heads, dk, 1e-6);
+        l2norm_and_gqa_expand(
+            q_raw,
+            k_raw,
+            &mut q_expanded,
+            &mut k_expanded,
+            1,
+            n_k_heads,
+            n_v_heads,
+            dk,
+            1e-6,
+        );
 
         let a_log = self.f32_slice(&idx.a_log);
         let dt_bias = self.f32_slice(&idx.dt_bias);
         let mut beta = vec![0.0f32; n_v_heads];
         let mut g = vec![0.0f32; n_v_heads];
-        compute_gates_fused(&b_raw, &a_raw, &a_log, &dt_bias, &mut beta, &mut g, 1, n_v_heads);
+        compute_gates_fused(
+            &b_raw, &a_raw, &a_log, &dt_bias, &mut beta, &mut g, 1, n_v_heads,
+        );
 
         let mut attn_out_raw = vec![0.0f32; n_v_heads * dv];
         for h in 0..n_v_heads {
@@ -1341,15 +1490,26 @@ impl StreamingAliceModel {
                 &q_expanded[h * dk..(h + 1) * dk],
                 &k_expanded[h * dk..(h + 1) * dk],
                 &v_all[h * dv..(h + 1) * dv],
-                &[beta[h]], &[g[h]],
+                &[beta[h]],
+                &[g[h]],
                 &mut attn_out_raw[h * dv..(h + 1) * dv],
-                &mut states[h], dk, dv, 1,
+                &mut states[h],
+                dk,
+                dv,
+                1,
             );
         }
 
         let norm_w = self.f32_slice(&idx.norm_weight);
         let mut attn_normed = vec![0.0f32; val_dim];
-        gated_rmsnorm(&attn_out_raw, &z, &norm_w, &mut attn_normed, dv, config.rms_norm_eps);
+        gated_rmsnorm(
+            &attn_out_raw,
+            &z,
+            &norm_w,
+            &mut attn_normed,
+            dv,
+            config.rms_norm_eps,
+        );
 
         // out_proj — JIT ternary
         buf_b.fill(0.0);
@@ -1372,7 +1532,9 @@ impl StreamingAliceModel {
         let (gp, gs) = self.packed(&idx.gate_proj);
         let (up, us) = self.packed(&idx.up_proj);
         let (dp, ds) = self.packed(&idx.down_proj);
-        ternary_swiglu_ffn(buf_a, gp, gs, up, us, dp, ds, buf_b, gate_buf, up_buf, 1, hidden, inter);
+        ternary_swiglu_ffn(
+            buf_a, gp, gs, up, us, dp, ds, buf_b, gate_buf, up_buf, 1, hidden, inter,
+        );
 
         // residual add → buf_a
         for i in 0..hidden {
@@ -1424,10 +1586,30 @@ impl StreamingAliceModel {
         let q_norm_w = self.f32_slice(&idx.q_norm);
         let k_norm_w = self.f32_slice(&idx.k_norm);
         qk_norm(&mut q, &q_norm_w, num_heads, head_dim, config.rms_norm_eps);
-        qk_norm(&mut k_new, &k_norm_w, num_kv_heads, head_dim, config.rms_norm_eps);
+        qk_norm(
+            &mut k_new,
+            &k_norm_w,
+            num_kv_heads,
+            head_dim,
+            config.rms_norm_eps,
+        );
 
-        apply_rope_with_offset(&mut q, num_heads, head_dim, rotary_dim, position, config.rope_theta);
-        apply_rope_with_offset(&mut k_new, num_kv_heads, head_dim, rotary_dim, position, config.rope_theta);
+        apply_rope_with_offset(
+            &mut q,
+            num_heads,
+            head_dim,
+            rotary_dim,
+            position,
+            config.rope_theta,
+        );
+        apply_rope_with_offset(
+            &mut k_new,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            position,
+            config.rope_theta,
+        );
 
         // KV cache grow (遅延確保)
         k_cache.extend_from_slice(&k_new);
@@ -1445,23 +1627,30 @@ impl StreamingAliceModel {
 
             let mut scores = vec![0.0f32; cache_len];
             for t in 0..cache_len {
-                let k_t = &k_cache[(t * num_kv_heads + kv_h) * head_dim..
-                                   (t * num_kv_heads + kv_h + 1) * head_dim];
+                let k_t = &k_cache[(t * num_kv_heads + kv_h) * head_dim
+                    ..(t * num_kv_heads + kv_h + 1) * head_dim];
                 let dot: f32 = q_h.iter().zip(k_t.iter()).map(|(a, b)| a * b).sum();
                 scores[t] = dot * scale;
             }
 
             let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0.0f32;
-            for s in &mut scores { *s = (*s - max_s).exp(); sum += *s; }
+            for s in &mut scores {
+                *s = (*s - max_s).exp();
+                sum += *s;
+            }
             let inv_sum = sum.recip();
-            for s in &mut scores { *s *= inv_sum; }
+            for s in &mut scores {
+                *s *= inv_sum;
+            }
 
             for t in 0..cache_len {
-                let v_t = &v_cache[(t * num_kv_heads + kv_h) * head_dim..
-                                   (t * num_kv_heads + kv_h + 1) * head_dim];
+                let v_t = &v_cache[(t * num_kv_heads + kv_h) * head_dim
+                    ..(t * num_kv_heads + kv_h + 1) * head_dim];
                 let w = scores[t];
-                for d in 0..head_dim { out_h[d] += w * v_t[d]; }
+                for d in 0..head_dim {
+                    out_h[d] += w * v_t[d];
+                }
             }
         }
 
@@ -1471,7 +1660,9 @@ impl StreamingAliceModel {
         let (p, s) = self.packed(&idx.o_proj);
         ternary_matmul_bt(&attn_out_raw, p, s, buf_b, 1, hidden, num_heads * head_dim);
 
-        for i in 0..hidden { buf_a[i] = residual[i] + buf_b[i]; }
+        for i in 0..hidden {
+            buf_a[i] = residual[i] + buf_b[i];
+        }
 
         // FFN — JIT ternary SwiGLU
         let residual_ffn: Vec<f32> = buf_a.clone();
@@ -1483,9 +1674,13 @@ impl StreamingAliceModel {
         let (gp, gs) = self.packed(&idx.gate_proj);
         let (up, us) = self.packed(&idx.up_proj);
         let (dp, ds) = self.packed(&idx.down_proj);
-        ternary_swiglu_ffn(buf_a, gp, gs, up, us, dp, ds, buf_b, gate_buf, up_buf, 1, hidden, inter);
+        ternary_swiglu_ffn(
+            buf_a, gp, gs, up, us, dp, ds, buf_b, gate_buf, up_buf, 1, hidden, inter,
+        );
 
-        for i in 0..hidden { buf_a[i] = residual_ffn[i] + buf_b[i]; }
+        for i in 0..hidden {
+            buf_a[i] = residual_ffn[i] + buf_b[i];
+        }
     }
 
     /// キャッシュ付きストリーミング生成。
@@ -1578,10 +1773,14 @@ impl StreamingAliceModel {
                 sample_top_k(&mut logits, gen_config.temperature, gen_config.top_k)
             };
 
-            if next_token == eos_token_id { break; }
+            if next_token == eos_token_id {
+                break;
+            }
 
             let text = tokenizer.decode(&[next_token]);
-            if !callback(&text) { break; }
+            if !callback(&text) {
+                break;
+            }
 
             all_ids.push(next_token);
             last_token = next_token;
@@ -1686,20 +1885,28 @@ mod tests {
         // verify norm is preserved (rotation preserves L2 norm)
         let norm_before: f32 = original.iter().map(|v| v * v).sum::<f32>().sqrt();
         let norm_after: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!((norm_before - norm_after).abs() < 1e-4,
-            "norm変化: before={norm_before} after={norm_after}");
+        assert!(
+            (norm_before - norm_after).abs() < 1e-4,
+            "norm変化: before={norm_before} after={norm_after}"
+        );
     }
 
     /// apply_rope_with_offset: 複数ヘッドでも各ヘッドが独立に回転される。
     #[test]
     fn test_rope_offset_multi_head() {
         // 2ヘッド, head_dim=4, rotary_dim=4
-        let mut x = vec![1.0f32, 0.0, 0.0, 1.0, // head 0
-                         1.0, 0.0, 0.0, 1.0]; // head 1
+        let mut x = vec![
+            1.0f32, 0.0, 0.0, 1.0, // head 0
+            1.0, 0.0, 0.0, 1.0,
+        ]; // head 1
         apply_rope_with_offset(&mut x, 2, 4, 4, 0, 10000.0);
         // position=0 → 変化なし (両ヘッド)
         for i in 0..8 {
-            let expected = if i % 4 == 0 || i % 4 == 3 { 1.0f32 } else { 0.0f32 };
+            let expected = if i % 4 == 0 || i % 4 == 3 {
+                1.0f32
+            } else {
+                0.0f32
+            };
             assert!((x[i] - expected).abs() < 1e-5, "x[{i}]={}", x[i]);
         }
     }
@@ -1718,7 +1925,11 @@ mod tests {
             x
         };
         // position 0 と 5 では結果が異なる
-        let diff: f32 = x_pos0.iter().zip(x_pos5.iter()).map(|(a, b)| (a - b).abs()).sum();
+        let diff: f32 = x_pos0
+            .iter()
+            .zip(x_pos5.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
         assert!(diff > 1e-4, "position 0 と 5 の出力が同じ: diff={diff}");
     }
 }

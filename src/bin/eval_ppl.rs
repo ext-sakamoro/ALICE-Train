@@ -77,12 +77,15 @@ fn main() {
     // モデル読み込み (streaming: mmap + JIT ternary)
     println!("\n  モデル読み込み中 (streaming mmap)...");
     let load_start = Instant::now();
-    let model = alice_train::inference::StreamingAliceModel::from_file(&args.model)
-        .unwrap_or_else(|e| {
+    let model =
+        alice_train::inference::StreamingAliceModel::from_file(&args.model).unwrap_or_else(|e| {
             eprintln!("モデル読み込み失敗: {e}");
             std::process::exit(1);
         });
-    println!("  モデル読み込み完了 ({:.1}s)", load_start.elapsed().as_secs_f64());
+    println!(
+        "  モデル読み込み完了 ({:.1}s)",
+        load_start.elapsed().as_secs_f64()
+    );
 
     let vocab_size = model.config().vocab_size;
 
@@ -170,6 +173,9 @@ fn main() {
     println!("  評価トークン数: {total_tokens}");
     println!("  平均 Loss: {avg_loss:.4}");
     println!("  Perplexity (PPL): {ppl:.2}");
-    println!("  計測時間: {elapsed:.1}s ({:.2} tok/s)", total_tokens as f64 / elapsed);
+    println!(
+        "  計測時間: {elapsed:.1}s ({:.2} tok/s)",
+        total_tokens as f64 / elapsed
+    );
     println!("  学習時最低 Loss: 5.59 → 期待 PPL: {:.2}", (5.59f64).exp());
 }

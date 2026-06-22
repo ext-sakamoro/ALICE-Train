@@ -476,11 +476,27 @@ pub fn ternary_swiglu_ffn(
 ) {
     // gate = input × gate_proj^T
     gate_buf.fill(0.0);
-    ternary_matmul_bt(input, gate_packed, gate_scale, gate_buf, seq_len, intermediate_dim, hidden_dim);
+    ternary_matmul_bt(
+        input,
+        gate_packed,
+        gate_scale,
+        gate_buf,
+        seq_len,
+        intermediate_dim,
+        hidden_dim,
+    );
 
     // up = input × up_proj^T
     up_buf.fill(0.0);
-    ternary_matmul_bt(input, up_packed, up_scale, up_buf, seq_len, intermediate_dim, hidden_dim);
+    ternary_matmul_bt(
+        input,
+        up_packed,
+        up_scale,
+        up_buf,
+        seq_len,
+        intermediate_dim,
+        hidden_dim,
+    );
 
     // SiLU(gate) * up
     for i in 0..seq_len * intermediate_dim {
@@ -490,7 +506,15 @@ pub fn ternary_swiglu_ffn(
 
     // output = gate_silu × down_proj^T
     output.fill(0.0);
-    ternary_matmul_bt(gate_buf, down_packed, down_scale, output, seq_len, hidden_dim, intermediate_dim);
+    ternary_matmul_bt(
+        gate_buf,
+        down_packed,
+        down_scale,
+        output,
+        seq_len,
+        hidden_dim,
+        intermediate_dim,
+    );
 }
 
 // ============================================================================

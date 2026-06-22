@@ -47,7 +47,8 @@ impl VisionConfig {
     #[must_use]
     pub fn estimated_params(&self) -> usize {
         let patch_embed = 3 * self.patch_size * self.patch_size * self.hidden_size;
-        let transformer = self.num_layers * (4 * self.hidden_size * self.hidden_size + 8 * self.hidden_size);
+        let transformer =
+            self.num_layers * (4 * self.hidden_size * self.hidden_size + 8 * self.hidden_size);
         let projection = self.hidden_size * self.output_dim;
         patch_embed + transformer + projection
     }

@@ -243,11 +243,9 @@ fn fq_vec_inplace(src: &[f32], dst: &mut [f32]) {
     let sum_abs: f64 = src.par_iter().map(|&v| v.abs() as f64).sum();
     let gamma = (sum_abs / src.len() as f64) as f32;
     let inv_gamma = if gamma > 1e-10 { 1.0 / gamma } else { 0.0 };
-    dst.par_iter_mut()
-        .zip(src.par_iter())
-        .for_each(|(d, &s)| {
-            *d = (s * inv_gamma).round().clamp(-1.0, 1.0) * gamma;
-        });
+    dst.par_iter_mut().zip(src.par_iter()).for_each(|(d, &s)| {
+        *d = (s * inv_gamma).round().clamp(-1.0, 1.0) * gamma;
+    });
 }
 
 /// FP32 テンソルを in-place で fake quantize（非量子化重みはコピー）。

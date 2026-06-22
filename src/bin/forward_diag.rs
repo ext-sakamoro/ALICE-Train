@@ -44,16 +44,30 @@ fn tensor_stats(data: &[f32]) -> (f32, f32, f32, f32, usize, usize) {
     let mut nan_count = 0usize;
     let mut inf_count = 0usize;
     for &v in data {
-        if v.is_nan() { nan_count += 1; continue; }
-        if v.is_infinite() { inf_count += 1; continue; }
+        if v.is_nan() {
+            nan_count += 1;
+            continue;
+        }
+        if v.is_infinite() {
+            inf_count += 1;
+            continue;
+        }
         sum += v as f64;
         sum_sq += (v as f64) * (v as f64);
-        if v < min { min = v; }
-        if v > max { max = v; }
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
     }
     let n = (data.len() - nan_count - inf_count) as f64;
     let mean = if n > 0.0 { (sum / n) as f32 } else { 0.0 };
-    let std = if n > 1.0 { ((sum_sq / n - (sum / n).powi(2)).max(0.0).sqrt()) as f32 } else { 0.0 };
+    let std = if n > 1.0 {
+        ((sum_sq / n - (sum / n).powi(2)).max(0.0).sqrt()) as f32
+    } else {
+        0.0
+    };
     (mean, std, min, max, nan_count, inf_count)
 }
 
@@ -103,13 +117,25 @@ fn main() {
 
     println!("  vocab_size: {vocab_size}");
     println!("  hidden_size: {}", config.hidden_size);
-    println!("  layers: {} ({} DeltaNet + {} FullAttn)",
+    println!(
+        "  layers: {} ({} DeltaNet + {} FullAttn)",
         config.num_hidden_layers,
-        config.layer_types.iter().filter(|t| **t == LayerType::LinearAttention).count(),
-        config.layer_types.iter().filter(|t| **t == LayerType::FullAttention).count(),
+        config
+            .layer_types
+            .iter()
+            .filter(|t| **t == LayerType::LinearAttention)
+            .count(),
+        config
+            .layer_types
+            .iter()
+            .filter(|t| **t == LayerType::FullAttention)
+            .count(),
     );
     println!("  quantization: {}", model.meta.quantization);
-    println!("  source: step {}, loss {:.4}", model.meta.source_step, model.meta.source_loss);
+    println!(
+        "  source: step {}, loss {:.4}",
+        model.meta.source_step, model.meta.source_loss
+    );
     println!("  random baseline loss: {random_loss:.4}");
     println!();
 
@@ -132,7 +158,8 @@ fn main() {
     println!("  Prefill ({} tokens):", prompt_ids.len());
     for (i, &tok) in prompt_ids.iter().enumerate() {
         let t_tok = Instant::now();
-        let logits = model.forward_incremental_streaming(tok, &mut cache)
+        let logits = model
+            .forward_incremental_streaming(tok, &mut cache)
             .unwrap_or_else(|e| {
                 eprintln!("  [ERROR] token {i} forward失敗: {e}");
                 std::process::exit(1);
@@ -146,10 +173,15 @@ fn main() {
 
         println!("    tok[{i}]={tok:>6} | logits: mean={mean:.4} std={std:.4} min={min:.2} max={max:.2} NaN={nans} Inf={infs} | loss={loss:.4} | {elapsed_ms}ms");
         if i == prompt_ids.len() - 1 || nans > 0 || infs > 0 {
-            println!("      top5: {:?}", top5.iter().map(|(id, s)| {
-                let t = tokenizer.decode(&[*id as u32]);
-                format!("{id}(\"{t}\")={s:.2}")
-            }).collect::<Vec<_>>());
+            println!(
+                "      top5: {:?}",
+                top5.iter()
+                    .map(|(id, s)| {
+                        let t = tokenizer.decode(&[*id as u32]);
+                        format!("{id}(\"{t}\")={s:.2}")
+                    })
+                    .collect::<Vec<_>>()
+            );
         }
 
         if nans > 0 || infs > 0 {
@@ -166,7 +198,8 @@ fn main() {
 
     for i in 0..cli.max_tokens {
         let t_tok = Instant::now();
-        let logits = model.forward_incremental_streaming(last_token, &mut cache)
+        let logits = model
+            .forward_incremental_streaming(last_token, &mut cache)
             .unwrap_or_else(|e| {
                 eprintln!("  [ERROR] gen token {i} forward失敗: {e}");
                 std::process::exit(1);
@@ -174,7 +207,9 @@ fn main() {
         let elapsed_ms = t_tok.elapsed().as_millis();
 
         // Greedy
-        let next_id = logits.iter().enumerate()
+        let next_id = logits
+            .iter()
+            .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(id, _)| id as u32)
             .unwrap_or(0);

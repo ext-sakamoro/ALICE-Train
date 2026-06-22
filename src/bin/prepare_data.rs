@@ -217,7 +217,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-// --- tokenize_byte_level ---
+    // --- tokenize_byte_level ---
 
     #[test]
     fn test_tokenize_empty_string() {
