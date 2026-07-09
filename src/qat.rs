@@ -63,6 +63,14 @@ pub struct QatConfig {
     pub temperature_decay: f32,
     /// gradient clipping の閾値（0.0 = 無効）。
     pub grad_clip: f32,
+    /// Group-wise 量子化のグループサイズ（`None` = tensor-wise = 単一 scale）。
+    ///
+    /// `Some(N)` を指定すると重み配列を N 要素ずつのグループに分割し、
+    /// グループ毎に独立した scale factor を学習する。Q4_0 / Q4_K など
+    /// llama.cpp 系の 4-bit フォーマットは `group_size = 32` (Q4_0) や
+    /// `group_size = 32` (Q4_K sub-block) を採用しており、group-wise QAT
+    /// で学習した重みはこれらのフォーマットに直接エクスポート可能。
+    pub group_size: Option<usize>,
 }
 
 impl Default for QatConfig {
@@ -73,6 +81,7 @@ impl Default for QatConfig {
             temperature: 1.0,
             temperature_decay: 0.99,
             grad_clip: 0.0,
+            group_size: None,
         }
     }
 }
@@ -93,6 +102,24 @@ impl QatConfig {
             temperature: 1.0,
             temperature_decay: 0.995,
             grad_clip: 1.0,
+            group_size: None,
+        }
+    }
+
+    /// Group-wise INT4 QAT の設定を返す（Q4_0 / Q4_K 互換出力向け）。
+    ///
+    /// `group_size` は 1 グループの要素数。Q4_0 なら 32、Q4_K なら 32
+    /// (super-block 内 sub-block 単位) が標準。`weights.len()` は
+    /// `group_size` の倍数である必要がある。
+    #[must_use]
+    pub fn int4_grouped(group_size: usize) -> Self {
+        Self {
+            bits: QuantBits::Int4,
+            learn_scale: true,
+            temperature: 1.0,
+            temperature_decay: 0.995,
+            grad_clip: 1.0,
+            group_size: Some(group_size),
         }
     }
 
@@ -105,6 +132,7 @@ impl QatConfig {
             temperature: 1.0,
             temperature_decay: 1.0,
             grad_clip: 0.0,
+            group_size: None,
         }
     }
 }
@@ -113,10 +141,18 @@ impl QatConfig {
 ///
 /// forward 時に値を離散化し、backward 時は STE で勾配をそのまま通す。
 /// これにより学習中にモデルが量子化誤差に適応する。
+///
+/// `config.group_size` が `Some(N)` の場合、重み配列を N 要素ずつの
+/// グループに分割し、グループ毎に独立した scale を保持する
+/// （`group_scales`）。`None` の場合は単一の `scale` を使う。
 pub struct FakeQuantize {
     config: QatConfig,
-    /// 学習可能な scale factor（mean(|W|) で初期化）。
+    /// Tensor-wise 学習可能な scale factor（mean(|W|) で初期化）。
+    /// `config.group_size == None` の時のみ意味を持つ。
     scale: f32,
+    /// Group-wise scale factors。長さ = `weights.len() / group_size`。
+    /// `config.group_size == None` の時は空。
+    group_scales: Vec<f32>,
     /// 現在の temperature。
     current_temp: f32,
 }
@@ -129,6 +165,7 @@ impl FakeQuantize {
             current_temp: config.temperature,
             config,
             scale: 1.0,
+            group_scales: Vec::new(),
         }
     }
 
@@ -143,6 +180,12 @@ impl FakeQuantize {
         self.scale
     }
 
+    /// Group-wise scale factors を返す（`group_size` 設定時のみ有効）。
+    #[must_use]
+    pub fn group_scales(&self) -> &[f32] {
+        &self.group_scales
+    }
+
     /// 現在の temperature を返す。
     #[must_use]
     pub fn temperature(&self) -> f32 {
@@ -151,9 +194,38 @@ impl FakeQuantize {
 
     /// Weights から scale factor を calibrate する。
     ///
-    /// BitNet b1.58 式: γ = mean(|W|)
+    /// - `group_size == None`: BitNet b1.58 式 γ = mean(|W|)（tensor-wise）。
+    /// - `group_size == Some(N)`: グループ毎に γ = max(|W_group|) / half_levels
+    ///   (Q4_0 互換のシンメトリック per-group scaling)。
+    ///
+    /// # Panics
+    /// `group_size` 指定時、`weights.len()` が group_size の倍数でないと panic。
     pub fn calibrate_scale(&mut self, weights: &[f32]) {
         if weights.is_empty() {
+            return;
+        }
+        if let Some(g) = self.config.group_size {
+            assert!(g > 0, "group_size must be > 0");
+            assert!(
+                weights.len().is_multiple_of(g),
+                "weights.len() ({}) must be a multiple of group_size ({})",
+                weights.len(),
+                g
+            );
+            let n_groups = weights.len() / g;
+            let half_levels = self.symmetric_half_levels();
+            self.group_scales = Vec::with_capacity(n_groups);
+            for group in weights.chunks_exact(g) {
+                let mut max_abs = 0.0f32;
+                for &w in group {
+                    let a = w.abs();
+                    if a > max_abs {
+                        max_abs = a;
+                    }
+                }
+                let scale = (max_abs / half_levels).max(1e-10);
+                self.group_scales.push(scale);
+            }
             return;
         }
         let mut sum = 0.0f64;
@@ -166,12 +238,59 @@ impl FakeQuantize {
         }
     }
 
+    /// Symmetric 量子化グリッドの半分（[-half_levels, +half_levels]）。
+    #[inline]
+    fn symmetric_half_levels(&self) -> f32 {
+        match self.config.bits {
+            QuantBits::Ternary | QuantBits::Binary2 => 1.0,
+            QuantBits::Int4 => 7.0,
+            QuantBits::Int8 => 127.0,
+        }
+    }
+
     /// Forward pass: fake quantize weights in-place。
     ///
     /// `weights` を量子化→逆量子化し、同じバッファに書き戻す。
     /// 元の FP32 値は呼び出し側が別途保持すること。
+    ///
+    /// - `group_size == None`: tensor-wise 単一 scale で全体を量子化。
+    /// - `group_size == Some(N)`: 各グループを独立した scale で量子化
+    ///   (Q4_0 / Q4_K 互換の per-group symmetric quantization)。
     pub fn fake_quantize_forward(&self, weights: &[f32], quantized: &mut [f32]) {
         assert_eq!(weights.len(), quantized.len());
+
+        // Group-wise 経路 (Q4_0/Q4_K 互換 export 用): 各グループ毎に scale を切替。
+        if let Some(g) = self.config.group_size {
+            assert!(g > 0, "group_size must be > 0");
+            assert!(
+                weights.len().is_multiple_of(g),
+                "weights.len() must be a multiple of group_size"
+            );
+            let n_groups = weights.len() / g;
+            assert_eq!(
+                self.group_scales.len(),
+                n_groups,
+                "call calibrate_scale() before fake_quantize_forward() in group-wise mode"
+            );
+            let half_levels = self.symmetric_half_levels();
+            let inv_temp = 1.0 / self.current_temp.max(1e-10);
+            for (grp_idx, (w_group, q_group)) in weights
+                .chunks_exact(g)
+                .zip(quantized.chunks_exact_mut(g))
+                .enumerate()
+            {
+                let scale = self.group_scales[grp_idx].max(1e-10);
+                let inv_scale = 1.0 / scale;
+                for (q, &w) in q_group.iter_mut().zip(w_group.iter()) {
+                    let scaled = w * inv_scale * inv_temp;
+                    let rounded = scaled.round().clamp(-half_levels, half_levels);
+                    *q = rounded * scale;
+                }
+            }
+            return;
+        }
+
+        // Tensor-wise 経路 (既存パス)。
         let inv_scale = 1.0 / self.scale.max(1e-10);
         let inv_temp = 1.0 / self.current_temp.max(1e-10);
 
@@ -809,5 +928,117 @@ mod tests {
         let r2 = r.clone();
         assert_eq!(r2.epoch, 5);
         assert!((r2.avg_loss - 0.01).abs() < 1e-6);
+    }
+
+    // --- Phase III: Group-wise Int4 QAT (Q4_0 / Q4_K 互換) ---
+
+    #[test]
+    fn test_qat_config_int4_grouped() {
+        let c = QatConfig::int4_grouped(32);
+        assert_eq!(c.bits, QuantBits::Int4);
+        assert_eq!(c.group_size, Some(32));
+        assert!(c.learn_scale);
+    }
+
+    #[test]
+    fn test_qat_config_default_group_size_none() {
+        // 既存の tensor-wise config は group_size が None。
+        assert_eq!(QatConfig::default().group_size, None);
+        assert_eq!(QatConfig::int4().group_size, None);
+        assert_eq!(QatConfig::int8().group_size, None);
+    }
+
+    #[test]
+    fn test_int4_grouped_calibrate_per_group_scale() {
+        // 2 groups × 4 elements 各グループの max(|W|) が異なる。
+        let weights = [
+            0.1, 0.2, 0.3, 0.4, // group 0: max = 0.4, scale = 0.4 / 7
+            1.0, 2.0, 3.0, 4.0, // group 1: max = 4.0, scale = 4.0 / 7
+        ];
+        let mut fq = FakeQuantize::new(QatConfig::int4_grouped(4));
+        fq.calibrate_scale(&weights);
+        let scales = fq.group_scales();
+        assert_eq!(scales.len(), 2);
+        assert!(
+            (scales[0] - 0.4 / 7.0).abs() < 1e-6,
+            "group 0 scale: expected {}, got {}",
+            0.4 / 7.0,
+            scales[0]
+        );
+        assert!(
+            (scales[1] - 4.0 / 7.0).abs() < 1e-6,
+            "group 1 scale: expected {}, got {}",
+            4.0 / 7.0,
+            scales[1]
+        );
+    }
+
+    #[test]
+    fn test_int4_grouped_forward_roundtrip_extremes() {
+        // 各グループの extreme 値 (±max) は round-trip で ~scale 精度で復元。
+        let weights = [
+            -0.4, -0.2, 0.2, 0.4, //
+            -4.0, -2.0, 2.0, 4.0,
+        ];
+        let mut fq = FakeQuantize::new(QatConfig::int4_grouped(4));
+        fq.calibrate_scale(&weights);
+        let mut q = vec![0.0f32; weights.len()];
+        fq.fake_quantize_forward(&weights, &mut q);
+        // Extreme 値は誤差 ≤ scale の半分程度で復元される。
+        for (i, (&w, &out)) in weights.iter().zip(q.iter()).enumerate() {
+            let group_scale = fq.group_scales()[i / 4];
+            let err = (w - out).abs();
+            assert!(
+                err <= group_scale,
+                "index {i}: |{w} - {out}| = {err} > group_scale {group_scale}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_int4_grouped_symmetric_grid() {
+        // 全て max=1.0 の group で clamp が [-7, +7] * scale = [-1.0, +1.0] に収まる。
+        let weights = vec![1.0f32; 8];
+        let mut fq = FakeQuantize::new(QatConfig::int4_grouped(8));
+        fq.calibrate_scale(&weights);
+        let mut q = vec![0.0f32; weights.len()];
+        fq.fake_quantize_forward(&weights, &mut q);
+        for &v in &q {
+            assert!(v.abs() <= 1.0 + 1e-4, "grid overshoot: {v}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a multiple of group_size")]
+    fn test_int4_grouped_length_mismatch_panics() {
+        let weights = vec![0.5f32; 7]; // 7 not divisible by 4
+        let mut fq = FakeQuantize::new(QatConfig::int4_grouped(4));
+        fq.calibrate_scale(&weights); // panics inside calibrate
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "call calibrate_scale() before fake_quantize_forward() in group-wise mode"
+    )]
+    fn test_int4_grouped_forward_without_calibration_panics() {
+        let weights = vec![0.5f32; 8];
+        let fq = FakeQuantize::new(QatConfig::int4_grouped(4));
+        let mut q = vec![0.0f32; 8];
+        fq.fake_quantize_forward(&weights, &mut q); // group_scales is empty
+    }
+
+    #[test]
+    fn test_int4_tensor_wise_still_works() {
+        // group_size=None のときは既存の tensor-wise 経路が使われる。
+        let weights = [0.1, -0.5, 0.3, 0.7, -0.2];
+        let mut fq = FakeQuantize::new(QatConfig::int4());
+        fq.calibrate_scale(&weights);
+        assert!(fq.group_scales().is_empty()); // group モードは走っていない
+        let mut q = vec![0.0; weights.len()];
+        fq.fake_quantize_forward(&weights, &mut q);
+        let s = fq.scale();
+        for &v in &q {
+            assert!(v.abs() <= s + 1e-6);
+        }
     }
 }
