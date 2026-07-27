@@ -17,6 +17,10 @@ cuda = ["cudarc"]
 qat-cli = ["safetensors", "clap"]
 qat-gpu = ["gpu", "qat-cli"]
 qat-cuda = ["cuda", "qat-cli"]
+# ALICE-TTS v2.0 対応 (Feature Request R1-R4)
+# R1: TtsBatch — serde のみで足りるため追加 dep 無し
+# R4 (将来): hound + rustfft を tts 内 sub-feature として追加予定
+tts = []
 
 [[bin]]
 name = "train-qat-70b"

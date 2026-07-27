@@ -113,6 +113,10 @@ pub mod tokenizer;
 pub mod trainer;
 pub mod vision;
 
+// ALICE-TTS v2.0 対応モジュール (feature gate、既存 LLM 学習に影響なし)
+#[cfg(feature = "tts")]
+pub mod tts;
+
 // GPU モジュール (feature gate)
 #[cfg(feature = "gpu")]
 pub mod gpu;
@@ -146,6 +150,10 @@ pub use pipeline::{QatEpochSummary, QatPipeline, QatPipelineConfig, QatRunResult
 pub use qat::{CalibrationStats, FakeQuantize, QatConfig, QatEpochResult, QatTrainer, QuantBits};
 pub use scheduler::{ConstantScheduler, LrScheduler, WarmupCosineScheduler};
 pub use trainer::{EpochResult, TrainConfig, TrainableNetwork, Trainer};
+
+// TTS re-exports (feature = "tts")
+#[cfg(feature = "tts")]
+pub use tts::{TtsBatch, TtsBatchError};
 
 // GPU re-exports
 #[cfg(feature = "gpu")]
