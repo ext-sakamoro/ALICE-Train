@@ -18,9 +18,10 @@ qat-cli = ["safetensors", "clap"]
 qat-gpu = ["gpu", "qat-cli"]
 qat-cuda = ["cuda", "qat-cli"]
 # ALICE-TTS v2.0 対応 (Feature Request R1-R4)
-# R1: TtsBatch — serde のみで足りるため追加 dep 無し
-# R4 (将来): hound + rustfft を tts 内 sub-feature として追加予定
-tts = []
+# R1: TtsBatch (serde 流用、追加 dep 無し)
+# R4: AudioFeatureExtractor (STFT + mel filterbank + F0 (YIN) + energy) — rustfft 使用
+# R2: TtsDataset loader (hound は R2 実装時に追加予定)
+tts = ["dep:rustfft"]
 
 [[bin]]
 name = "train-qat-70b"
@@ -92,6 +93,9 @@ clap = { version = "4", features = ["derive"], optional = true }
 
 # PyTorch .pth ローダー
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# ALICE-TTS v2.0 R4 AudioFeatureExtractor 用 STFT (feature = "tts" gate)
+rustfft = { version = "6", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

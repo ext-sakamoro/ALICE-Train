@@ -10,13 +10,15 @@
 //!   マルチモーダルバッチ型 (本モジュール実装済)
 //! - **R2**: `TtsDataset` — JSUT/JVS/JVNV manifest からの batch loader (未実装、Phase T.0-R 継続)
 //! - **R3**: `ProsodyLoss` — F0/duration/energy の重み付き joint loss (未実装、同上)
-//! - **R4**: `AudioFeatureExtractor` — STFT + mel filterbank + F0/energy 抽出 (未実装、同上)
+//! - **R4**: [`AudioFeatureExtractor`] — STFT + mel filterbank + F0 (YIN) + energy 抽出 (実装済)
 //!
 //! # 関連ドキュメント
 //!
 //! - `~/ALICE-TTS/docs/v2/feature-requests/alice-train-tts-support.md` — Feature Request 詳細
 //! - `~/ALICE-TTS/docs/v2/ARCHITECTURE.md` §AD-7 — Rust 学習 pipeline は ALICE-Train 派生
 
+pub mod audio;
 pub mod batch;
 
+pub use audio::AudioFeatureExtractor;
 pub use batch::{TtsBatch, TtsBatchError};
