@@ -9,7 +9,7 @@
 //! - **R1**: [`TtsBatch`] — 音声 + テキスト + prosody + alignment + speaker + duration の
 //!   マルチモーダルバッチ型 (実装済)
 //! - **R2**: [`TtsDataset`] — JSUT/JVS/JVNV manifest からの batch loader (実装済)
-//! - **R3**: `ProsodyLoss` — F0/duration/energy の重み付き joint loss (未実装、Phase T.0-R 継続)
+//! - **R3**: [`ProsodyLoss`] — F0/duration/energy の重み付き joint loss (実装済) — **Phase T.0-R 4 R 完了**
 //! - **R4**: [`AudioFeatureExtractor`] — STFT + mel filterbank + F0 (YIN) + energy 抽出 (実装済)
 //!
 //! # 関連ドキュメント
@@ -20,7 +20,9 @@
 pub mod audio;
 pub mod batch;
 pub mod dataset;
+pub mod loss;
 
 pub use audio::AudioFeatureExtractor;
 pub use batch::{TtsBatch, TtsBatchError};
 pub use dataset::{TtsDataset, TtsDatasetError, TtsManifestEntry};
+pub use loss::{LossComponents, ProsodyLoss, ProsodyLossError, ProsodyPrediction, ProsodyTarget};
