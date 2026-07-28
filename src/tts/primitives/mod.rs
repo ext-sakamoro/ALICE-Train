@@ -9,12 +9,14 @@
 //! | Module | 内容 |
 //! |---|---|
 //! | [`conv1d`] | 1D convolution (forward + 手書き backward、grouped/depthwise 対応) |
+//! | [`layer_norm`] | LayerNorm (forward + 手書き backward、PyTorch nn.LayerNorm 互換) |
+//! | [`multi_head_attention`] | Multi-Head Attention (self + cross、causal / bidirectional、forward + backward) |
 //!
 //! # ロードマップ (Phase T.0-P)
 //!
 //! - ✅ Conv1D + backward
 //! - ✅ LayerNorm + backward
-//! - ⏳ MultiHeadAttention + backward (causal / bidirectional 両対応)
+//! - ✅ MultiHeadAttention + backward (causal / bidirectional 両対応、self + cross)
 //! - ⏳ PositionalEncoding (sinusoidal + rotary)
 //! - ⏳ WeightNorm (optional、Vocos style)
 //!
@@ -26,6 +28,8 @@
 
 pub mod conv1d;
 pub mod layer_norm;
+pub mod multi_head_attention;
 
 pub use conv1d::{Conv1d, Conv1dConfig, Conv1dError};
 pub use layer_norm::{LayerNorm, LayerNormConfig, LayerNormError};
+pub use multi_head_attention::{MhaError, MhaGrads, MultiHeadAttention, MultiHeadAttentionConfig};

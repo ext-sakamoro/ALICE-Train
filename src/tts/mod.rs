@@ -28,5 +28,6 @@ pub use batch::{TtsBatch, TtsBatchError};
 pub use dataset::{TtsDataset, TtsDatasetError, TtsManifestEntry};
 pub use loss::{LossComponents, ProsodyLoss, ProsodyLossError, ProsodyPrediction, ProsodyTarget};
 pub use primitives::{
-    Conv1d, Conv1dConfig, Conv1dError, LayerNorm, LayerNormConfig, LayerNormError,
+    Conv1d, Conv1dConfig, Conv1dError, LayerNorm, LayerNormConfig, LayerNormError, MhaError,
+    MhaGrads, MultiHeadAttention, MultiHeadAttentionConfig,
 };

@@ -155,8 +155,9 @@ pub use trainer::{EpochResult, TrainConfig, TrainableNetwork, Trainer};
 #[cfg(feature = "tts")]
 pub use tts::{
     AudioFeatureExtractor, Conv1d, Conv1dConfig, Conv1dError, LayerNorm, LayerNormConfig,
-    LayerNormError, LossComponents, ProsodyLoss, ProsodyLossError, ProsodyPrediction,
-    ProsodyTarget, TtsBatch, TtsBatchError, TtsDataset, TtsDatasetError, TtsManifestEntry,
+    LayerNormError, LossComponents, MhaError, MhaGrads, MultiHeadAttention,
+    MultiHeadAttentionConfig, ProsodyLoss, ProsodyLossError, ProsodyPrediction, ProsodyTarget,
+    TtsBatch, TtsBatchError, TtsDataset, TtsDatasetError, TtsManifestEntry,
 };
 
 // GPU re-exports
