@@ -153,9 +153,14 @@ pub fn blas_matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k
 /// A を転置して掛ける (grad_weight = grad_output^T × input で使用)。
 pub fn blas_matmul_tn(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     #[cfg(feature = "cuda")]
-    if let Some(_cuda_mtx) = CUDA_MATMUL.get() {
-        // CUDA 経路は Phase T.4c で追加 (Qwen35 用 sgemm を TTS 向けに転用)
-        // 暫定: fallback で対応
+    if let Some(cuda_mtx) = CUDA_MATMUL.get() {
+        // Phase T.4c: CUDA 経路 (既存 matmul_tn_inplace の param 命名差異を吸収)
+        // 私 (blas_matmul_tn): A(k×m), B(k×n) → C(m×n)、C = A^T × B
+        // 既存 CudaMatmul::matmul_tn_inplace: A(m×k), B(m×n) → C(k×n)、param 命名で
+        //   their.m = shared(k_mine)、their.k = out_row(m_mine)、their.n = out_col(n_mine)
+        let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+        cuda.matmul_tn_inplace(a, b, c, k, n, m);
+        return;
     }
 
     #[cfg(any(

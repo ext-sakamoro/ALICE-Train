@@ -26,6 +26,15 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Phase T.4c: CUDA cuBLAS 初期化 (feature = "cuda" 有効時)
+    // 以降 blas_matmul_bt/nn/tn は自動的に GPU 経路に routing される
+    #[cfg(feature = "cuda")]
+    {
+        println!("[info] Initializing CUDA cuBLAS (Phase T.4c)...");
+        alice_train::blas::init_cuda_blas();
+        println!("[info] CUDA cuBLAS ready (matmul → GPU)");
+    }
+
     // 簡易 arg parse (--config <path>)
     let args: Vec<String> = env::args().collect();
     let config_path = parse_config_arg(&args).unwrap_or_else(|| {
