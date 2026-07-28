@@ -271,9 +271,6 @@ impl TtsTrainer {
                     .as_mut()
                     .expect("AdamW state should be initialized in with_adamw");
                 self.model.apply_adamw(&grads, state, adamw_cfg);
-                // Phase E 現状: AdamW state に variance predictor 未拡張、SGD で fallback 更新
-                self.model
-                    .apply_sgd_variance_only(&grads, self.config.learning_rate);
             }
         }
 

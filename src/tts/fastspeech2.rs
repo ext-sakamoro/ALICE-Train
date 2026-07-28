@@ -2268,8 +2268,68 @@ impl FastSpeech2 {
                 bc2,
             );
         }
-        // Variance predictor / pitch/energy embed backward で grad = 0 のため update 無効化
-        // (Phase T.4a 継続で ProsodyLoss joint 時に生きる)
+        // Variance predictor 3 系統 AdamW (Phase E-next-2)
+        apply_variance_predictor_adamw(
+            &mut self.duration_predictor,
+            &grads.duration_predictor,
+            &mut state.duration_predictor,
+            config,
+            bc1,
+            bc2,
+        );
+        apply_variance_predictor_adamw(
+            &mut self.pitch_predictor,
+            &grads.pitch_predictor,
+            &mut state.pitch_predictor,
+            config,
+            bc1,
+            bc2,
+        );
+        apply_variance_predictor_adamw(
+            &mut self.energy_predictor,
+            &grads.energy_predictor,
+            &mut state.energy_predictor,
+            config,
+            bc1,
+            bc2,
+        );
+        // pitch/energy embed Conv1D AdamW
+        adamw_slice(
+            self.pitch_embed.weight_mut(),
+            &grads.pitch_embed_w,
+            &mut state.pitch_embed_m_w,
+            &mut state.pitch_embed_v_w,
+            config,
+            bc1,
+            bc2,
+        );
+        adamw_slice(
+            self.pitch_embed.bias_mut(),
+            &grads.pitch_embed_b,
+            &mut state.pitch_embed_m_b,
+            &mut state.pitch_embed_v_b,
+            config,
+            bc1,
+            bc2,
+        );
+        adamw_slice(
+            self.energy_embed.weight_mut(),
+            &grads.energy_embed_w,
+            &mut state.energy_embed_m_w,
+            &mut state.energy_embed_v_w,
+            config,
+            bc1,
+            bc2,
+        );
+        adamw_slice(
+            self.energy_embed.bias_mut(),
+            &grads.energy_embed_b,
+            &mut state.energy_embed_m_b,
+            &mut state.energy_embed_v_b,
+            config,
+            bc1,
+            bc2,
+        );
     }
 
     /// 全 model weight を safetensors ファイルに保存する (Phase T.4a Phase C)。
@@ -2465,17 +2525,39 @@ impl FastSpeech2 {
         apply_variance_predictor_sgd(&mut self.duration_predictor, &grads.duration_predictor, lr);
         apply_variance_predictor_sgd(&mut self.pitch_predictor, &grads.pitch_predictor, lr);
         apply_variance_predictor_sgd(&mut self.energy_predictor, &grads.energy_predictor, lr);
-    }
-
-    /// AdamW trainer 経路で variance predictor だけ SGD で fallback 更新する helper (Phase E)。
-    ///
-    /// `AdamW state` に variance predictor state が未拡張のため、Phase E MVP では
-    /// AdamW trainer 使用時も variance predictor は SGD 更新で運用する。
-    /// (次 Phase で `FastSpeech2AdamWState` を拡張し完全 AdamW 化予定)
-    pub fn apply_sgd_variance_only(&mut self, grads: &FastSpeech2Grads, lr: f32) {
-        apply_variance_predictor_sgd(&mut self.duration_predictor, &grads.duration_predictor, lr);
-        apply_variance_predictor_sgd(&mut self.pitch_predictor, &grads.pitch_predictor, lr);
-        apply_variance_predictor_sgd(&mut self.energy_predictor, &grads.energy_predictor, lr);
+        // pitch/energy embed Conv1D (Phase E-next-1 hidden injection で grad != 0)
+        for (w, g) in self
+            .pitch_embed
+            .weight_mut()
+            .iter_mut()
+            .zip(&grads.pitch_embed_w)
+        {
+            *w -= lr * g;
+        }
+        for (b, g) in self
+            .pitch_embed
+            .bias_mut()
+            .iter_mut()
+            .zip(&grads.pitch_embed_b)
+        {
+            *b -= lr * g;
+        }
+        for (w, g) in self
+            .energy_embed
+            .weight_mut()
+            .iter_mut()
+            .zip(&grads.energy_embed_w)
+        {
+            *w -= lr * g;
+        }
+        for (b, g) in self
+            .energy_embed
+            .bias_mut()
+            .iter_mut()
+            .zip(&grads.energy_embed_b)
+        {
+            *b -= lr * g;
+        }
     }
 }
 
@@ -2607,6 +2689,107 @@ pub struct FastSpeech2AdamWState {
     pub postnet_m_b: Vec<Vec<f32>>,
     /// Postnet 各層 bias v。
     pub postnet_v_b: Vec<Vec<f32>>,
+    /// Duration predictor AdamW state (Phase E-next-2)。
+    pub duration_predictor: VariancePredictorAdamWState,
+    /// Pitch predictor AdamW state。
+    pub pitch_predictor: VariancePredictorAdamWState,
+    /// Energy predictor AdamW state。
+    pub energy_predictor: VariancePredictorAdamWState,
+    /// pitch_embed Conv1D weight m/v (Phase E-next-2)。
+    pub pitch_embed_m_w: Vec<f32>,
+    /// (v)。
+    pub pitch_embed_v_w: Vec<f32>,
+    /// pitch_embed Conv1D bias m/v。
+    pub pitch_embed_m_b: Vec<f32>,
+    /// (v)。
+    pub pitch_embed_v_b: Vec<f32>,
+    /// energy_embed Conv1D weight m/v。
+    pub energy_embed_m_w: Vec<f32>,
+    /// (v)。
+    pub energy_embed_v_w: Vec<f32>,
+    /// energy_embed Conv1D bias m/v。
+    pub energy_embed_m_b: Vec<f32>,
+    /// (v)。
+    pub energy_embed_v_b: Vec<f32>,
+}
+
+/// Variance predictor 用 AdamW state (Phase E-next-2)。
+///
+/// 各 sub-layer (Conv1D × 2 + `LayerNorm` × 2 + Linear) の m/v を保持。
+#[derive(Clone, Debug, Default)]
+pub struct VariancePredictorAdamWState {
+    /// Conv1 weight m/v。
+    pub conv1_m_w: Vec<f32>,
+    /// (v)。
+    pub conv1_v_w: Vec<f32>,
+    /// Conv1 bias m/v。
+    pub conv1_m_b: Vec<f32>,
+    /// (v)。
+    pub conv1_v_b: Vec<f32>,
+    /// norm1 gamma m/v。
+    pub norm1_m_gamma: Vec<f32>,
+    /// (v)。
+    pub norm1_v_gamma: Vec<f32>,
+    /// norm1 beta m/v。
+    pub norm1_m_beta: Vec<f32>,
+    /// (v)。
+    pub norm1_v_beta: Vec<f32>,
+    /// Conv2 weight m/v。
+    pub conv2_m_w: Vec<f32>,
+    /// (v)。
+    pub conv2_v_w: Vec<f32>,
+    /// Conv2 bias m/v。
+    pub conv2_m_b: Vec<f32>,
+    /// (v)。
+    pub conv2_v_b: Vec<f32>,
+    /// norm2 gamma m/v。
+    pub norm2_m_gamma: Vec<f32>,
+    /// (v)。
+    pub norm2_v_gamma: Vec<f32>,
+    /// norm2 beta m/v。
+    pub norm2_m_beta: Vec<f32>,
+    /// (v)。
+    pub norm2_v_beta: Vec<f32>,
+    /// Linear weight m/v。
+    pub linear_m_w: Vec<f32>,
+    /// (v)。
+    pub linear_v_w: Vec<f32>,
+    /// Linear bias m/v。
+    pub linear_m_b: Vec<f32>,
+    /// (v)。
+    pub linear_v_b: Vec<f32>,
+}
+
+impl VariancePredictorAdamWState {
+    /// FastSpeech2Config に合わせた 0 埋め state を構築 (Phase E-next-2)。
+    #[must_use]
+    pub fn zeros_from_config(cfg: &FastSpeech2Config) -> Self {
+        let h = cfg.hidden_dim;
+        let ph = cfg.predictor_hidden;
+        let k = cfg.predictor_kernel_size;
+        Self {
+            conv1_m_w: vec![0.0; ph * h * k],
+            conv1_v_w: vec![0.0; ph * h * k],
+            conv1_m_b: vec![0.0; ph],
+            conv1_v_b: vec![0.0; ph],
+            norm1_m_gamma: vec![0.0; ph],
+            norm1_v_gamma: vec![0.0; ph],
+            norm1_m_beta: vec![0.0; ph],
+            norm1_v_beta: vec![0.0; ph],
+            conv2_m_w: vec![0.0; ph * ph * k],
+            conv2_v_w: vec![0.0; ph * ph * k],
+            conv2_m_b: vec![0.0; ph],
+            conv2_v_b: vec![0.0; ph],
+            norm2_m_gamma: vec![0.0; ph],
+            norm2_v_gamma: vec![0.0; ph],
+            norm2_m_beta: vec![0.0; ph],
+            norm2_v_beta: vec![0.0; ph],
+            linear_m_w: vec![0.0; ph],
+            linear_v_w: vec![0.0; ph],
+            linear_m_b: vec![0.0; 1],
+            linear_v_b: vec![0.0; 1],
+        }
+    }
 }
 
 impl FastSpeech2AdamWState {
@@ -2687,6 +2870,17 @@ impl FastSpeech2AdamWState {
             postnet_v_w: postnet_shapes.iter().map(|&n| vec![0.0; n]).collect(),
             postnet_m_b: postnet_bias_shapes.iter().map(|&n| vec![0.0; n]).collect(),
             postnet_v_b: postnet_bias_shapes.iter().map(|&n| vec![0.0; n]).collect(),
+            duration_predictor: VariancePredictorAdamWState::zeros_from_config(cfg),
+            pitch_predictor: VariancePredictorAdamWState::zeros_from_config(cfg),
+            energy_predictor: VariancePredictorAdamWState::zeros_from_config(cfg),
+            pitch_embed_m_w: vec![0.0; h],
+            pitch_embed_v_w: vec![0.0; h],
+            pitch_embed_m_b: vec![0.0; h],
+            pitch_embed_v_b: vec![0.0; h],
+            energy_embed_m_w: vec![0.0; h],
+            energy_embed_v_w: vec![0.0; h],
+            energy_embed_m_b: vec![0.0; h],
+            energy_embed_v_b: vec![0.0; h],
         }
     }
 }
@@ -2713,6 +2907,107 @@ fn adamw_slice(
 }
 
 /// FftBlock AdamW update helper。
+/// VariancePredictor AdamW update helper (Phase E-next-2)。
+fn apply_variance_predictor_adamw(
+    vp: &mut VariancePredictor,
+    grads: &VariancePredictorGrads,
+    state: &mut VariancePredictorAdamWState,
+    config: &AdamWConfig,
+    bc1: f32,
+    bc2: f32,
+) {
+    adamw_slice(
+        vp.conv1.weight_mut(),
+        &grads.conv1_w,
+        &mut state.conv1_m_w,
+        &mut state.conv1_v_w,
+        config,
+        bc1,
+        bc2,
+    );
+    adamw_slice(
+        vp.conv1.bias_mut(),
+        &grads.conv1_b,
+        &mut state.conv1_m_b,
+        &mut state.conv1_v_b,
+        config,
+        bc1,
+        bc2,
+    );
+    adamw_slice(
+        vp.norm1.gamma_mut(),
+        &grads.norm1_gamma,
+        &mut state.norm1_m_gamma,
+        &mut state.norm1_v_gamma,
+        config,
+        bc1,
+        bc2,
+    );
+    adamw_slice(
+        vp.norm1.beta_mut(),
+        &grads.norm1_beta,
+        &mut state.norm1_m_beta,
+        &mut state.norm1_v_beta,
+        config,
+        bc1,
+        bc2,
+    );
+    adamw_slice(
+        vp.conv2.weight_mut(),
+        &grads.conv2_w,
+        &mut state.conv2_m_w,
+        &mut state.conv2_v_w,
+        config,
+        bc1,
+        bc2,
+    );
+    adamw_slice(
+        vp.conv2.bias_mut(),
+        &grads.conv2_b,
+        &mut state.conv2_m_b,
+        &mut state.conv2_v_b,
+        config,
+        bc1,
+        bc2,
+    );
+    adamw_slice(
+        vp.norm2.gamma_mut(),
+        &grads.norm2_gamma,
+        &mut state.norm2_m_gamma,
+        &mut state.norm2_v_gamma,
+        config,
+        bc1,
+        bc2,
+    );
+    adamw_slice(
+        vp.norm2.beta_mut(),
+        &grads.norm2_beta,
+        &mut state.norm2_m_beta,
+        &mut state.norm2_v_beta,
+        config,
+        bc1,
+        bc2,
+    );
+    adamw_slice(
+        vp.linear.weight_mut(),
+        &grads.linear_w,
+        &mut state.linear_m_w,
+        &mut state.linear_v_w,
+        config,
+        bc1,
+        bc2,
+    );
+    adamw_slice(
+        vp.linear.bias_mut(),
+        &grads.linear_b,
+        &mut state.linear_m_b,
+        &mut state.linear_v_b,
+        config,
+        bc1,
+        bc2,
+    );
+}
+
 fn apply_fft_block_adamw(
     block: &mut FftBlock,
     grads: &FftBlockGrads,
