@@ -42,9 +42,9 @@
         "learning_rate": 0.0001,
         "log_interval": 100,
         "total_steps": 300000,
-        "checkpoint_interval": 5000,
+        "checkpoint_interval": 1000,
         "checkpoint_dir": "/notebooks/ALICE-Train/checkpoints/fs2_jsut",
-        "_comment": "AdamW lr=1e-4, checkpoint 5000 step 毎 (Free A6000 6h session で ~15k step 進行想定)"
+        "_comment": "AdamW lr=1e-4, checkpoint 1000 step 毎 (~25 min interval @ 42 steps/min throughput、Free tier 6h で ~10 checkpoint + Box auto-upload)"
     },
     "eval": {
         "eval_interval": 5000,
