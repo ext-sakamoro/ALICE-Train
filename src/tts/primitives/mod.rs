@@ -12,8 +12,8 @@
 //!
 //! # ロードマップ (Phase T.0-P)
 //!
-//! - ✅ Conv1D + backward (本 module)
-//! - ⏳ LayerNorm + backward
+//! - ✅ Conv1D + backward
+//! - ✅ LayerNorm + backward
 //! - ⏳ MultiHeadAttention + backward (causal / bidirectional 両対応)
 //! - ⏳ PositionalEncoding (sinusoidal + rotary)
 //! - ⏳ WeightNorm (optional、Vocos style)
@@ -25,5 +25,7 @@
 //! - Vocos primitives (`~/ALICE-TTS/crates/alice-tts-vocoder/src/primitives.rs`) — 将来集約対象
 
 pub mod conv1d;
+pub mod layer_norm;
 
 pub use conv1d::{Conv1d, Conv1dConfig, Conv1dError};
+pub use layer_norm::{LayerNorm, LayerNormConfig, LayerNormError};

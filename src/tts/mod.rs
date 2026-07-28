@@ -27,4 +27,6 @@ pub use audio::AudioFeatureExtractor;
 pub use batch::{TtsBatch, TtsBatchError};
 pub use dataset::{TtsDataset, TtsDatasetError, TtsManifestEntry};
 pub use loss::{LossComponents, ProsodyLoss, ProsodyLossError, ProsodyPrediction, ProsodyTarget};
-pub use primitives::{Conv1d, Conv1dConfig, Conv1dError};
+pub use primitives::{
+    Conv1d, Conv1dConfig, Conv1dError, LayerNorm, LayerNormConfig, LayerNormError,
+};
