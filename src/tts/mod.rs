@@ -21,8 +21,10 @@ pub mod audio;
 pub mod batch;
 pub mod dataset;
 pub mod loss;
+pub mod primitives;
 
 pub use audio::AudioFeatureExtractor;
 pub use batch::{TtsBatch, TtsBatchError};
 pub use dataset::{TtsDataset, TtsDatasetError, TtsManifestEntry};
 pub use loss::{LossComponents, ProsodyLoss, ProsodyLossError, ProsodyPrediction, ProsodyTarget};
+pub use primitives::{Conv1d, Conv1dConfig, Conv1dError};
