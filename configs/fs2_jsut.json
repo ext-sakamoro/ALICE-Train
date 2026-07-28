@@ -1,49 +1,50 @@
 {
-    "_comment": "FastSpeech2 training config for JSUT 100-speaker fine-tune (Phase T.4a)",
-    "_version": "0.1.0-phase-t4a",
-    "_reference": "ALICE-TTS docs/v2/ROADMAP.md Phase T.4a",
+    "_comment": "FastSpeech2 training config for JSUT 5000 utt (Phase T.4a + Phase E-next-4)",
+    "_version": "0.2.0-phase-e-next-4",
+    "_reference": "docs/fastspeech2_training.md",
     "model": {
-        "vocab_size": 100,
-        "hidden_dim": 256,
+        "_comment": "Phase T.4b-B: CPU 学習用軽量 config (hidden 192, layers 3)、期待 2-3× 加速",
+        "vocab_size": 42,
+        "hidden_dim": 192,
         "num_heads": 2,
-        "num_encoder_layers": 4,
-        "num_decoder_layers": 4,
+        "num_encoder_layers": 3,
+        "num_decoder_layers": 3,
         "fft_kernel_size": 3,
         "fft_expansion": 4,
         "predictor_kernel_size": 3,
-        "predictor_hidden": 256,
+        "predictor_hidden": 192,
         "mel_dim": 80,
         "postnet_kernel_size": 5,
-        "postnet_layers": 5,
-        "postnet_hidden": 512,
+        "postnet_layers": 3,
+        "postnet_hidden": 256,
         "max_len": 2048
     },
     "audio": {
-        "sample_rate": 24000,
-        "n_fft": 1024,
-        "hop_length": 256,
+        "sample_rate": 48000,
+        "n_fft": 2048,
+        "hop_length": 512,
         "n_mels": 80,
-        "_comment": "24 kHz mono、Slaney mel filterbank、hop 256 = 10.67 ms/frame"
+        "_comment": "48 kHz JSUT native, n_fft 2048, hop 512 = 10.67 ms/frame (24kHz+hop256 と同 frame rate)"
     },
     "dataset": {
         "manifest_path": "data/jsut/manifest.jsonl",
-        "audio_root": "data/jsut/audio",
+        "audio_root": "data/jsut/jsut_ver1.1",
         "split_ratios": [
             0.9,
             0.05,
             0.05
         ],
         "split_seed": 42,
-        "batch_size": 8,
-        "_comment": "JSUT 100 話者 × 100 utt = 10000 utt、90/5/5 split"
+        "batch_size": 1,
+        "_comment": "JSUT 5000 utt, 90/5/5 split, batch=1 (Phase E-next-3 で variable-length 対応済だが fs2_train.rs は batch=1 前提)"
     },
     "training": {
         "learning_rate": 0.0001,
         "log_interval": 100,
         "total_steps": 300000,
-        "checkpoint_interval": 10000,
-        "checkpoint_dir": "checkpoints/fs2_jsut",
-        "_comment": "AdamW (lr=1e-4 で 5 step 92% loss 減少実測)、SGD 経由なら lr=1e-3 推奨"
+        "checkpoint_interval": 5000,
+        "checkpoint_dir": "/notebooks/ALICE-Train/checkpoints/fs2_jsut",
+        "_comment": "AdamW lr=1e-4, checkpoint 5000 step 毎 (Free A6000 6h session で ~15k step 進行想定)"
     },
     "eval": {
         "eval_interval": 5000,

@@ -784,22 +784,32 @@ impl MultiHeadAttention {
         // attn_out shape: [batch, seq_q, e] (concat heads 後)
         let mut attn_out = vec![0.0_f32; batch * seq_q * e];
 
+        // Phase T.4b-A: Per-head 抽出 buffer (Q_h, K_h, V_h, attn_h) を再利用
+        // per-head 抽出は O(seq × d) の memory copy、その後 matmul O(seq² × d) が BLAS 化
+        let mut q_h = vec![0.0_f32; seq_q * d];
+        let mut k_h = vec![0.0_f32; seq_k * d];
+        let mut v_h = vec![0.0_f32; seq_k * d];
+        let mut attn_h = vec![0.0_f32; seq_q * d];
+        let mut scores = vec![0.0_f32; seq_q * seq_k];
+
         for b in 0..batch {
             for head in 0..h {
-                // 1. scores = Q_h @ K_h^T / sqrt(D), shape [seq_q, seq_k]
-                //    Q_proj layout: [batch, seq_q, e], Q_h layout: q_proj[b, sq, head*d..head*d+d]
-                //    K_proj layout: [batch, seq_k, e], K_h layout: k_proj[b, sk, head*d..head*d+d]
-                let mut scores = vec![0.0_f32; seq_q * seq_k];
+                // Q_h / K_h / V_h を contiguous 抽出
                 for sq in 0..seq_q {
-                    for sk in 0..seq_k {
-                        let mut acc = 0.0_f32;
-                        for dd in 0..d {
-                            let q_idx = b * seq_q * e + sq * e + head * d + dd;
-                            let k_idx = b * seq_k * e + sk * e + head * d + dd;
-                            acc += q_proj[q_idx] * k_proj[k_idx];
-                        }
-                        scores[sq * seq_k + sk] = acc * scale;
-                    }
+                    let src = b * seq_q * e + sq * e + head * d;
+                    q_h[sq * d..sq * d + d].copy_from_slice(&q_proj[src..src + d]);
+                }
+                for sk in 0..seq_k {
+                    let src_k = b * seq_k * e + sk * e + head * d;
+                    k_h[sk * d..sk * d + d].copy_from_slice(&k_proj[src_k..src_k + d]);
+                    v_h[sk * d..sk * d + d].copy_from_slice(&v_proj[src_k..src_k + d]);
+                }
+
+                // 1. scores = Q_h @ K_h^T (BLAS), shape [seq_q, seq_k]
+                crate::blas::blas_matmul_bt(&q_h, &k_h, &mut scores, seq_q, seq_k, d);
+                // scale by 1/sqrt(d)
+                for v in scores.iter_mut() {
+                    *v *= scale;
                 }
 
                 // 2. causal mask
@@ -811,7 +821,7 @@ impl MultiHeadAttention {
                     }
                 }
 
-                // 2b. key_mask: false 位置の key を attention から除外 (score = -inf)
+                // 2b. key_mask: false 位置の key を attention から除外
                 if let Some(mask) = key_mask {
                     for sq in 0..seq_q {
                         for sk in 0..seq_k {
@@ -831,24 +841,17 @@ impl MultiHeadAttention {
 
                 // save attn weights for backward
                 for sq in 0..seq_q {
-                    for sk in 0..seq_k {
-                        let idx = b * h * seq_q * seq_k + head * seq_q * seq_k + sq * seq_k + sk;
-                        attn_weights[idx] = scores[sq * seq_k + sk];
-                    }
+                    let src = sq * seq_k;
+                    let dst = b * h * seq_q * seq_k + head * seq_q * seq_k + sq * seq_k;
+                    attn_weights[dst..dst + seq_k].copy_from_slice(&scores[src..src + seq_k]);
                 }
 
-                // 4. attn @ V_h, shape [seq_q, d]
+                // 4. attn @ V_h (BLAS), shape [seq_q, d]
+                crate::blas::blas_matmul_nn(&scores, &v_h, &mut attn_h, seq_q, d, seq_k);
+                // Write attn_h back to attn_out[b, sq, head*d..head*d+d]
                 for sq in 0..seq_q {
-                    for dd in 0..d {
-                        let mut acc = 0.0_f32;
-                        for sk in 0..seq_k {
-                            let v_idx = b * seq_k * e + sk * e + head * d + dd;
-                            acc += scores[sq * seq_k + sk] * v_proj[v_idx];
-                        }
-                        // Write to attn_out[b, sq, head*d + dd]
-                        let out_idx = b * seq_q * e + sq * e + head * d + dd;
-                        attn_out[out_idx] = acc;
-                    }
+                    let dst = b * seq_q * e + sq * e + head * d;
+                    attn_out[dst..dst + d].copy_from_slice(&attn_h[sq * d..sq * d + d]);
                 }
             }
         }
@@ -953,7 +956,7 @@ fn softmax_row(row: &mut [f32]) {
     }
 }
 
-/// `attn @ V` backward:
+/// `attn @ V` backward (Phase T.4b-A: per-head BLAS 化):
 /// `attn_out[b, h, sq, d] = Σ_sk attn_w[b, h, sq, sk] * v_h[b, h, sk, d]`
 ///
 /// Returns (grad_attn_weights, grad_v_proj)。
@@ -971,20 +974,42 @@ fn attn_matmul_v_backward(
     let mut grad_attn_weights = vec![0.0_f32; batch * h * seq_q * seq_k];
     let mut grad_v_proj = vec![0.0_f32; batch * seq_k * e];
 
+    // per-head buffer 再利用
+    let mut v_h = vec![0.0_f32; seq_k * d];
+    let mut grad_out_h = vec![0.0_f32; seq_q * d];
+    let mut grad_v_h = vec![0.0_f32; seq_k * d];
+
     for b in 0..batch {
         for head in 0..h {
+            // V_h と grad_attn_out_h を contiguous 抽出
+            for sk in 0..seq_k {
+                let src = b * seq_k * e + sk * e + head * d;
+                v_h[sk * d..sk * d + d].copy_from_slice(&v_proj[src..src + d]);
+            }
             for sq in 0..seq_q {
-                for dd in 0..d {
-                    let g_out_idx = b * seq_q * e + sq * e + head * d + dd;
-                    let g_out = grad_attn_out[g_out_idx];
-                    for sk in 0..seq_k {
-                        let attn_idx =
-                            b * h * seq_q * seq_k + head * seq_q * seq_k + sq * seq_k + sk;
-                        let v_idx = b * seq_k * e + sk * e + head * d + dd;
+                let src = b * seq_q * e + sq * e + head * d;
+                grad_out_h[sq * d..sq * d + d].copy_from_slice(&grad_attn_out[src..src + d]);
+            }
 
-                        grad_attn_weights[attn_idx] += g_out * v_proj[v_idx];
-                        grad_v_proj[v_idx] += g_out * attn_weights[attn_idx];
-                    }
+            // grad_attn_h[seq_q, seq_k] = grad_out_h[seq_q, d] × V_h[seq_k, d]^T
+            let g_attn_base = b * h * seq_q * seq_k + head * seq_q * seq_k;
+            crate::blas::blas_matmul_bt(
+                &grad_out_h,
+                &v_h,
+                &mut grad_attn_weights[g_attn_base..g_attn_base + seq_q * seq_k],
+                seq_q,
+                seq_k,
+                d,
+            );
+
+            // grad_V_h[seq_k, d] = attn_h[seq_q, seq_k]^T × grad_out_h[seq_q, d]
+            let attn_h = &attn_weights[g_attn_base..g_attn_base + seq_q * seq_k];
+            crate::blas::blas_matmul_tn(attn_h, &grad_out_h, &mut grad_v_h, seq_k, d, seq_q);
+            // grad_V_h → grad_v_proj (per-head 位置に加算 = copy)
+            for sk in 0..seq_k {
+                let dst = b * seq_k * e + sk * e + head * d;
+                for dd in 0..d {
+                    grad_v_proj[dst + dd] += grad_v_h[sk * d + dd];
                 }
             }
         }
@@ -1023,7 +1048,7 @@ fn softmax_backward_4d(
     grad_scores
 }
 
-/// Scaled dot-product `scores = Q_h @ K_h^T / sqrt(D)` backward:
+/// Scaled dot-product `scores = Q_h @ K_h^T / sqrt(D)` backward (Phase T.4b-A: per-head BLAS 化):
 /// `grad_Q_h[sq, d] = (1/sqrt(D)) * Σ_sk grad_scores[sq, sk] * K_h[sk, d]`
 /// `grad_K_h[sk, d] = (1/sqrt(D)) * Σ_sq grad_scores[sq, sk] * Q_h[sq, d]`
 fn score_backward(
@@ -1041,18 +1066,46 @@ fn score_backward(
     let mut grad_q_proj = vec![0.0_f32; batch * seq_q * e];
     let mut grad_k_proj = vec![0.0_f32; batch * seq_k * e];
 
+    // per-head buffer
+    let mut q_h = vec![0.0_f32; seq_q * d];
+    let mut k_h = vec![0.0_f32; seq_k * d];
+    let mut grad_scores_scaled = vec![0.0_f32; seq_q * seq_k];
+    let mut grad_q_h = vec![0.0_f32; seq_q * d];
+    let mut grad_k_h = vec![0.0_f32; seq_k * d];
+
     for b in 0..batch {
         for head in 0..h {
+            // Q_h / K_h contiguous 抽出
             for sq in 0..seq_q {
-                for sk in 0..seq_k {
-                    let gs_idx = b * h * seq_q * seq_k + head * seq_q * seq_k + sq * seq_k + sk;
-                    let gs = grad_scores[gs_idx] * scale;
-                    for dd in 0..d {
-                        let q_idx = b * seq_q * e + sq * e + head * d + dd;
-                        let k_idx = b * seq_k * e + sk * e + head * d + dd;
-                        grad_q_proj[q_idx] += gs * k_proj[k_idx];
-                        grad_k_proj[k_idx] += gs * q_proj[q_idx];
-                    }
+                let src = b * seq_q * e + sq * e + head * d;
+                q_h[sq * d..sq * d + d].copy_from_slice(&q_proj[src..src + d]);
+            }
+            for sk in 0..seq_k {
+                let src = b * seq_k * e + sk * e + head * d;
+                k_h[sk * d..sk * d + d].copy_from_slice(&k_proj[src..src + d]);
+            }
+            // scaled grad_scores を per-head 抽出 (scale をここで適用)
+            let gs_base = b * h * seq_q * seq_k + head * seq_q * seq_k;
+            for i in 0..(seq_q * seq_k) {
+                grad_scores_scaled[i] = grad_scores[gs_base + i] * scale;
+            }
+
+            // grad_Q_h[seq_q, d] = grad_scores_scaled[seq_q, seq_k] @ K_h[seq_k, d]
+            crate::blas::blas_matmul_nn(&grad_scores_scaled, &k_h, &mut grad_q_h, seq_q, d, seq_k);
+            // grad_K_h[seq_k, d] = grad_scores_scaled[seq_q, seq_k]^T @ Q_h[seq_q, d]
+            crate::blas::blas_matmul_tn(&grad_scores_scaled, &q_h, &mut grad_k_h, seq_k, d, seq_q);
+
+            // 位置に加算 (accumulate は copy_from_slice ではなく += が必要)
+            for sq in 0..seq_q {
+                let dst = b * seq_q * e + sq * e + head * d;
+                for dd in 0..d {
+                    grad_q_proj[dst + dd] += grad_q_h[sq * d + dd];
+                }
+            }
+            for sk in 0..seq_k {
+                let dst = b * seq_k * e + sk * e + head * d;
+                for dd in 0..d {
+                    grad_k_proj[dst + dd] += grad_k_h[sk * d + dd];
                 }
             }
         }
