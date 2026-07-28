@@ -20,16 +20,18 @@
 pub mod audio;
 pub mod batch;
 pub mod dataset;
+pub mod fastspeech2;
 pub mod loss;
 pub mod primitives;
 
 pub use audio::AudioFeatureExtractor;
 pub use batch::{TtsBatch, TtsBatchError};
 pub use dataset::{TtsDataset, TtsDatasetError, TtsManifestEntry};
+pub use fastspeech2::{FastSpeech2, FastSpeech2Config, FastSpeech2Error};
 pub use loss::{LossComponents, ProsodyLoss, ProsodyLossError, ProsodyPrediction, ProsodyTarget};
 pub use primitives::{
-    Conv1d, Conv1dConfig, Conv1dError, LayerNorm, LayerNormConfig, LayerNormError, MhaError,
-    MhaGrads, MultiHeadAttention, MultiHeadAttentionConfig, PosEncError, RotaryEmbedding,
-    RotaryEmbeddingConfig, SinusoidalPositionalEncoding, SinusoidalPositionalEncodingConfig,
-    WeightNorm, WeightNormConfig, WeightNormError,
+    Conv1d, Conv1dConfig, Conv1dError, LayerNorm, LayerNormConfig, LayerNormError, Linear,
+    LinearConfig, LinearError, MhaError, MhaGrads, MultiHeadAttention, MultiHeadAttentionConfig,
+    PosEncError, RotaryEmbedding, RotaryEmbeddingConfig, SinusoidalPositionalEncoding,
+    SinusoidalPositionalEncodingConfig, WeightNorm, WeightNormConfig, WeightNormError,
 };
