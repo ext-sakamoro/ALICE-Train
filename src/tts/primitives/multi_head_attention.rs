@@ -240,6 +240,36 @@ impl MultiHeadAttention {
         &self.b_q
     }
 
+    /// SGD update: `w -= lr * grad` を全 8 tensor に適用する (Q/K/V/O weight + bias)。
+    pub fn apply_sgd(&mut self, grads: &MhaGrads, lr: f32) {
+        for (w, g) in self.w_q.iter_mut().zip(&grads.w_q) {
+            *w -= lr * g;
+        }
+        for (w, g) in self.w_k.iter_mut().zip(&grads.w_k) {
+            *w -= lr * g;
+        }
+        for (w, g) in self.w_v.iter_mut().zip(&grads.w_v) {
+            *w -= lr * g;
+        }
+        for (w, g) in self.w_o.iter_mut().zip(&grads.w_o) {
+            *w -= lr * g;
+        }
+        if self.config.bias {
+            for (b, g) in self.b_q.iter_mut().zip(&grads.b_q) {
+                *b -= lr * g;
+            }
+            for (b, g) in self.b_k.iter_mut().zip(&grads.b_k) {
+                *b -= lr * g;
+            }
+            for (b, g) in self.b_v.iter_mut().zip(&grads.b_v) {
+                *b -= lr * g;
+            }
+            for (b, g) in self.b_o.iter_mut().zip(&grads.b_o) {
+                *b -= lr * g;
+            }
+        }
+    }
+
     /// self-attention forward (Q=K=V=input)。
     ///
     /// # Errors

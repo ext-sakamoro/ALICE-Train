@@ -23,6 +23,7 @@ pub mod dataset;
 pub mod fastspeech2;
 pub mod loss;
 pub mod primitives;
+pub mod tts_trainer;
 
 pub use audio::AudioFeatureExtractor;
 pub use batch::{TtsBatch, TtsBatchError};
@@ -35,3 +36,4 @@ pub use primitives::{
     PosEncError, RotaryEmbedding, RotaryEmbeddingConfig, SinusoidalPositionalEncoding,
     SinusoidalPositionalEncodingConfig, WeightNorm, WeightNormConfig, WeightNormError,
 };
+pub use tts_trainer::{TtsStepResult, TtsTrainConfig, TtsTrainer};

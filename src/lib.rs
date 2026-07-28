@@ -160,7 +160,8 @@ pub use tts::{
     MultiHeadAttentionConfig, PosEncError, ProsodyLoss, ProsodyLossError, ProsodyPrediction,
     ProsodyTarget, RotaryEmbedding, RotaryEmbeddingConfig, SinusoidalPositionalEncoding,
     SinusoidalPositionalEncodingConfig, TtsBatch, TtsBatchError, TtsDataset, TtsDatasetError,
-    TtsManifestEntry, WeightNorm, WeightNormConfig, WeightNormError,
+    TtsManifestEntry, TtsStepResult, TtsTrainConfig, TtsTrainer, WeightNorm, WeightNormConfig,
+    WeightNormError,
 };
 
 // GPU re-exports

@@ -1334,6 +1334,125 @@ impl FastSpeech2 {
 
         Ok(grads)
     }
+
+    /// SGD update: `w -= lr * grad` を全 sub-layer weight + bias に適用する。
+    ///
+    /// Variance predictor + pitch/energy embed は backward_full で grad が 0 になっているため
+    /// (MVP 制約: forward で使用してない) 更新しても影響なし。
+    pub fn apply_sgd(&mut self, grads: &FastSpeech2Grads, lr: f32) {
+        // Embedding
+        for (w, g) in self.embedding.iter_mut().zip(&grads.embedding) {
+            *w -= lr * g;
+        }
+        // Encoder FftBlocks
+        for (block, bg) in self.encoder.iter_mut().zip(&grads.encoder) {
+            apply_fft_block_sgd(block, bg, lr);
+        }
+        // Decoder FftBlocks
+        for (block, bg) in self.decoder.iter_mut().zip(&grads.decoder) {
+            apply_fft_block_sgd(block, bg, lr);
+        }
+        // mel_linear
+        for (w, g) in self
+            .mel_linear
+            .weight_mut()
+            .iter_mut()
+            .zip(&grads.mel_linear_w)
+        {
+            *w -= lr * g;
+        }
+        for (b, g) in self
+            .mel_linear
+            .bias_mut()
+            .iter_mut()
+            .zip(&grads.mel_linear_b)
+        {
+            *b -= lr * g;
+        }
+        // Postnet
+        for (i, conv) in self.postnet.iter_mut().enumerate() {
+            for (w, g) in conv.weight_mut().iter_mut().zip(&grads.postnet_w[i]) {
+                *w -= lr * g;
+            }
+            for (b, g) in conv.bias_mut().iter_mut().zip(&grads.postnet_b[i]) {
+                *b -= lr * g;
+            }
+        }
+    }
+}
+
+/// FftBlock SGD update helper (private struct のため同 module 内 helper)。
+fn apply_fft_block_sgd(block: &mut FftBlock, grads: &FftBlockGrads, lr: f32) {
+    // MHA
+    block.self_attn.apply_sgd(&grads.mha, lr);
+    // attn_norm
+    for (w, g) in block
+        .attn_norm
+        .gamma_mut()
+        .iter_mut()
+        .zip(&grads.attn_norm_gamma)
+    {
+        *w -= lr * g;
+    }
+    for (b, g) in block
+        .attn_norm
+        .beta_mut()
+        .iter_mut()
+        .zip(&grads.attn_norm_beta)
+    {
+        *b -= lr * g;
+    }
+    // ffn_conv1
+    for (w, g) in block
+        .ffn_conv1
+        .weight_mut()
+        .iter_mut()
+        .zip(&grads.ffn_conv1_w)
+    {
+        *w -= lr * g;
+    }
+    for (b, g) in block
+        .ffn_conv1
+        .bias_mut()
+        .iter_mut()
+        .zip(&grads.ffn_conv1_b)
+    {
+        *b -= lr * g;
+    }
+    // ffn_conv2
+    for (w, g) in block
+        .ffn_conv2
+        .weight_mut()
+        .iter_mut()
+        .zip(&grads.ffn_conv2_w)
+    {
+        *w -= lr * g;
+    }
+    for (b, g) in block
+        .ffn_conv2
+        .bias_mut()
+        .iter_mut()
+        .zip(&grads.ffn_conv2_b)
+    {
+        *b -= lr * g;
+    }
+    // ffn_norm
+    for (w, g) in block
+        .ffn_norm
+        .gamma_mut()
+        .iter_mut()
+        .zip(&grads.ffn_norm_gamma)
+    {
+        *w -= lr * g;
+    }
+    for (b, g) in block
+        .ffn_norm
+        .beta_mut()
+        .iter_mut()
+        .zip(&grads.ffn_norm_beta)
+    {
+        *b -= lr * g;
+    }
 }
 
 /// FastSpeech2 backward で返される weight/bias 勾配 bundle (Phase 3 完全版)。
