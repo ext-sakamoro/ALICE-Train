@@ -497,6 +497,192 @@ impl VariancePredictor {
             .forward(&norm2_out, batch * seq_len)
             .expect("linear")
     }
+
+    /// backward: `grad_output[batch, seq_len]` (or flat [batch*seq_len, 1] 同一 memory)
+    /// → `(grad_input[batch, seq_len, hidden], VariancePredictorGrads)`。
+    ///
+    /// Forward 再計算 + reverse chain (Linear → norm2 → ReLU2 → conv2 → norm1 → ReLU1 → conv1)。
+    #[allow(dead_code)] // Phase T.4a 継続で backward_full から呼ばれる
+    fn backward(
+        &self,
+        input: &[f32],
+        grad_output: &[f32],
+        batch: usize,
+        seq_len: usize,
+    ) -> (Vec<f32>, VariancePredictorGrads) {
+        let h = self.conv1.config().in_channels;
+        let ph = self.conv1.config().out_channels;
+
+        // === Forward 再計算 (intermediate 保存) ===
+        let reshaped = reshape_time_last_to_channel_first(input, batch, seq_len, h);
+        let conv1_out = self
+            .conv1
+            .forward(&reshaped, batch, seq_len)
+            .expect("conv1 fw");
+        let conv1_relu: Vec<f32> = conv1_out.iter().map(|&x| x.max(0.0)).collect();
+        let mut norm1_in = vec![0.0_f32; batch * seq_len * ph];
+        for b in 0..batch {
+            for t in 0..seq_len {
+                for c in 0..ph {
+                    norm1_in[b * seq_len * ph + t * ph + c] =
+                        conv1_relu[b * ph * seq_len + c * seq_len + t];
+                }
+            }
+        }
+        let norm1_out = self
+            .norm1
+            .forward(&norm1_in, batch * seq_len)
+            .expect("norm1 fw");
+        let norm1_reshaped = reshape_time_last_to_channel_first(&norm1_out, batch, seq_len, ph);
+        let conv2_out = self
+            .conv2
+            .forward(&norm1_reshaped, batch, seq_len)
+            .expect("conv2 fw");
+        let conv2_relu: Vec<f32> = conv2_out.iter().map(|&x| x.max(0.0)).collect();
+        let mut norm2_in = vec![0.0_f32; batch * seq_len * ph];
+        for b in 0..batch {
+            for t in 0..seq_len {
+                for c in 0..ph {
+                    norm2_in[b * seq_len * ph + t * ph + c] =
+                        conv2_relu[b * ph * seq_len + c * seq_len + t];
+                }
+            }
+        }
+        let norm2_out = self
+            .norm2
+            .forward(&norm2_in, batch * seq_len)
+            .expect("norm2 fw");
+
+        // === Backward chain (reverse) ===
+        // 1. Linear backward
+        let (grad_norm2_out, linear_w_grad, linear_b_grad) = self
+            .linear
+            .backward(&norm2_out, grad_output, batch * seq_len)
+            .expect("linear bw");
+
+        // 2. norm2 backward
+        let (grad_norm2_in, norm2_gamma_grad, norm2_beta_grad) = self
+            .norm2
+            .backward(&norm2_in, &grad_norm2_out, batch * seq_len)
+            .expect("norm2 bw");
+
+        // 3. reshape grad_norm2_in [B*seq_len, ph] → [B, ph, seq_len] for ReLU + conv2 backward
+        let mut grad_conv2_relu = vec![0.0_f32; batch * seq_len * ph];
+        for b in 0..batch {
+            for t in 0..seq_len {
+                for c in 0..ph {
+                    grad_conv2_relu[b * ph * seq_len + c * seq_len + t] =
+                        grad_norm2_in[b * seq_len * ph + t * ph + c];
+                }
+            }
+        }
+
+        // 4. ReLU 2 backward: grad_conv2_out = grad_conv2_relu * (conv2_out > 0)
+        let grad_conv2_out: Vec<f32> = grad_conv2_relu
+            .iter()
+            .zip(&conv2_out)
+            .map(|(g, &pre)| if pre > 0.0 { *g } else { 0.0 })
+            .collect();
+
+        // 5. conv2 backward
+        let (grad_norm1_reshaped, conv2_w_grad, conv2_b_grad) = self
+            .conv2
+            .backward(&norm1_reshaped, &grad_conv2_out, batch, seq_len)
+            .expect("conv2 bw");
+
+        // 6. reshape grad_norm1_reshaped [B, ph, seq_len] → [B*seq_len, ph]
+        let mut grad_norm1_out = vec![0.0_f32; batch * seq_len * ph];
+        for b in 0..batch {
+            for t in 0..seq_len {
+                for c in 0..ph {
+                    grad_norm1_out[b * seq_len * ph + t * ph + c] =
+                        grad_norm1_reshaped[b * ph * seq_len + c * seq_len + t];
+                }
+            }
+        }
+
+        // 7. norm1 backward
+        let (grad_norm1_in, norm1_gamma_grad, norm1_beta_grad) = self
+            .norm1
+            .backward(&norm1_in, &grad_norm1_out, batch * seq_len)
+            .expect("norm1 bw");
+
+        // 8. reshape grad_norm1_in [B*seq_len, ph] → [B, ph, seq_len] for ReLU + conv1 backward
+        let mut grad_conv1_relu = vec![0.0_f32; batch * seq_len * ph];
+        for b in 0..batch {
+            for t in 0..seq_len {
+                for c in 0..ph {
+                    grad_conv1_relu[b * ph * seq_len + c * seq_len + t] =
+                        grad_norm1_in[b * seq_len * ph + t * ph + c];
+                }
+            }
+        }
+
+        // 9. ReLU 1 backward
+        let grad_conv1_out: Vec<f32> = grad_conv1_relu
+            .iter()
+            .zip(&conv1_out)
+            .map(|(g, &pre)| if pre > 0.0 { *g } else { 0.0 })
+            .collect();
+
+        // 10. conv1 backward
+        let (grad_reshaped_input, conv1_w_grad, conv1_b_grad) = self
+            .conv1
+            .backward(&reshaped, &grad_conv1_out, batch, seq_len)
+            .expect("conv1 bw");
+
+        // 11. reshape grad_reshaped_input [B, h, seq_len] → [B, seq_len, h]
+        let mut grad_input = vec![0.0_f32; batch * seq_len * h];
+        for b in 0..batch {
+            for t in 0..seq_len {
+                for c in 0..h {
+                    grad_input[b * seq_len * h + t * h + c] =
+                        grad_reshaped_input[b * h * seq_len + c * seq_len + t];
+                }
+            }
+        }
+
+        (
+            grad_input,
+            VariancePredictorGrads {
+                conv1_w: conv1_w_grad,
+                conv1_b: conv1_b_grad,
+                norm1_gamma: norm1_gamma_grad,
+                norm1_beta: norm1_beta_grad,
+                conv2_w: conv2_w_grad,
+                conv2_b: conv2_b_grad,
+                norm2_gamma: norm2_gamma_grad,
+                norm2_beta: norm2_beta_grad,
+                linear_w: linear_w_grad,
+                linear_b: linear_b_grad,
+            },
+        )
+    }
+}
+
+/// VariancePredictor backward で返される sub-layer 勾配 bundle。
+#[derive(Clone, Debug, Default)]
+pub struct VariancePredictorGrads {
+    /// Conv1 weight 勾配。
+    pub conv1_w: Vec<f32>,
+    /// Conv1 bias 勾配。
+    pub conv1_b: Vec<f32>,
+    /// norm1 gamma 勾配。
+    pub norm1_gamma: Vec<f32>,
+    /// norm1 beta 勾配。
+    pub norm1_beta: Vec<f32>,
+    /// Conv2 weight 勾配。
+    pub conv2_w: Vec<f32>,
+    /// Conv2 bias 勾配。
+    pub conv2_b: Vec<f32>,
+    /// norm2 gamma 勾配。
+    pub norm2_gamma: Vec<f32>,
+    /// norm2 beta 勾配。
+    pub norm2_beta: Vec<f32>,
+    /// Linear weight 勾配。
+    pub linear_w: Vec<f32>,
+    /// Linear bias 勾配。
+    pub linear_b: Vec<f32>,
 }
 
 /// reshape `[batch, seq_len, channels]` → `[batch, channels, seq_len]` for Conv1D input。
@@ -992,27 +1178,190 @@ impl FastSpeech2 {
                 reason: format!("mel_linear backward: {e}"),
             })?;
 
-        // Bundle grads (encoder/decoder/variance は 0 埋め、Phase T.4a 継続で埋める)
-        let grads = FastSpeech2Grads {
-            embedding: vec![0.0; self.embedding.len()],
-            mel_linear_w: grad_mel_w,
-            mel_linear_b: grad_mel_b,
-            postnet_w: postnet_w_grads,
-            postnet_b: postnet_b_grads,
-        };
+        // Bundle grads (encoder/decoder/variance/embed 系は 0 埋め、backward_full が全埋め)
+        let mut grads = FastSpeech2Grads::zeros_from_config(&self.config);
+        grads.mel_linear_w = grad_mel_w;
+        grads.mel_linear_b = grad_mel_b;
+        grads.postnet_w = postnet_w_grads;
+        grads.postnet_b = postnet_b_grads;
 
         Ok((grads, grad_decoder_out))
     }
+
+    /// FastSpeech2 backward **全 chain 完全版** (Phase 3 完全)。
+    ///
+    /// backward_terminal に加えて、decoder FFT block chain → Length Regulator →
+    /// encoder FFT block chain → embedding backward の完全 chain を実装。
+    /// pitch/energy embed は forward MVP で使用されていないため grad は 0 埋め。
+    /// Variance predictor (duration/pitch/energy) は forward output を hidden に反映しないため
+    /// (MVP 制約)、backward chain 上 grad は 0 のまま。予測誤差 loss を別途追加する場合は
+    /// ProsodyLoss + variance predictor の直接 backward を chain 外で計算する設計。
+    ///
+    /// # 引数
+    ///
+    /// - `mora_ids`: `[batch, mora_len]`
+    /// - `target_durations`: `[batch, mora_len]` (frame 単位)
+    /// - `grad_mel`: `[batch, frame_len, mel_dim]`
+    ///
+    /// # 戻り値
+    ///
+    /// [`FastSpeech2Grads`] 完全埋め (embedding + encoder + decoder + mel_linear + postnet)。
+    ///
+    /// # Errors
+    ///
+    /// shape 不整合。
+    pub fn backward_full(
+        &self,
+        mora_ids: &[u32],
+        target_durations: &[u32],
+        grad_mel: &[f32],
+        batch: usize,
+        mora_len: usize,
+    ) -> Result<FastSpeech2Grads, FastSpeech2Error> {
+        let cfg = self.config;
+
+        // Step 1: backward_terminal で Postnet + mel_linear → grad_decoder_out を取得
+        let (mut grads, grad_decoder_out) =
+            self.backward_terminal(mora_ids, target_durations, grad_mel, batch, mora_len)?;
+
+        // frame_len は grad_decoder_out.len() から逆算
+        let frame_len = grad_decoder_out.len() / (batch * cfg.hidden_dim);
+
+        // Step 2: Decoder FftBlock chain backward (逆順)
+        // 各 block の input が必要 → forward 再計算で intermediates 取得
+        let mut decoder_inputs: Vec<Vec<f32>> = Vec::with_capacity(cfg.num_decoder_layers);
+
+        // 再計算: mora_ids → embedded → encoder_pe → encoder blocks → LR → decoder_pe → decoder blocks
+        let mut embedded = vec![0.0_f32; batch * mora_len * cfg.hidden_dim];
+        for b in 0..batch {
+            for t in 0..mora_len {
+                let id = mora_ids[b * mora_len + t] as usize;
+                let src = &self.embedding[id * cfg.hidden_dim..(id + 1) * cfg.hidden_dim];
+                let dst_start = b * mora_len * cfg.hidden_dim + t * cfg.hidden_dim;
+                embedded[dst_start..dst_start + cfg.hidden_dim].copy_from_slice(src);
+            }
+        }
+        let encoder_pe_out = self
+            .encoder_pos_enc
+            .forward(&embedded, batch, mora_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("encoder PE fw: {e}"),
+            })?;
+        // encoder inputs cache
+        let mut encoder_inputs: Vec<Vec<f32>> = Vec::with_capacity(cfg.num_encoder_layers);
+        let mut encoder_current = encoder_pe_out;
+        for block in &self.encoder {
+            encoder_inputs.push(encoder_current.clone());
+            encoder_current = block.forward(&encoder_current, batch, mora_len);
+        }
+        let encoder_out = encoder_current;
+
+        // LR forward
+        let (expanded, _) = length_regulator(
+            &encoder_out,
+            batch,
+            mora_len,
+            cfg.hidden_dim,
+            target_durations,
+        );
+        // decoder PE + blocks
+        let decoder_pe_out = self
+            .decoder_pos_enc
+            .forward(&expanded, batch, frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("decoder PE fw: {e}"),
+            })?;
+        let mut decoder_current = decoder_pe_out;
+        for block in &self.decoder {
+            decoder_inputs.push(decoder_current.clone());
+            decoder_current = block.forward(&decoder_current, batch, frame_len);
+        }
+
+        // Step 3: Decoder FftBlock chain backward (reverse)
+        let mut grad_current = grad_decoder_out;
+        for i in (0..cfg.num_decoder_layers).rev() {
+            let (grad_in, fft_grads) =
+                self.decoder[i].backward(&decoder_inputs[i], &grad_current, batch, frame_len);
+            grads.decoder[i] = fft_grads;
+            grad_current = grad_in;
+        }
+
+        // Step 4: Decoder PE backward = pass-through
+        let grad_expanded = self
+            .decoder_pos_enc
+            .backward(&grad_current, batch, frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("decoder PE bw: {e}"),
+            })?;
+
+        // Step 5: Length Regulator backward
+        let grad_encoder_out = length_regulator_backward(
+            &grad_expanded,
+            batch,
+            mora_len,
+            cfg.hidden_dim,
+            target_durations,
+        );
+
+        // Step 6: Encoder FftBlock chain backward (reverse)
+        // Note: variance predictor + pitch/energy embed は forward MVP で使用してないため
+        // grad_encoder_out に何も足さない (grad = 0 で通過)
+        let mut grad_current = grad_encoder_out;
+        for i in (0..cfg.num_encoder_layers).rev() {
+            let (grad_in, fft_grads) =
+                self.encoder[i].backward(&encoder_inputs[i], &grad_current, batch, mora_len);
+            grads.encoder[i] = fft_grads;
+            grad_current = grad_in;
+        }
+
+        // Step 7: Encoder PE backward = pass-through
+        let grad_embedded = self
+            .encoder_pos_enc
+            .backward(&grad_current, batch, mora_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("encoder PE bw: {e}"),
+            })?;
+
+        // Step 8: Embedding backward
+        grads.embedding = embedding_backward(
+            &grad_embedded,
+            mora_ids,
+            cfg.vocab_size,
+            cfg.hidden_dim,
+            batch,
+            mora_len,
+        );
+
+        Ok(grads)
+    }
 }
 
-/// FastSpeech2 backward で返される weight/bias 勾配 bundle (Phase 1: terminal-only)。
+/// FastSpeech2 backward で返される weight/bias 勾配 bundle (Phase 3 完全版)。
 ///
-/// 現 Phase 1 では mel_linear + postnet の勾配のみ埋まる。encoder / decoder / variance predictor
-/// の勾配は Phase T.4a 継続で追加予定 (現状は本 struct に field なし = 未 return)。
+/// `backward_terminal` は postnet + mel_linear のみ埋め、encoder / decoder / variance / embed
+/// 系は shape 正しい 0 埋め。`backward_full` は全 field を埋める (Phase 3 対応)。
 #[derive(Clone, Debug)]
 pub struct FastSpeech2Grads {
-    /// Embedding table `[vocab_size, hidden_dim]` の勾配 (現 Phase 1 は 0 埋め)。
+    /// Embedding table `[vocab_size, hidden_dim]` の勾配。
     pub embedding: Vec<f32>,
+    /// Encoder FFT block 各層の勾配。
+    pub encoder: Vec<FftBlockGrads>,
+    /// Duration predictor の勾配。
+    pub duration_predictor: VariancePredictorGrads,
+    /// Pitch predictor の勾配。
+    pub pitch_predictor: VariancePredictorGrads,
+    /// Energy predictor の勾配。
+    pub energy_predictor: VariancePredictorGrads,
+    /// pitch_embed Conv1D weight 勾配。
+    pub pitch_embed_w: Vec<f32>,
+    /// pitch_embed Conv1D bias 勾配。
+    pub pitch_embed_b: Vec<f32>,
+    /// energy_embed Conv1D weight 勾配。
+    pub energy_embed_w: Vec<f32>,
+    /// energy_embed Conv1D bias 勾配。
+    pub energy_embed_b: Vec<f32>,
+    /// Decoder FFT block 各層の勾配。
+    pub decoder: Vec<FftBlockGrads>,
     /// mel_linear weight `[mel_dim, hidden_dim]` の勾配。
     pub mel_linear_w: Vec<f32>,
     /// mel_linear bias `[mel_dim]` の勾配。
@@ -1021,6 +1370,90 @@ pub struct FastSpeech2Grads {
     pub postnet_w: Vec<Vec<f32>>,
     /// Postnet 各層 Conv1D bias の勾配。
     pub postnet_b: Vec<Vec<f32>>,
+}
+
+impl FastSpeech2Grads {
+    /// model の shape に合わせて zero 初期化した grads を返す (backward で埋めていく用)。
+    #[must_use]
+    fn zeros_from_config(cfg: &FastSpeech2Config) -> Self {
+        let ph = cfg.predictor_hidden;
+        let h = cfg.hidden_dim;
+        let mel = cfg.mel_dim;
+        let vp_zeros = || VariancePredictorGrads {
+            conv1_w: vec![0.0; ph * h * cfg.predictor_kernel_size],
+            conv1_b: vec![0.0; ph],
+            norm1_gamma: vec![0.0; ph],
+            norm1_beta: vec![0.0; ph],
+            conv2_w: vec![0.0; ph * ph * cfg.predictor_kernel_size],
+            conv2_b: vec![0.0; ph],
+            norm2_gamma: vec![0.0; ph],
+            norm2_beta: vec![0.0; ph],
+            linear_w: vec![0.0; ph],
+            linear_b: vec![0.0; 1],
+        };
+        let mid = h * cfg.fft_expansion;
+        let fft_zeros = || FftBlockGrads {
+            mha: crate::tts::MhaGrads {
+                w_q: vec![0.0; h * h],
+                w_k: vec![0.0; h * h],
+                w_v: vec![0.0; h * h],
+                w_o: vec![0.0; h * h],
+                b_q: vec![0.0; h],
+                b_k: vec![0.0; h],
+                b_v: vec![0.0; h],
+                b_o: vec![0.0; h],
+            },
+            attn_norm_gamma: vec![0.0; h],
+            attn_norm_beta: vec![0.0; h],
+            ffn_conv1_w: vec![0.0; mid * h * cfg.fft_kernel_size],
+            ffn_conv1_b: vec![0.0; mid],
+            ffn_conv2_w: vec![0.0; h * mid * cfg.fft_kernel_size],
+            ffn_conv2_b: vec![0.0; h],
+            ffn_norm_gamma: vec![0.0; h],
+            ffn_norm_beta: vec![0.0; h],
+        };
+
+        // Postnet weight shapes (per-layer)
+        let postnet_w: Vec<Vec<f32>> = (0..cfg.postnet_layers)
+            .map(|i| {
+                let (in_ch, out_ch) = if i == 0 {
+                    (mel, cfg.postnet_hidden)
+                } else if i == cfg.postnet_layers - 1 {
+                    (cfg.postnet_hidden, mel)
+                } else {
+                    (cfg.postnet_hidden, cfg.postnet_hidden)
+                };
+                vec![0.0; out_ch * in_ch * cfg.postnet_kernel_size]
+            })
+            .collect();
+        let postnet_b: Vec<Vec<f32>> = (0..cfg.postnet_layers)
+            .map(|i| {
+                let out_ch = if i == cfg.postnet_layers - 1 {
+                    mel
+                } else {
+                    cfg.postnet_hidden
+                };
+                vec![0.0; out_ch]
+            })
+            .collect();
+
+        Self {
+            embedding: vec![0.0; cfg.vocab_size * h],
+            encoder: (0..cfg.num_encoder_layers).map(|_| fft_zeros()).collect(),
+            duration_predictor: vp_zeros(),
+            pitch_predictor: vp_zeros(),
+            energy_predictor: vp_zeros(),
+            pitch_embed_w: vec![0.0; h],
+            pitch_embed_b: vec![0.0; h],
+            energy_embed_w: vec![0.0; h],
+            energy_embed_b: vec![0.0; h],
+            decoder: (0..cfg.num_decoder_layers).map(|_| fft_zeros()).collect(),
+            mel_linear_w: vec![0.0; mel * h],
+            mel_linear_b: vec![0.0; mel],
+            postnet_w,
+            postnet_b,
+        }
+    }
 }
 
 /// Length Regulator: mora hidden `[B, mora_len, hidden]` を duration に従って frame 単位に展開する。
@@ -1056,6 +1489,75 @@ fn length_regulator(
     }
 
     (out, per_batch_frames)
+}
+
+/// Length Regulator backward: `grad_expanded[B, max_frame, hidden]` を duration に従って mora-level に還元する。
+///
+/// forward で 1 mora を duration frame に copy-broadcast したので、backward では
+/// 対応する duration frame の grad を **加算合計** して mora-level grad に戻す。
+///
+/// # 戻り値
+///
+/// `Vec<f32>[batch * mora_len * hidden_dim]` の grad_hidden (forward 前の encoder 出力への grad)。
+fn length_regulator_backward(
+    grad_expanded: &[f32],
+    batch: usize,
+    mora_len: usize,
+    hidden_dim: usize,
+    durations: &[u32],
+) -> Vec<f32> {
+    let max_frames = if batch * hidden_dim == 0 {
+        0
+    } else {
+        grad_expanded.len() / (batch * hidden_dim)
+    };
+    let mut grad_hidden = vec![0.0_f32; batch * mora_len * hidden_dim];
+
+    for b in 0..batch {
+        let mut frame_cursor = 0_usize;
+        for m in 0..mora_len {
+            let dur = durations[b * mora_len + m] as usize;
+            let dst_start = b * mora_len * hidden_dim + m * hidden_dim;
+            for _ in 0..dur {
+                let src_start = b * max_frames * hidden_dim + frame_cursor * hidden_dim;
+                for c in 0..hidden_dim {
+                    grad_hidden[dst_start + c] += grad_expanded[src_start + c];
+                }
+                frame_cursor += 1;
+            }
+        }
+    }
+
+    grad_hidden
+}
+
+/// Embedding backward: `grad_embedded[B, mora_len, hidden]` を mora_id ごとに accumulate して
+/// `grad_embedding_table[vocab_size, hidden]` に還元する。
+///
+/// forward は embedding lookup (grad copy per mora_id) → backward は同じ id で足し込み。
+fn embedding_backward(
+    grad_embedded: &[f32],
+    mora_ids: &[u32],
+    vocab_size: usize,
+    hidden_dim: usize,
+    batch: usize,
+    mora_len: usize,
+) -> Vec<f32> {
+    let mut grad_embedding = vec![0.0_f32; vocab_size * hidden_dim];
+    for b in 0..batch {
+        for m in 0..mora_len {
+            let id = mora_ids[b * mora_len + m] as usize;
+            if id >= vocab_size {
+                continue;
+            }
+            let src_start = b * mora_len * hidden_dim + m * hidden_dim;
+            let dst_start = id * hidden_dim;
+            for c in 0..hidden_dim {
+                grad_embedding[dst_start + c] += grad_embedded[src_start + c];
+            }
+        }
+    }
+    grad_embedding
 }
 
 /// FastSpeech2 操作で発生し得るエラー。
@@ -1348,5 +1850,108 @@ mod tests {
             .backward_terminal(&mora_ids, &durations, &grad_mel, 1, 3)
             .expect_err("shape mismatch");
         assert!(matches!(err, FastSpeech2Error::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn backward_full_returns_correct_shapes_for_all_grads() {
+        let cfg = small_config();
+        let model = FastSpeech2::zeros(cfg).unwrap();
+        let mora_ids: Vec<u32> = vec![1, 2, 3];
+        let durations: Vec<u32> = vec![2, 2, 2];
+        let grad_mel = vec![1.0_f32; 6 * cfg.mel_dim];
+
+        let grads = model
+            .backward_full(&mora_ids, &durations, &grad_mel, 1, 3)
+            .expect("backward_full");
+
+        assert_eq!(grads.embedding.len(), cfg.vocab_size * cfg.hidden_dim);
+        assert_eq!(grads.encoder.len(), cfg.num_encoder_layers);
+        assert_eq!(grads.decoder.len(), cfg.num_decoder_layers);
+        for enc in &grads.encoder {
+            assert_eq!(enc.attn_norm_gamma.len(), cfg.hidden_dim);
+            assert_eq!(enc.ffn_norm_gamma.len(), cfg.hidden_dim);
+            assert_eq!(enc.mha.w_q.len(), cfg.hidden_dim * cfg.hidden_dim);
+        }
+        assert_eq!(
+            grads.duration_predictor.conv1_w.len(),
+            cfg.predictor_hidden * cfg.hidden_dim * cfg.predictor_kernel_size
+        );
+        assert_eq!(grads.pitch_embed_w.len(), cfg.hidden_dim);
+        assert_eq!(grads.mel_linear_w.len(), cfg.mel_dim * cfg.hidden_dim);
+        assert_eq!(grads.postnet_w.len(), cfg.postnet_layers);
+    }
+
+    #[test]
+    fn backward_full_grads_are_finite() {
+        let cfg = small_config();
+        let model = FastSpeech2::zeros(cfg).unwrap();
+        let mora_ids: Vec<u32> = vec![1, 2, 3];
+        let durations: Vec<u32> = vec![2, 2, 2];
+        let grad_mel = vec![1.0_f32; 6 * cfg.mel_dim];
+        let grads = model
+            .backward_full(&mora_ids, &durations, &grad_mel, 1, 3)
+            .expect("backward_full");
+        for &v in &grads.embedding {
+            assert!(v.is_finite());
+        }
+        for enc in &grads.encoder {
+            for &v in &enc.mha.w_q {
+                assert!(v.is_finite());
+            }
+        }
+    }
+
+    #[test]
+    fn length_regulator_backward_sums_by_duration() {
+        // mora = 2, hidden = 2, duration = [2, 3], expanded = 5 frames
+        // grad_expanded = [1,2, 3,4, 5,6, 7,8, 9,10]
+        // grad_hidden expected: mora 0 = [1+3, 2+4] = [4, 6]、mora 1 = [5+7+9, 6+8+10] = [21, 24]
+        let grad_expanded = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        let durations = vec![2_u32, 3];
+        let grad_hidden = length_regulator_backward(&grad_expanded, 1, 2, 2, &durations);
+        assert_eq!(grad_hidden.len(), 4);
+        assert!((grad_hidden[0] - 4.0).abs() < 1e-6);
+        assert!((grad_hidden[1] - 6.0).abs() < 1e-6);
+        assert!((grad_hidden[2] - 21.0).abs() < 1e-6);
+        assert!((grad_hidden[3] - 24.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn embedding_backward_accumulates_by_id() {
+        // vocab=4, hidden=2, mora_ids=[1, 2, 1]
+        // grad_embedded = [1,2, 3,4, 5,6]
+        // grad_embedding: id 1: [1+5, 2+6] = [6, 8]、id 2: [3, 4]
+        let grad_embedded = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mora_ids = vec![1_u32, 2, 1];
+        let grad_emb = embedding_backward(&grad_embedded, &mora_ids, 4, 2, 1, 3);
+        assert_eq!(grad_emb.len(), 8);
+        assert!((grad_emb[0]).abs() < 1e-6);
+        assert!((grad_emb[1]).abs() < 1e-6);
+        assert!((grad_emb[2] - 6.0).abs() < 1e-6);
+        assert!((grad_emb[3] - 8.0).abs() < 1e-6);
+        assert!((grad_emb[4] - 3.0).abs() < 1e-6);
+        assert!((grad_emb[5] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn variance_predictor_backward_returns_correct_shapes() {
+        let cfg = small_config();
+        let predictor = VariancePredictor::zeros(cfg.hidden_dim, cfg.predictor_hidden, 3);
+        let batch = 1;
+        let seq_len = 5;
+        let input: Vec<f32> = (0..batch * seq_len * cfg.hidden_dim)
+            .map(|i| (i as f32 * 0.1).sin())
+            .collect();
+        let grad_output: Vec<f32> = (0..batch * seq_len)
+            .map(|i| (i as f32 * 0.2).cos())
+            .collect();
+        let (grad_input, grads) = predictor.backward(&input, &grad_output, batch, seq_len);
+        assert_eq!(grad_input.len(), batch * seq_len * cfg.hidden_dim);
+        assert_eq!(
+            grads.conv1_w.len(),
+            cfg.predictor_hidden * cfg.hidden_dim * 3
+        );
+        assert_eq!(grads.linear_w.len(), cfg.predictor_hidden);
+        assert_eq!(grads.linear_b.len(), 1);
     }
 }
