@@ -314,6 +314,11 @@ impl Conv1d {
             });
         }
 
+        // Phase T.4d-A: im2col + BLAS fast path (groups=1 case は FastSpeech2 で dominant)
+        if cfg.groups == 1 {
+            return Ok(self.forward_im2col(input, batch, in_len, out_len));
+        }
+
         let in_ch_per_group = cfg.in_channels / cfg.groups;
         let out_ch_per_group = cfg.out_channels / cfg.groups;
 
@@ -363,6 +368,166 @@ impl Conv1d {
         Ok(output)
     }
 
+    /// Phase T.4d-A: im2col + BLAS forward fast path (groups=1 のみ)。
+    ///
+    /// im2col で input を [batch * out_len, in_ch * k] に unfold し、
+    /// weight [out_ch, in_ch * k] と blas_matmul_bt で一気に計算する。
+    /// naive triple loop の 3-5× 高速化 (BLAS/CUDA 経由)。
+    fn forward_im2col(&self, input: &[f32], batch: usize, in_len: usize, out_len: usize) -> Vec<f32> {
+        let cfg = &self.config;
+        let in_ch = cfg.in_channels;
+        let out_ch = cfg.out_channels;
+        let k = cfg.kernel_size;
+        let col_rows = batch * out_len;
+        let col_cols = in_ch * k;
+
+        // im2col: [batch * out_len, in_ch * k]
+        let mut col = vec![0.0_f32; col_rows * col_cols];
+        for b in 0..batch {
+            let input_batch_offset = b * in_ch * in_len;
+            for t_out in 0..out_len {
+                let col_row_offset = (b * out_len + t_out) * col_cols;
+                for c_in in 0..in_ch {
+                    for kk in 0..k {
+                        let t_offset = t_out * cfg.stride + kk * cfg.dilation;
+                        let Some(t_in) = t_offset.checked_sub(cfg.padding) else {
+                            continue;
+                        };
+                        if t_in >= in_len {
+                            continue;
+                        }
+                        col[col_row_offset + c_in * k + kk] =
+                            input[input_batch_offset + c_in * in_len + t_in];
+                    }
+                }
+            }
+        }
+
+        // matmul: output_2d[col_rows, out_ch] = col[col_rows, col_cols] × weight[out_ch, col_cols]^T
+        let mut output_2d = vec![0.0_f32; col_rows * out_ch];
+        crate::blas::blas_matmul_bt(&col, &self.weight, &mut output_2d, col_rows, out_ch, col_cols);
+
+        // rearrange output_2d [batch, out_len, out_ch] → output [batch, out_ch, out_len]
+        let mut output = vec![0.0_f32; col_rows * out_ch];
+        for b in 0..batch {
+            for t_out in 0..out_len {
+                let src = (b * out_len + t_out) * out_ch;
+                for c_out in 0..out_ch {
+                    let bias_val = if cfg.bias { self.bias[c_out] } else { 0.0 };
+                    output[b * out_ch * out_len + c_out * out_len + t_out] =
+                        output_2d[src + c_out] + bias_val;
+                }
+            }
+        }
+        output
+    }
+
+    /// Phase T.4d-A: im2col + BLAS backward fast path (groups=1 のみ)。
+    fn backward_im2col(
+        &self,
+        input: &[f32],
+        grad_output: &[f32],
+        batch: usize,
+        in_len: usize,
+        out_len: usize,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let cfg = &self.config;
+        let in_ch = cfg.in_channels;
+        let out_ch = cfg.out_channels;
+        let k = cfg.kernel_size;
+        let col_rows = batch * out_len;
+        let col_cols = in_ch * k;
+
+        // im2col の再計算 (forward と同じ)
+        let mut col = vec![0.0_f32; col_rows * col_cols];
+        for b in 0..batch {
+            let input_batch_offset = b * in_ch * in_len;
+            for t_out in 0..out_len {
+                let col_row_offset = (b * out_len + t_out) * col_cols;
+                for c_in in 0..in_ch {
+                    for kk in 0..k {
+                        let t_offset = t_out * cfg.stride + kk * cfg.dilation;
+                        let Some(t_in) = t_offset.checked_sub(cfg.padding) else {
+                            continue;
+                        };
+                        if t_in >= in_len {
+                            continue;
+                        }
+                        col[col_row_offset + c_in * k + kk] =
+                            input[input_batch_offset + c_in * in_len + t_in];
+                    }
+                }
+            }
+        }
+
+        // rearrange grad_output [batch, out_ch, out_len] → grad_output_2d [batch * out_len, out_ch]
+        let mut grad_output_2d = vec![0.0_f32; col_rows * out_ch];
+        for b in 0..batch {
+            for c_out in 0..out_ch {
+                for t_out in 0..out_len {
+                    grad_output_2d[(b * out_len + t_out) * out_ch + c_out] =
+                        grad_output[b * out_ch * out_len + c_out * out_len + t_out];
+                }
+            }
+        }
+
+        // grad_weight[out_ch, col_cols] = grad_output_2d[col_rows, out_ch]^T × col[col_rows, col_cols]
+        let mut grad_weight = vec![0.0_f32; out_ch * col_cols];
+        crate::blas::blas_matmul_tn(
+            &grad_output_2d,
+            &col,
+            &mut grad_weight,
+            out_ch,
+            col_cols,
+            col_rows,
+        );
+
+        // grad_col[col_rows, col_cols] = grad_output_2d[col_rows, out_ch] × weight[out_ch, col_cols]
+        let mut grad_col = vec![0.0_f32; col_rows * col_cols];
+        crate::blas::blas_matmul_nn(
+            &grad_output_2d,
+            &self.weight,
+            &mut grad_col,
+            col_rows,
+            col_cols,
+            out_ch,
+        );
+
+        // col2im: grad_col → grad_input (position 分散加算)
+        let mut grad_input = vec![0.0_f32; batch * in_ch * in_len];
+        for b in 0..batch {
+            let input_batch_offset = b * in_ch * in_len;
+            for t_out in 0..out_len {
+                let col_row_offset = (b * out_len + t_out) * col_cols;
+                for c_in in 0..in_ch {
+                    for kk in 0..k {
+                        let t_offset = t_out * cfg.stride + kk * cfg.dilation;
+                        let Some(t_in) = t_offset.checked_sub(cfg.padding) else {
+                            continue;
+                        };
+                        if t_in >= in_len {
+                            continue;
+                        }
+                        grad_input[input_batch_offset + c_in * in_len + t_in] +=
+                            grad_col[col_row_offset + c_in * k + kk];
+                    }
+                }
+            }
+        }
+
+        // grad_bias[out_ch] = sum over (batch, out_len) of grad_output_2d
+        let mut grad_bias = vec![0.0_f32; out_ch];
+        if cfg.bias {
+            for row in 0..col_rows {
+                for c_out in 0..out_ch {
+                    grad_bias[c_out] += grad_output_2d[row * out_ch + c_out];
+                }
+            }
+        }
+
+        (grad_input, grad_weight, grad_bias)
+    }
+
     /// backward pass — grad_input / grad_weight / grad_bias を計算して返す。
     ///
     /// # 引数
@@ -401,6 +566,11 @@ impl Conv1d {
                 expected: batch * cfg.out_channels * out_len,
                 actual: grad_output.len(),
             });
+        }
+
+        // Phase T.4d-A: im2col + BLAS fast path (groups=1)
+        if cfg.groups == 1 {
+            return Ok(self.backward_im2col(input, grad_output, batch, in_len, out_len));
         }
 
         let in_ch_per_group = cfg.in_channels / cfg.groups;
