@@ -46,6 +46,7 @@
 //! ```
 
 use crate::tts::fastspeech2::{AdamWConfig, FastSpeech2, FastSpeech2AdamWState, FastSpeech2Error};
+use crate::tts::loss::{LossComponents, ProsodyLoss, ProsodyPrediction, ProsodyTarget};
 
 /// Optimizer 種別 (SGD or AdamW)。
 #[derive(Clone, Copy, Debug)]
@@ -88,6 +89,19 @@ pub struct TtsStepResult {
     /// mel L2 loss (mean squared error)。
     pub mel_loss: f32,
     /// step counter (1-indexed、trainer が自動 increment)。
+    pub step: usize,
+}
+
+/// Phase E `step_prosody` の結果 (mel + prosody joint)。
+#[derive(Clone, Copy, Debug)]
+pub struct TtsProsodyStepResult {
+    /// mel L2 loss。
+    pub mel_loss: f32,
+    /// prosody 3 系統の loss 詳細 (`f0_l1` / `duration_mse` / `energy_mse` / total)。
+    pub prosody: LossComponents,
+    /// 総合 loss (mel_loss + prosody.total)。
+    pub total_loss: f32,
+    /// step counter。
     pub step: usize,
 }
 
@@ -161,6 +175,116 @@ impl TtsTrainer {
     #[must_use]
     pub fn step_count(&self) -> usize {
         self.step_count
+    }
+
+    /// `ProsodyLoss` joint step (Phase T.4a Phase E): mel MSE + prosody 3 系統 joint。
+    ///
+    /// forward で mel + prosody prediction を取得し、mel_target + prosody_target で loss 計算、
+    /// backward で variance predictor grad を hidden から取り出し + encoder chain に accumulate、
+    /// optimizer で全 param 更新 (variance predictor 込み)。
+    ///
+    /// AdamW ではまだ variance predictor state が未実装のため、AdamW 選択時も variance predictor
+    /// 更新は SGD 相当 (次 Phase で AdamW state 拡張)。SGD trainer では全 param が SGD 更新。
+    ///
+    /// # 引数
+    ///
+    /// - `mora_ids`: `[batch, mora_len]`
+    /// - `target_durations`: `[batch, mora_len]` (frame 単位、Length Regulator 用)
+    /// - `mel_target`: `[batch, frame_len, mel_dim]`
+    /// - `prosody_target`: mora-level F0/duration/energy target (mask 対応)
+    /// - `prosody_loss_config`: 3 predictor の重み (`w_f0`/`w_duration`/`w_energy`)
+    ///
+    /// # Errors
+    ///
+    /// - shape 不整合 (mel_target / prosody_target と実測 mora_len の食い違い)
+    /// - forward / backward の shape 不整合
+    /// - `prosody_loss_config.compute` からのエラー
+    pub fn step_prosody(
+        &mut self,
+        mora_ids: &[u32],
+        target_durations: &[u32],
+        mel_target: &[f32],
+        prosody_target: &ProsodyTarget,
+        prosody_loss_config: ProsodyLoss,
+        batch: usize,
+        mora_len: usize,
+    ) -> Result<TtsProsodyStepResult, FastSpeech2Error> {
+        // 1. Forward with prosody
+        let (mel_pred, prosody_pred) =
+            self.model
+                .forward_with_prosody(mora_ids, batch, mora_len, target_durations)?;
+        if mel_pred.len() != mel_target.len() {
+            return Err(FastSpeech2Error::ShapeMismatch {
+                field: "mel_target",
+                expected: mel_pred.len(),
+                actual: mel_target.len(),
+            });
+        }
+
+        // 2. mel MSE loss + grad_mel
+        let n = mel_pred.len() as f32;
+        let mut mel_loss_sum = 0.0_f32;
+        let mut grad_mel = vec![0.0_f32; mel_pred.len()];
+        for i in 0..mel_pred.len() {
+            let diff = mel_pred[i] - mel_target[i];
+            mel_loss_sum += diff * diff;
+            grad_mel[i] = 2.0 * diff / n;
+        }
+        let mel_loss = mel_loss_sum / n;
+
+        // 3. Prosody loss (F0 L1 + Duration MSE + Energy MSE, weighted)
+        let prosody_components = prosody_loss_config
+            .compute(&prosody_pred, prosody_target)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("prosody loss: {e}"),
+            })?;
+
+        // 4. Prosody grad (analytical): valid position 数で正規化、mask 有効時は false 位置に grad=0
+        let (grad_dur, grad_pitch, grad_energy) = compute_prosody_grads(
+            &prosody_pred,
+            prosody_target,
+            &prosody_loss_config,
+            batch,
+            mora_len,
+        )?;
+
+        // 5. Backward with prosody
+        let grads = self.model.backward_full_with_prosody(
+            mora_ids,
+            target_durations,
+            &grad_mel,
+            &grad_dur,
+            &grad_pitch,
+            &grad_energy,
+            batch,
+            mora_len,
+        )?;
+
+        // 6. Optimizer step
+        match self.optimizer {
+            TtsOptimizer::Sgd => {
+                self.model.apply_sgd(&grads, self.config.learning_rate);
+            }
+            TtsOptimizer::AdamW(ref adamw_cfg) => {
+                let state = self
+                    .adamw_state
+                    .as_mut()
+                    .expect("AdamW state should be initialized in with_adamw");
+                self.model.apply_adamw(&grads, state, adamw_cfg);
+                // Phase E 現状: AdamW state に variance predictor 未拡張、SGD で fallback 更新
+                self.model
+                    .apply_sgd_variance_only(&grads, self.config.learning_rate);
+            }
+        }
+
+        self.step_count += 1;
+        let total_loss = mel_loss + prosody_components.total;
+        Ok(TtsProsodyStepResult {
+            mel_loss,
+            prosody: prosody_components,
+            total_loss,
+            step: self.step_count,
+        })
     }
 
     /// Variable-length step (Phase T.4a Phase D): batch > 1 + per-sample 長さ対応。
@@ -347,6 +471,81 @@ impl TtsTrainer {
     }
 }
 
+/// Prosody 3 系統の analytical gradient を計算 (Phase E)。
+///
+/// - F0 は L1: `grad_f0[b][m] = w_f0 * sign(pred - target) / count` (valid position のみ)
+/// - Duration / Energy は MSE: `grad = w * 2 * (pred - target) / count`
+///
+/// `count` = valid mora 数 (mask 有効時は true 位置数、else `batch * mora_len`)。
+/// 全 mask false なら grad は全 0 (loss 0 と整合)。
+///
+/// # Errors
+///
+/// - shape 不整合 (pred / target の `[batch][mora_len]`)
+fn compute_prosody_grads(
+    pred: &ProsodyPrediction,
+    target: &ProsodyTarget,
+    loss_cfg: &ProsodyLoss,
+    batch: usize,
+    mora_len: usize,
+) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>), FastSpeech2Error> {
+    if pred.f0.len() != batch || pred.duration_frames.len() != batch || pred.energy.len() != batch {
+        return Err(FastSpeech2Error::ShapeMismatch {
+            field: "prosody pred batch",
+            expected: batch,
+            actual: pred.f0.len(),
+        });
+    }
+    if target.f0.len() != batch
+        || target.duration_frames.len() != batch
+        || target.energy.len() != batch
+    {
+        return Err(FastSpeech2Error::ShapeMismatch {
+            field: "prosody target batch",
+            expected: batch,
+            actual: target.f0.len(),
+        });
+    }
+    let mut count: usize = 0;
+    for b in 0..batch {
+        if pred.f0[b].len() != mora_len {
+            return Err(FastSpeech2Error::ShapeMismatch {
+                field: "prosody pred mora_len",
+                expected: mora_len,
+                actual: pred.f0[b].len(),
+            });
+        }
+        for m in 0..mora_len {
+            let valid = target.mask.as_ref().is_none_or(|mk| mk[b][m]);
+            if valid {
+                count += 1;
+            }
+        }
+    }
+    let count_f = if count == 0 { 1.0_f32 } else { count as f32 };
+    let mut grad_f0 = vec![vec![0.0_f32; mora_len]; batch];
+    let mut grad_dur = vec![vec![0.0_f32; mora_len]; batch];
+    let mut grad_energy = vec![vec![0.0_f32; mora_len]; batch];
+    if count == 0 {
+        return Ok((grad_dur, grad_f0, grad_energy));
+    }
+    for b in 0..batch {
+        for m in 0..mora_len {
+            let valid = target.mask.as_ref().is_none_or(|mk| mk[b][m]);
+            if !valid {
+                continue;
+            }
+            let df = pred.f0[b][m] - target.f0[b][m];
+            grad_f0[b][m] = loss_cfg.w_f0 * df.signum() / count_f;
+            let dd = pred.duration_frames[b][m] - target.duration_frames[b][m];
+            grad_dur[b][m] = loss_cfg.w_duration * 2.0 * dd / count_f;
+            let de = pred.energy[b][m] - target.energy[b][m];
+            grad_energy[b][m] = loss_cfg.w_energy * 2.0 * de / count_f;
+        }
+    }
+    Ok((grad_dur, grad_f0, grad_energy))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +669,87 @@ mod tests {
             prev_loss = result.mel_loss;
         }
         assert_eq!(trainer.step_count(), 5);
+    }
+
+    #[test]
+    fn step_prosody_joint_loss_finite_and_decreases() {
+        // Phase T.4a Phase E smoke test: mel + prosody joint loss (SGD)
+        // 5 step 走らせて mel_loss + prosody.total どちらも finite + step カウンター上昇
+        let cfg = small_config();
+        let mut model = FastSpeech2::zeros(cfg).unwrap();
+        model.init_xavier(456);
+        let mut trainer = TtsTrainer::new(
+            model,
+            TtsTrainConfig {
+                learning_rate: 1e-3,
+                log_interval: 100,
+            },
+        );
+
+        let batch = 1;
+        let mora_len = 3;
+        let mora_ids = vec![1_u32, 2, 3];
+        let durations = vec![2_u32, 2, 2];
+        let mel_target = vec![0.3_f32; 6 * cfg.mel_dim];
+        let prosody_target = ProsodyTarget {
+            f0: vec![vec![120.0, 130.0, 125.0]],
+            duration_frames: vec![vec![2.0, 2.0, 2.0]],
+            energy: vec![vec![-20.0, -18.0, -19.0]],
+            mask: None,
+        };
+        let prosody_cfg = ProsodyLoss::default_weights();
+
+        let mut min_total = f32::MAX;
+        for i in 1..=5 {
+            let result = trainer
+                .step_prosody(
+                    &mora_ids,
+                    &durations,
+                    &mel_target,
+                    &prosody_target,
+                    prosody_cfg,
+                    batch,
+                    mora_len,
+                )
+                .expect("step_prosody");
+            assert!(result.mel_loss.is_finite(), "step {i} mel_loss NaN");
+            assert!(result.prosody.total.is_finite(), "step {i} prosody NaN");
+            assert!(result.total_loss.is_finite(), "step {i} total NaN");
+            assert_eq!(result.step, i);
+            if result.total_loss < min_total {
+                min_total = result.total_loss;
+            }
+        }
+        assert_eq!(trainer.step_count(), 5);
+        assert!(min_total.is_finite());
+    }
+
+    #[test]
+    fn step_prosody_shape_mismatch_returns_error() {
+        let cfg = small_config();
+        let model = FastSpeech2::zeros(cfg).unwrap();
+        let mut trainer = TtsTrainer::new(model, TtsTrainConfig::default());
+        let mora_ids = vec![1_u32, 2, 3];
+        let durations = vec![2_u32, 2, 2];
+        let mel_target = vec![0.0_f32; 100]; // wrong size
+        let prosody_target = ProsodyTarget {
+            f0: vec![vec![120.0, 130.0, 125.0]],
+            duration_frames: vec![vec![2.0, 2.0, 2.0]],
+            energy: vec![vec![-20.0, -18.0, -19.0]],
+            mask: None,
+        };
+        let err = trainer
+            .step_prosody(
+                &mora_ids,
+                &durations,
+                &mel_target,
+                &prosody_target,
+                ProsodyLoss::default_weights(),
+                1,
+                3,
+            )
+            .expect_err("shape mismatch");
+        assert!(matches!(err, FastSpeech2Error::ShapeMismatch { .. }));
     }
 
     #[test]
