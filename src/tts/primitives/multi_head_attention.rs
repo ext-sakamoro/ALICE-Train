@@ -878,7 +878,7 @@ pub struct MhaGrads {
     pub b_o: Vec<f32>,
 }
 
-/// 線形層 forward: `y[m, out] = Σ_in x[m, in] * w[out, in] + b[out]`。
+/// 線形層 forward: `y[m, out] = Σ_in x[m, in] * w[out, in] + b[out]` (Phase T.4b: BLAS 化)。
 fn linear_forward(
     x: &[f32],
     w: &[f32],
@@ -889,19 +889,19 @@ fn linear_forward(
     has_bias: bool,
 ) -> Vec<f32> {
     let mut y = vec![0.0_f32; m * out_dim];
-    for row in 0..m {
-        for o in 0..out_dim {
-            let mut acc = if has_bias { b[o] } else { 0.0 };
-            for i in 0..in_dim {
-                acc += x[row * in_dim + i] * w[o * in_dim + i];
+    // y[m, out] = x[m, in] × w[out, in]^T
+    crate::blas::blas_matmul_bt(x, w, &mut y, m, out_dim, in_dim);
+    if has_bias {
+        for row in 0..m {
+            for o in 0..out_dim {
+                y[row * out_dim + o] += b[o];
             }
-            y[row * out_dim + o] = acc;
         }
     }
     y
 }
 
-/// 線形層 backward: return (grad_x, grad_w, grad_b)。
+/// 線形層 backward: return (grad_x, grad_w, grad_b) (Phase T.4b: BLAS 化)。
 fn linear_backward(
     x: &[f32],
     grad_y: &[f32],
@@ -915,15 +915,14 @@ fn linear_backward(
     let mut grad_w = vec![0.0_f32; out_dim * in_dim];
     let mut grad_b = vec![0.0_f32; out_dim];
 
-    for row in 0..m {
-        for o in 0..out_dim {
-            let g = grad_y[row * out_dim + o];
-            if has_bias {
-                grad_b[o] += g;
-            }
-            for i in 0..in_dim {
-                grad_w[o * in_dim + i] += g * x[row * in_dim + i];
-                grad_x[row * in_dim + i] += g * w[o * in_dim + i];
+    // grad_x[m, in] = grad_y[m, out] × w[out, in]
+    crate::blas::blas_matmul_nn(grad_y, w, &mut grad_x, m, in_dim, out_dim);
+    // grad_w[out, in] = grad_y[m, out]^T × x[m, in]
+    crate::blas::blas_matmul_tn(grad_y, x, &mut grad_w, out_dim, in_dim, m);
+    if has_bias {
+        for row in 0..m {
+            for o in 0..out_dim {
+                grad_b[o] += grad_y[row * out_dim + o];
             }
         }
     }

@@ -52,11 +52,44 @@ extern "C" {
     );
 }
 
-#[cfg(target_os = "macos")]
+// ── Linux OpenBLAS FFI (Phase T.4b: TTS 学習高速化) ──────────────────────────
+// build 時に -lopenblas がリンクされる必要あり (Cargo.toml optional feature "blas-openblas")
+
+#[cfg(all(target_os = "linux", feature = "blas-openblas"))]
+#[link(name = "openblas")]
+extern "C" {
+    fn cblas_sgemm(
+        order: i32,
+        trans_a: i32,
+        trans_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+    );
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", feature = "blas-openblas")
+))]
 const CBLAS_ROW_MAJOR: i32 = 101;
-#[cfg(target_os = "macos")]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", feature = "blas-openblas")
+))]
 const CBLAS_NO_TRANS: i32 = 111;
-#[cfg(target_os = "macos")]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", feature = "blas-openblas")
+))]
 const CBLAS_TRANS: i32 = 112;
 
 // ── 公開 API ────────────────────────────────────────────────────────────────
@@ -76,7 +109,10 @@ pub fn blas_matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k
         return;
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", feature = "blas-openblas")
+    ))]
     {
         let mi = i32::try_from(m).expect("m overflow");
         let ni = i32::try_from(n).expect("n overflow");
@@ -102,9 +138,61 @@ pub fn blas_matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "linux", feature = "blas-openblas")
+    )))]
     {
         tiled_matmul_bt(a, b, c, m, n, k);
+    }
+}
+
+/// C = A^T × B — BLAS 最適化版 (Phase T.4b: TTS grad_weight 用に追加)。
+///
+/// A: (k × m), B: (k × n) → C: (m × n)。
+/// A を転置して掛ける (grad_weight = grad_output^T × input で使用)。
+pub fn blas_matmul_tn(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    #[cfg(feature = "cuda")]
+    if let Some(_cuda_mtx) = CUDA_MATMUL.get() {
+        // CUDA 経路は Phase T.4c で追加 (Qwen35 用 sgemm を TTS 向けに転用)
+        // 暫定: fallback で対応
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", feature = "blas-openblas")
+    ))]
+    {
+        let mi = i32::try_from(m).expect("m overflow");
+        let ni = i32::try_from(n).expect("n overflow");
+        let ki = i32::try_from(k).expect("k overflow");
+        // C = A^T × B → cblas: C = A(Trans) × B(NoTrans)
+        unsafe {
+            cblas_sgemm(
+                CBLAS_ROW_MAJOR,
+                CBLAS_TRANS,
+                CBLAS_NO_TRANS,
+                mi,
+                ni,
+                ki,
+                1.0,
+                a.as_ptr(),
+                mi,
+                b.as_ptr(),
+                ni,
+                0.0,
+                c.as_mut_ptr(),
+                ni,
+            );
+        }
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "linux", feature = "blas-openblas")
+    )))]
+    {
+        tiled_matmul_tn(a, b, c, m, n, k);
     }
 }
 
@@ -119,7 +207,10 @@ pub fn blas_matmul_nn(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k
         return;
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", feature = "blas-openblas")
+    ))]
     {
         let mi = i32::try_from(m).expect("m overflow");
         let ni = i32::try_from(n).expect("n overflow");
@@ -144,7 +235,10 @@ pub fn blas_matmul_nn(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "linux", feature = "blas-openblas")
+    )))]
     {
         tiled_matmul_nn(a, b, c, m, n, k);
     }
@@ -218,6 +312,42 @@ fn tiled_matmul_nn(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: u
                         let mut sum = c[i * n + j];
                         for h in kk..k_end {
                             sum = a[i * k + h].mul_add(b[h * n + j], sum);
+                        }
+                        c[i * n + j] = sum;
+                    }
+                }
+                jj += TILE;
+            }
+            ii += TILE;
+        }
+        kk += TILE;
+    }
+}
+
+/// C = A^T × B — タイル matmul (Phase T.4b、grad_weight 用)。
+///
+/// A: (k × m), B: (k × n) → C: (m × n)。
+#[cfg(not(target_os = "macos"))]
+fn tiled_matmul_tn(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    for v in c.iter_mut() {
+        *v = 0.0;
+    }
+
+    let mut kk = 0;
+    while kk < k {
+        let k_end = (kk + TILE).min(k);
+        let mut ii = 0;
+        while ii < m {
+            let i_end = (ii + TILE).min(m);
+            let mut jj = 0;
+            while jj < n {
+                let j_end = (jj + TILE).min(n);
+                for i in ii..i_end {
+                    for j in jj..j_end {
+                        let mut sum = c[i * n + j];
+                        for h in kk..k_end {
+                            // A^T[i, h] = A[h, i], B[h, j]
+                            sum = a[h * m + i].mul_add(b[h * n + j], sum);
                         }
                         c[i * n + j] = sum;
                     }

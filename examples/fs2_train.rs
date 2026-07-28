@@ -78,9 +78,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             postnet_hidden: config["model"]["postnet_hidden"].as_u64().unwrap_or(512) as usize,
             max_len: config["model"]["max_len"].as_u64().unwrap_or(2048) as usize,
         };
-        println!("[info] Building FastSpeech2 model (zeros init + Xavier init seed=42)...");
+        println!("[info] Building FastSpeech2 model (zeros init + Xavier init seed=42 + Phase E-next-4 log-domain bias)...");
         let mut model = FastSpeech2::zeros(fs2_config)?;
-        model.init_xavier(42);
+
+        // Checkpoint resume 対応 (Phase T.4a Phase C + Paperspace 6h session)
+        let ckpt_dir = config["training"]["checkpoint_dir"]
+            .as_str()
+            .unwrap_or("checkpoints/fs2_jsut");
+        std::fs::create_dir_all(ckpt_dir).ok();
+        let latest_ckpt = find_latest_checkpoint(ckpt_dir);
+        let mut resume_step = 0_usize;
+        if let Some((path, step)) = &latest_ckpt {
+            println!(
+                "[info] Resuming from checkpoint: {} (step {})",
+                path.display(),
+                step
+            );
+            model.load_safetensors(path)?;
+            resume_step = *step;
+        } else {
+            model.init_xavier(42);
+            // Phase E-next-4: log-domain bias 事前設定 (dur log(4+1)=1.5, pitch log(150Hz)=5.0, energy -20dB)
+            model.init_variance_biases(1.5, 5.0, -20.0);
+        }
 
         // 2. Trainer 構築
         let train_config = TtsTrainConfig {
@@ -155,20 +175,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             total_steps, batch_size
         );
 
-        let mut step_count = 0_usize;
+        let checkpoint_interval = config["training"]["checkpoint_interval"]
+            .as_u64()
+            .unwrap_or(1000) as usize;
+
+        let mut step_count = resume_step;
+        let mut iter_count = 0_usize;
+        let mut skip_reason: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
         'outer: for epoch in 0.. {
             for batch_result in train_ds.iter_batches(batch_size) {
-                let batch = batch_result?;
+                iter_count += 1;
+                if iter_count.is_multiple_of(50) {
+                    eprintln!("[iter {iter_count}] step_count={step_count} skips={skip_reason:?}");
+                }
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("[iter {iter_count}] batch load error: {e}");
+                        *skip_reason.entry("batch_load_err").or_insert(0) += 1;
+                        continue;
+                    }
+                };
                 if batch.batch_size() == 0 {
+                    *skip_reason.entry("empty_batch").or_insert(0) += 1;
                     continue;
                 }
                 // batch_size=1 sample のみ抜き取り (variable frame len 対応まで)
                 if batch.batch_size() > 1 {
-                    eprintln!(
-                        "[warn] step {}: batch_size {} > 1 skipped (variable frame len 未対応)",
-                        step_count,
-                        batch.batch_size()
-                    );
+                    *skip_reason.entry("batch_size_gt1").or_insert(0) += 1;
                     continue;
                 }
                 let mora_ids = &batch.text_moras()[0]
@@ -187,6 +222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // mel target = batch.audio_mel()[0] を [mel_dim, frames] → [frames, mel_dim] に転置
                 let mel_batch = &batch.audio_mel()[0];
                 if mel_batch.is_empty() {
+                    *skip_reason.entry("empty_mel").or_insert(0) += 1;
                     continue;
                 }
                 let n_mels = mel_batch.len();
@@ -199,19 +235,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let expected_frames: usize = durations.iter().map(|&d| d as usize).sum();
-                if expected_frames != frames {
-                    // duration mismatch (簡易 forced alignment のズレ)、skip
+                // Duration auto-rescale: placeholder 80ms/mora と実 audio 長のズレを比例調整
+                // 完全 forced alignment は Phase T.4a 継続で MFA 導入予定
+                let durations_scaled: Vec<u32> = if expected_frames == frames {
+                    durations.clone()
+                } else if expected_frames == 0 {
+                    *skip_reason.entry("zero_expected_frames").or_insert(0) += 1;
+                    continue;
+                } else {
+                    let scale = frames as f32 / expected_frames as f32;
+                    let mut scaled: Vec<u32> = durations
+                        .iter()
+                        .map(|&d| ((d as f32 * scale).round() as u32).max(1))
+                        .collect();
+                    // Sum mismatch は最後の mora で吸収
+                    let sum: u32 = scaled.iter().sum();
+                    let target = frames as u32;
+                    if sum > target && !scaled.is_empty() {
+                        let diff = sum - target;
+                        let last = scaled.len() - 1;
+                        scaled[last] = scaled[last].saturating_sub(diff).max(1);
+                    } else if sum < target && !scaled.is_empty() {
+                        let diff = target - sum;
+                        let last = scaled.len() - 1;
+                        scaled[last] += diff;
+                    }
+                    scaled
+                };
+                // 最終検証: sum(durations_scaled) == frames
+                let scaled_sum: usize = durations_scaled.iter().map(|&d| d as usize).sum();
+                if scaled_sum != frames {
+                    *skip_reason.entry("scale_sum_mismatch").or_insert(0) += 1;
                     continue;
                 }
 
-                let result = trainer.step(mora_ids, &durations, &mel_target, 1, mora_len)?;
+                let t0 = std::time::Instant::now();
+                let result = trainer.step(mora_ids, &durations_scaled, &mel_target, 1, mora_len)?;
+                let dt = t0.elapsed().as_secs_f32();
                 step_count = result.step;
-
-                if step_count.is_multiple_of(log_interval) {
+                if step_count <= 3 || step_count.is_multiple_of(log_interval) {
                     println!(
-                        "[step {}] epoch={} mel_loss={:.4}",
-                        step_count, epoch, result.mel_loss
+                        "[step {}] epoch={} mel_loss={:.4} step_time={:.2}s mora={} frames={}",
+                        step_count, epoch, result.mel_loss, dt, mora_len, frames
                     );
+                }
+
+                if step_count > 0 && step_count.is_multiple_of(checkpoint_interval) {
+                    let ckpt_path = format!("{}/step_{}.safetensors", ckpt_dir, step_count);
+                    match trainer.model().save_safetensors(&ckpt_path) {
+                        Ok(_) => println!("[ckpt] saved {}", ckpt_path),
+                        Err(e) => eprintln!("[ckpt] save failed: {e}"),
+                    }
                 }
 
                 if step_count >= total_steps {
@@ -234,6 +308,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// checkpoint_dir 内で `step_N.safetensors` の最大 N を持つ file を返す (Phase T.4a Phase C resume)。
+fn find_latest_checkpoint(ckpt_dir: &str) -> Option<(PathBuf, usize)> {
+    let dir = PathBuf::from(ckpt_dir);
+    if !dir.exists() {
+        return None;
+    }
+    let mut best: Option<(PathBuf, usize)> = None;
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = p.file_name()?.to_str()?;
+            if let Some(rest) = name.strip_prefix("step_") {
+                if let Some(num_str) = rest.strip_suffix(".safetensors") {
+                    if let Ok(n) = num_str.parse::<usize>() {
+                        if best.as_ref().is_none_or(|(_, prev)| n > *prev) {
+                            best = Some((p, n));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best
 }
 
 fn parse_config_arg(args: &[String]) -> Option<PathBuf> {

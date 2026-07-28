@@ -192,13 +192,22 @@ impl Linear {
             });
         }
         let mut output = vec![0.0_f32; batch * cfg.out_features];
-        for b in 0..batch {
-            for o in 0..cfg.out_features {
-                let mut acc = if cfg.bias { self.bias[o] } else { 0.0 };
-                for i in 0..cfg.in_features {
-                    acc += input[b * cfg.in_features + i] * self.weight[o * cfg.in_features + i];
+        // Phase T.4b: BLAS matmul (macOS Accelerate / Linux OpenBLAS / tiled fallback)
+        // output[batch, out] = input[batch, in] × weight[out, in]^T
+        crate::blas::blas_matmul_bt(
+            input,
+            &self.weight,
+            &mut output,
+            batch,
+            cfg.out_features,
+            cfg.in_features,
+        );
+        // bias add
+        if cfg.bias {
+            for b in 0..batch {
+                for o in 0..cfg.out_features {
+                    output[b * cfg.out_features + o] += self.bias[o];
                 }
-                output[b * cfg.out_features + o] = acc;
             }
         }
         Ok(output)
@@ -233,15 +242,30 @@ impl Linear {
         let mut grad_weight = vec![0.0_f32; self.weight.len()];
         let mut grad_bias = vec![0.0_f32; cfg.out_features];
 
-        for b in 0..batch {
-            for o in 0..cfg.out_features {
-                let g = grad_output[b * cfg.out_features + o];
-                if cfg.bias {
-                    grad_bias[o] += g;
-                }
-                for i in 0..cfg.in_features {
-                    grad_weight[o * cfg.in_features + i] += g * input[b * cfg.in_features + i];
-                    grad_input[b * cfg.in_features + i] += g * self.weight[o * cfg.in_features + i];
+        // Phase T.4b: BLAS matmul
+        // grad_input[batch, in] = grad_output[batch, out] × weight[out, in]
+        crate::blas::blas_matmul_nn(
+            grad_output,
+            &self.weight,
+            &mut grad_input,
+            batch,
+            cfg.in_features,
+            cfg.out_features,
+        );
+        // grad_weight[out, in] = grad_output[batch, out]^T × input[batch, in]
+        crate::blas::blas_matmul_tn(
+            grad_output,
+            input,
+            &mut grad_weight,
+            cfg.out_features,
+            cfg.in_features,
+            batch,
+        );
+        // grad_bias[out] = sum over batch of grad_output[batch, out]
+        if cfg.bias {
+            for b in 0..batch {
+                for o in 0..cfg.out_features {
+                    grad_bias[o] += grad_output[b * cfg.out_features + o];
                 }
             }
         }

@@ -24,6 +24,9 @@ qat-cuda = ["cuda", "qat-cli"]
 # R3: ProsodyLoss — 追加 dep 無し
 # Phase T.4a Phase C: Checkpoint save/load — safetensors + bytemuck (f32 ↔ u8 cast)
 tts = ["dep:rustfft", "dep:hound", "dep:safetensors", "dep:bytemuck"]
+# Linux OpenBLAS backend for CPU BLAS (Phase T.4b: TTS 学習高速化)
+# apt-get install libopenblas-dev で system openblas を install してから使用
+blas-openblas = []
 
 [[bin]]
 name = "train-qat-70b"
