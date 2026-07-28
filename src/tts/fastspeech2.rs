@@ -238,6 +238,174 @@ impl FftBlock {
             .forward(&residual2, batch * seq_len)
             .expect("norm2")
     }
+
+    /// FFT block backward: `grad_output` から `grad_input` と全 sub-layer 勾配を計算する。
+    ///
+    /// Forward を再計算して中間 activation を取得し、reverse chain rule で backward。
+    /// 戻り値: `(grad_input, FftBlockGrads)`
+    ///
+    /// Phase T.4a backward Phase 2: FftBlock 単体の backward は完備、
+    /// FastSpeech2 全体 backward に統合するのは Phase T.4a 継続で対応する。
+    /// 現状は private method で test module + 将来の backward_full から呼ばれる予定。
+    #[allow(dead_code)] // Phase T.4a 継続で FastSpeech2::backward_full から呼ばれる
+    fn backward(
+        &self,
+        input: &[f32],
+        grad_output: &[f32],
+        batch: usize,
+        seq_len: usize,
+    ) -> (Vec<f32>, FftBlockGrads) {
+        let h = self.self_attn.config().embed_dim;
+
+        // === Forward 再計算 (中間 activation 保持) ===
+        let attn_out = self
+            .self_attn
+            .forward_self_attention(input, batch, seq_len, false)
+            .expect("attn");
+        let residual1 = add(input, &attn_out);
+        let after_attn = self
+            .attn_norm
+            .forward(&residual1, batch * seq_len)
+            .expect("norm");
+        let bs_hs = batch * seq_len * h;
+        let mut reshaped = vec![0.0_f32; bs_hs];
+        for b in 0..batch {
+            for t in 0..seq_len {
+                for c in 0..h {
+                    reshaped[b * h * seq_len + c * seq_len + t] =
+                        after_attn[b * seq_len * h + t * h + c];
+                }
+            }
+        }
+        let ffn_conv1_out = self
+            .ffn_conv1
+            .forward(&reshaped, batch, seq_len)
+            .expect("ffn1");
+        let ffn_relu: Vec<f32> = ffn_conv1_out.iter().map(|&x| x.max(0.0)).collect();
+        let ffn_conv2_out = self
+            .ffn_conv2
+            .forward(&ffn_relu, batch, seq_len)
+            .expect("ffn2");
+        let mut ffn_out = vec![0.0_f32; bs_hs];
+        for b in 0..batch {
+            for t in 0..seq_len {
+                for c in 0..h {
+                    ffn_out[b * seq_len * h + t * h + c] =
+                        ffn_conv2_out[b * h * seq_len + c * seq_len + t];
+                }
+            }
+        }
+        let residual2 = add(&after_attn, &ffn_out);
+
+        // === Backward chain ===
+        // Step 1: ffn_norm backward
+        let (grad_residual2, ffn_norm_gamma_grad, ffn_norm_beta_grad) = self
+            .ffn_norm
+            .backward(&residual2, grad_output, batch * seq_len)
+            .expect("ffn_norm bw");
+
+        // Step 2: Add branch: grad_after_attn_add = grad_residual2, grad_ffn_out = grad_residual2
+        let mut grad_after_attn = grad_residual2.clone();
+        let grad_ffn_out = grad_residual2;
+
+        // Step 3: reshape grad_ffn_out [B, seq_len, h] → [B, h, seq_len]
+        let mut grad_ffn_out_reshaped = vec![0.0_f32; bs_hs];
+        for b in 0..batch {
+            for t in 0..seq_len {
+                for c in 0..h {
+                    grad_ffn_out_reshaped[b * h * seq_len + c * seq_len + t] =
+                        grad_ffn_out[b * seq_len * h + t * h + c];
+                }
+            }
+        }
+
+        // Step 4: ffn_conv2 backward
+        let (grad_ffn_relu, ffn_conv2_w_grad, ffn_conv2_b_grad) = self
+            .ffn_conv2
+            .backward(&ffn_relu, &grad_ffn_out_reshaped, batch, seq_len)
+            .expect("ffn_conv2 bw");
+
+        // Step 5: ReLU backward: grad_pre_relu = grad_relu * (ffn_conv1_out > 0)
+        let grad_pre_relu: Vec<f32> = grad_ffn_relu
+            .iter()
+            .zip(&ffn_conv1_out)
+            .map(|(g, &pre)| if pre > 0.0 { *g } else { 0.0 })
+            .collect();
+
+        // Step 6: ffn_conv1 backward
+        let (grad_reshaped, ffn_conv1_w_grad, ffn_conv1_b_grad) = self
+            .ffn_conv1
+            .backward(&reshaped, &grad_pre_relu, batch, seq_len)
+            .expect("ffn_conv1 bw");
+
+        // Step 7: reshape grad_reshaped [B, h, seq_len] → [B, seq_len, h] → add to grad_after_attn
+        for b in 0..batch {
+            for t in 0..seq_len {
+                for c in 0..h {
+                    grad_after_attn[b * seq_len * h + t * h + c] +=
+                        grad_reshaped[b * h * seq_len + c * seq_len + t];
+                }
+            }
+        }
+
+        // Step 8: attn_norm backward
+        let (grad_residual1, attn_norm_gamma_grad, attn_norm_beta_grad) = self
+            .attn_norm
+            .backward(&residual1, &grad_after_attn, batch * seq_len)
+            .expect("attn_norm bw");
+
+        // Step 9: Add branch: grad_input_add = grad_residual1, grad_attn_out = grad_residual1
+        let mut grad_input = grad_residual1.clone();
+
+        // Step 10: MHA backward (self-attention Q=K=V=input)
+        let (grad_attn_input, mha_grads) = self
+            .self_attn
+            .backward_self_attention(input, &grad_residual1, batch, seq_len, false)
+            .expect("mha bw");
+
+        // Step 11: sum both branches
+        for (dst, src) in grad_input.iter_mut().zip(&grad_attn_input) {
+            *dst += src;
+        }
+
+        (
+            grad_input,
+            FftBlockGrads {
+                mha: mha_grads,
+                attn_norm_gamma: attn_norm_gamma_grad,
+                attn_norm_beta: attn_norm_beta_grad,
+                ffn_conv1_w: ffn_conv1_w_grad,
+                ffn_conv1_b: ffn_conv1_b_grad,
+                ffn_conv2_w: ffn_conv2_w_grad,
+                ffn_conv2_b: ffn_conv2_b_grad,
+                ffn_norm_gamma: ffn_norm_gamma_grad,
+                ffn_norm_beta: ffn_norm_beta_grad,
+            },
+        )
+    }
+}
+
+/// FftBlock backward で返される sub-layer 勾配 bundle。
+#[derive(Clone, Debug)]
+pub struct FftBlockGrads {
+    /// MHA 勾配 (Q/K/V/O weight + bias)。
+    pub mha: crate::tts::MhaGrads,
+    /// attn_norm gamma 勾配。
+    pub attn_norm_gamma: Vec<f32>,
+    /// attn_norm beta 勾配。
+    pub attn_norm_beta: Vec<f32>,
+    /// FFN Conv1 weight 勾配。
+    pub ffn_conv1_w: Vec<f32>,
+    /// FFN Conv1 bias 勾配。
+    pub ffn_conv1_b: Vec<f32>,
+    /// FFN Conv2 weight 勾配。
+    pub ffn_conv2_w: Vec<f32>,
+    /// FFN Conv2 bias 勾配。
+    pub ffn_conv2_b: Vec<f32>,
+    /// ffn_norm gamma 勾配。
+    pub ffn_norm_gamma: Vec<f32>,
+    /// ffn_norm beta 勾配。
+    pub ffn_norm_beta: Vec<f32>,
 }
 
 /// Variance Predictor (Conv1D + LayerNorm + ReLU + Conv1D + LayerNorm + Linear → scalar)。
@@ -1118,6 +1286,54 @@ mod tests {
         // Phase 1 では embedding は 0 埋め (未実装)
         for &v in &grads.embedding {
             assert!((v).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn fft_block_backward_returns_correct_shapes() {
+        // FftBlock backward の shape 検証 (private struct を module 内 test で直接構築)
+        let block = FftBlock::zeros(8, 2, 3, 2);
+        let batch = 1;
+        let seq_len = 5;
+        let hidden = 8;
+        let input: Vec<f32> = (0..batch * seq_len * hidden)
+            .map(|i| (i as f32 * 0.1).sin())
+            .collect();
+        let grad_output: Vec<f32> = (0..batch * seq_len * hidden)
+            .map(|i| (i as f32 * 0.2).cos())
+            .collect();
+
+        let (grad_input, grads) = block.backward(&input, &grad_output, batch, seq_len);
+
+        // shape 検証
+        assert_eq!(grad_input.len(), batch * seq_len * hidden);
+        assert_eq!(grads.attn_norm_gamma.len(), hidden);
+        assert_eq!(grads.attn_norm_beta.len(), hidden);
+        assert_eq!(grads.ffn_conv1_w.len(), hidden * hidden * 2 * 3); // out * (in/groups=in) * kernel = 16*8*3
+        assert_eq!(grads.ffn_conv1_b.len(), hidden * 2);
+        assert_eq!(grads.ffn_conv2_w.len(), hidden * hidden * 2 * 3); // out=hidden, in=mid=hidden*2, k=3
+        assert_eq!(grads.ffn_conv2_b.len(), hidden);
+        assert_eq!(grads.ffn_norm_gamma.len(), hidden);
+        assert_eq!(grads.ffn_norm_beta.len(), hidden);
+        assert_eq!(grads.mha.w_q.len(), hidden * hidden);
+        assert_eq!(grads.mha.b_q.len(), hidden);
+    }
+
+    #[test]
+    fn fft_block_backward_is_finite() {
+        // NaN/Inf 出さないことを確認 (zero weights model は LayerNorm eps で保護)
+        let block = FftBlock::zeros(8, 2, 3, 2);
+        let input = vec![0.5_f32; 5 * 8];
+        let grad_output = vec![1.0_f32; 5 * 8];
+        let (grad_input, grads) = block.backward(&input, &grad_output, 1, 5);
+        for &v in &grad_input {
+            assert!(v.is_finite(), "grad_input contains NaN/Inf");
+        }
+        for &v in &grads.attn_norm_gamma {
+            assert!(v.is_finite());
+        }
+        for &v in &grads.ffn_norm_gamma {
+            assert!(v.is_finite());
         }
     }
 
