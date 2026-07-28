@@ -2234,6 +2234,539 @@ impl FastSpeech2 {
         Ok(grads)
     }
 
+    /// Variable-length forward + prosody (Phase T.4a Phase E-next-3)。
+    ///
+    /// `forward_variable` + `forward_with_prosody` の融合。attention mask + pitch/energy embed injection。
+    ///
+    /// # 戻り値
+    ///
+    /// `(mel, ProsodyPrediction, frame_lens, max_frame_len)`:
+    /// - mel: `[batch, max_frame_len, mel_dim]` (padding 領域は attention mask で 0 近似)
+    /// - prosody: mora-level 3 系統 (padding 位置の値は garbage、mask 側で除外必須)
+    /// - frame_lens / max_frame_len: 各 sample の実 frame 長 / 最大値
+    ///
+    /// # Errors
+    ///
+    /// forward_variable と forward_with_prosody と同じ。
+    pub fn forward_variable_with_prosody(
+        &self,
+        mora_ids: &[u32],
+        target_durations: &[u32],
+        batch: usize,
+        max_mora_len: usize,
+        mora_lens: &[usize],
+    ) -> Result<(Vec<f32>, crate::tts::ProsodyPrediction, Vec<usize>, usize), FastSpeech2Error>
+    {
+        let cfg = self.config;
+        if mora_ids.len() != batch * max_mora_len {
+            return Err(FastSpeech2Error::ShapeMismatch {
+                field: "mora_ids",
+                expected: batch * max_mora_len,
+                actual: mora_ids.len(),
+            });
+        }
+        if target_durations.len() != batch * max_mora_len {
+            return Err(FastSpeech2Error::ShapeMismatch {
+                field: "target_durations",
+                expected: batch * max_mora_len,
+                actual: target_durations.len(),
+            });
+        }
+        if mora_lens.len() != batch {
+            return Err(FastSpeech2Error::ShapeMismatch {
+                field: "mora_lens",
+                expected: batch,
+                actual: mora_lens.len(),
+            });
+        }
+        for (b, &ml) in mora_lens.iter().enumerate() {
+            if ml > max_mora_len {
+                return Err(FastSpeech2Error::Internal {
+                    reason: format!("mora_lens[{b}]={ml} > max_mora_len={max_mora_len}"),
+                });
+            }
+        }
+        for &id in mora_ids {
+            if id as usize >= cfg.vocab_size {
+                return Err(FastSpeech2Error::VocabOverflow {
+                    id: id as usize,
+                    vocab_size: cfg.vocab_size,
+                });
+            }
+        }
+
+        // Encoder mask
+        let mut encoder_mask = vec![false; batch * max_mora_len];
+        for b in 0..batch {
+            for t in 0..mora_lens[b] {
+                encoder_mask[b * max_mora_len + t] = true;
+            }
+        }
+
+        // Embedding + PE + Encoder (masked)
+        let mut embedded = vec![0.0_f32; batch * max_mora_len * cfg.hidden_dim];
+        for b in 0..batch {
+            for t in 0..max_mora_len {
+                let id = mora_ids[b * max_mora_len + t] as usize;
+                let src = &self.embedding[id * cfg.hidden_dim..(id + 1) * cfg.hidden_dim];
+                let dst_start = b * max_mora_len * cfg.hidden_dim + t * cfg.hidden_dim;
+                embedded[dst_start..dst_start + cfg.hidden_dim].copy_from_slice(src);
+            }
+        }
+        let mut encoder_input = self
+            .encoder_pos_enc
+            .forward(&embedded, batch, max_mora_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("encoder PE: {e}"),
+            })?;
+        for block in &self.encoder {
+            encoder_input =
+                block.forward_masked(&encoder_input, batch, max_mora_len, Some(&encoder_mask));
+        }
+
+        // Variance predictor 3 系統 forward
+        let dur_pred_flat = self
+            .duration_predictor
+            .forward(&encoder_input, batch, max_mora_len);
+        let pitch_pred_flat = self
+            .pitch_predictor
+            .forward(&encoder_input, batch, max_mora_len);
+        let energy_pred_flat = self
+            .energy_predictor
+            .forward(&encoder_input, batch, max_mora_len);
+        let prosody = flat_predictions_to_prosody(
+            &dur_pred_flat,
+            &pitch_pred_flat,
+            &energy_pred_flat,
+            batch,
+            max_mora_len,
+        );
+
+        // pitch/energy embed injection (padding は LR で自然除外なので mask 不要)
+        let encoder_input = inject_prosody_embed(
+            &encoder_input,
+            &pitch_pred_flat,
+            &energy_pred_flat,
+            &self.pitch_embed,
+            &self.energy_embed,
+            batch,
+            max_mora_len,
+            cfg.hidden_dim,
+        )?;
+
+        // LR + Decoder + Mel + Postnet (forward_variable と同じ)
+        let (expanded, frame_len_per_batch) = length_regulator(
+            &encoder_input,
+            batch,
+            max_mora_len,
+            cfg.hidden_dim,
+            target_durations,
+        );
+        let max_frame_len = *frame_len_per_batch.iter().max().unwrap_or(&0);
+        if max_frame_len > cfg.max_len {
+            return Err(FastSpeech2Error::SeqLenExceedsMax {
+                seq_len: max_frame_len,
+                max_len: cfg.max_len,
+            });
+        }
+        let mut decoder_mask = vec![false; batch * max_frame_len];
+        for b in 0..batch {
+            for t in 0..frame_len_per_batch[b] {
+                decoder_mask[b * max_frame_len + t] = true;
+            }
+        }
+        let mut decoder_input = self
+            .decoder_pos_enc
+            .forward(&expanded, batch, max_frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("decoder PE: {e}"),
+            })?;
+        for block in &self.decoder {
+            decoder_input =
+                block.forward_masked(&decoder_input, batch, max_frame_len, Some(&decoder_mask));
+        }
+        let mel_before = self
+            .mel_linear
+            .forward(&decoder_input, batch * max_frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("mel linear: {e}"),
+            })?;
+        let mel_reshaped =
+            reshape_time_last_to_channel_first(&mel_before, batch, max_frame_len, cfg.mel_dim);
+        let mut postnet_out = mel_reshaped;
+        for (i, conv) in self.postnet.iter().enumerate() {
+            let conv_out = conv
+                .forward(&postnet_out, batch, max_frame_len)
+                .map_err(|e| FastSpeech2Error::Internal {
+                    reason: format!("postnet[{i}]: {e}"),
+                })?;
+            if i < self.postnet.len() - 1 {
+                postnet_out = conv_out.iter().map(|&x| x.tanh()).collect();
+            } else {
+                postnet_out = conv_out;
+            }
+        }
+        let mut postnet_out_reshaped = vec![0.0_f32; batch * max_frame_len * cfg.mel_dim];
+        for b in 0..batch {
+            for t in 0..max_frame_len {
+                for c in 0..cfg.mel_dim {
+                    postnet_out_reshaped[b * max_frame_len * cfg.mel_dim + t * cfg.mel_dim + c] =
+                        postnet_out[b * cfg.mel_dim * max_frame_len + c * max_frame_len + t];
+                }
+            }
+        }
+        let mel_after: Vec<f32> = mel_before
+            .iter()
+            .zip(&postnet_out_reshaped)
+            .map(|(a, b)| a + b)
+            .collect();
+
+        Ok((mel_after, prosody, frame_len_per_batch, max_frame_len))
+    }
+
+    /// Variable-length backward + prosody (Phase T.4a Phase E-next-3)。
+    ///
+    /// `backward_full_variable` + `backward_full_with_prosody` の融合。
+    /// mask 対応 + pitch/energy embed injection backward + variance predictor 3 系統 backward。
+    ///
+    /// # Errors
+    ///
+    /// forward_variable_with_prosody / backward_full_with_prosody と同じ。
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward_full_variable_with_prosody(
+        &self,
+        mora_ids: &[u32],
+        target_durations: &[u32],
+        grad_mel: &[f32],
+        grad_duration_pred: &[Vec<f32>],
+        grad_pitch_pred: &[Vec<f32>],
+        grad_energy_pred: &[Vec<f32>],
+        batch: usize,
+        max_mora_len: usize,
+        mora_lens: &[usize],
+    ) -> Result<FastSpeech2Grads, FastSpeech2Error> {
+        let cfg = self.config;
+
+        // prosody grad shape 検証
+        if grad_duration_pred.len() != batch
+            || grad_pitch_pred.len() != batch
+            || grad_energy_pred.len() != batch
+        {
+            return Err(FastSpeech2Error::ShapeMismatch {
+                field: "grad_prosody batch",
+                expected: batch,
+                actual: grad_duration_pred.len(),
+            });
+        }
+        for b in 0..batch {
+            for (name, v) in [
+                ("grad_duration_pred", &grad_duration_pred[b]),
+                ("grad_pitch_pred", &grad_pitch_pred[b]),
+                ("grad_energy_pred", &grad_energy_pred[b]),
+            ] {
+                if v.len() != max_mora_len {
+                    return Err(FastSpeech2Error::ShapeMismatch {
+                        field: name,
+                        expected: max_mora_len,
+                        actual: v.len(),
+                    });
+                }
+            }
+        }
+
+        // Encoder mask
+        let mut encoder_mask = vec![false; batch * max_mora_len];
+        for b in 0..batch {
+            for t in 0..mora_lens[b] {
+                encoder_mask[b * max_mora_len + t] = true;
+            }
+        }
+
+        // Forward 再計算: encoder path (masked)
+        let mut embedded = vec![0.0_f32; batch * max_mora_len * cfg.hidden_dim];
+        for b in 0..batch {
+            for t in 0..max_mora_len {
+                let id = mora_ids[b * max_mora_len + t] as usize;
+                let src = &self.embedding[id * cfg.hidden_dim..(id + 1) * cfg.hidden_dim];
+                let dst_start = b * max_mora_len * cfg.hidden_dim + t * cfg.hidden_dim;
+                embedded[dst_start..dst_start + cfg.hidden_dim].copy_from_slice(src);
+            }
+        }
+        let encoder_pe_out = self
+            .encoder_pos_enc
+            .forward(&embedded, batch, max_mora_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("encoder PE fw: {e}"),
+            })?;
+        let mut encoder_inputs: Vec<Vec<f32>> = Vec::with_capacity(cfg.num_encoder_layers);
+        let mut encoder_current = encoder_pe_out;
+        for block in &self.encoder {
+            encoder_inputs.push(encoder_current.clone());
+            encoder_current =
+                block.forward_masked(&encoder_current, batch, max_mora_len, Some(&encoder_mask));
+        }
+        let encoder_out = encoder_current;
+
+        // 変分予測 + injection
+        let pitch_pred_flat = self
+            .pitch_predictor
+            .forward(&encoder_out, batch, max_mora_len);
+        let energy_pred_flat = self
+            .energy_predictor
+            .forward(&encoder_out, batch, max_mora_len);
+        let encoder_out_injected = inject_prosody_embed(
+            &encoder_out,
+            &pitch_pred_flat,
+            &energy_pred_flat,
+            &self.pitch_embed,
+            &self.energy_embed,
+            batch,
+            max_mora_len,
+            cfg.hidden_dim,
+        )?;
+
+        // LR + Decoder path
+        let (expanded, frame_len_per_batch) = length_regulator(
+            &encoder_out_injected,
+            batch,
+            max_mora_len,
+            cfg.hidden_dim,
+            target_durations,
+        );
+        let max_frame_len = *frame_len_per_batch.iter().max().unwrap_or(&0);
+        let mut decoder_mask = vec![false; batch * max_frame_len];
+        for b in 0..batch {
+            for t in 0..frame_len_per_batch[b] {
+                decoder_mask[b * max_frame_len + t] = true;
+            }
+        }
+        let decoder_pe_out = self
+            .decoder_pos_enc
+            .forward(&expanded, batch, max_frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("decoder PE fw: {e}"),
+            })?;
+        let mut decoder_inputs: Vec<Vec<f32>> = Vec::with_capacity(cfg.num_decoder_layers);
+        let mut decoder_current = decoder_pe_out;
+        for block in &self.decoder {
+            decoder_inputs.push(decoder_current.clone());
+            decoder_current =
+                block.forward_masked(&decoder_current, batch, max_frame_len, Some(&decoder_mask));
+        }
+        let decoder_out = decoder_current;
+
+        let mel_before = self
+            .mel_linear
+            .forward(&decoder_out, batch * max_frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("mel linear fw: {e}"),
+            })?;
+
+        // Postnet re-forward + cache (backward_full_variable と同じ)
+        let mel_reshaped =
+            reshape_time_last_to_channel_first(&mel_before, batch, max_frame_len, cfg.mel_dim);
+        let mut postnet_inputs: Vec<Vec<f32>> = Vec::with_capacity(self.postnet.len());
+        let mut postnet_pre_act: Vec<Vec<f32>> = Vec::with_capacity(self.postnet.len());
+        let mut current = mel_reshaped;
+        for (i, conv) in self.postnet.iter().enumerate() {
+            postnet_inputs.push(current.clone());
+            let pre = conv.forward(&current, batch, max_frame_len).map_err(|e| {
+                FastSpeech2Error::Internal {
+                    reason: format!("postnet[{i}] fw: {e}"),
+                }
+            })?;
+            postnet_pre_act.push(pre.clone());
+            if i < self.postnet.len() - 1 {
+                current = pre.iter().map(|&x| x.tanh()).collect();
+            } else {
+                current = pre;
+            }
+        }
+
+        // Postnet + mel_linear backward (backward_full_variable と同じ)
+        let grad_mel_after = grad_mel;
+        let mut grad_postnet_out = vec![0.0_f32; batch * cfg.mel_dim * max_frame_len];
+        for b in 0..batch {
+            for t in 0..max_frame_len {
+                for c in 0..cfg.mel_dim {
+                    grad_postnet_out[b * cfg.mel_dim * max_frame_len + c * max_frame_len + t] =
+                        grad_mel_after[b * max_frame_len * cfg.mel_dim + t * cfg.mel_dim + c];
+                }
+            }
+        }
+        let mut grads = FastSpeech2Grads::zeros_from_config(&cfg);
+        let mut grad_current = grad_postnet_out;
+        for i in (0..self.postnet.len()).rev() {
+            let pre = &postnet_pre_act[i];
+            let input = &postnet_inputs[i];
+            let grad_pre: Vec<f32> = if i < self.postnet.len() - 1 {
+                pre.iter()
+                    .zip(&grad_current)
+                    .map(|(&z, &g)| g * (1.0 - z.tanh() * z.tanh()))
+                    .collect()
+            } else {
+                grad_current
+            };
+            let (grad_in, grad_w, grad_b) = self.postnet[i]
+                .backward(input, &grad_pre, batch, max_frame_len)
+                .map_err(|e| FastSpeech2Error::Internal {
+                    reason: format!("postnet[{i}] bw: {e}"),
+                })?;
+            grads.postnet_w[i] = grad_w;
+            grads.postnet_b[i] = grad_b;
+            grad_current = grad_in;
+        }
+        let mut grad_postnet_residual = vec![0.0_f32; batch * max_frame_len * cfg.mel_dim];
+        for b in 0..batch {
+            for t in 0..max_frame_len {
+                for c in 0..cfg.mel_dim {
+                    grad_postnet_residual[b * max_frame_len * cfg.mel_dim + t * cfg.mel_dim + c] =
+                        grad_current[b * cfg.mel_dim * max_frame_len + c * max_frame_len + t];
+                }
+            }
+        }
+        let grad_mel_before: Vec<f32> = grad_mel_after
+            .iter()
+            .zip(&grad_postnet_residual)
+            .map(|(a, b)| a + b)
+            .collect();
+
+        let (grad_decoder_out, grad_mel_w, grad_mel_b) = self
+            .mel_linear
+            .backward(&decoder_out, &grad_mel_before, batch * max_frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("mel_linear bw: {e}"),
+            })?;
+        grads.mel_linear_w = grad_mel_w;
+        grads.mel_linear_b = grad_mel_b;
+
+        // Decoder FftBlock chain backward (masked)
+        let mut grad_current = grad_decoder_out;
+        for i in (0..cfg.num_decoder_layers).rev() {
+            let (grad_in, fft_grads) = self.decoder[i].backward_masked(
+                &decoder_inputs[i],
+                &grad_current,
+                batch,
+                max_frame_len,
+                Some(&decoder_mask),
+            );
+            grads.decoder[i] = fft_grads;
+            grad_current = grad_in;
+        }
+
+        // Decoder PE backward + LR backward → grad_encoder_out_injected
+        let grad_expanded = self
+            .decoder_pos_enc
+            .backward(&grad_current, batch, max_frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("decoder PE bw: {e}"),
+            })?;
+        let grad_encoder_out_injected = length_regulator_backward(
+            &grad_expanded,
+            batch,
+            max_mora_len,
+            cfg.hidden_dim,
+            target_durations,
+        );
+
+        // pitch/energy embed backward
+        let grad_injected_channel_first = reshape_time_last_to_channel_first(
+            &grad_encoder_out_injected,
+            batch,
+            max_mora_len,
+            cfg.hidden_dim,
+        );
+        let (grad_pitch_pred_flat_from_inj, pitch_embed_w_grad, pitch_embed_b_grad) = self
+            .pitch_embed
+            .backward(
+                &pitch_pred_flat,
+                &grad_injected_channel_first,
+                batch,
+                max_mora_len,
+            )
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("pitch_embed bw: {e}"),
+            })?;
+        let (grad_energy_pred_flat_from_inj, energy_embed_w_grad, energy_embed_b_grad) = self
+            .energy_embed
+            .backward(
+                &energy_pred_flat,
+                &grad_injected_channel_first,
+                batch,
+                max_mora_len,
+            )
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("energy_embed bw: {e}"),
+            })?;
+        grads.pitch_embed_w = pitch_embed_w_grad;
+        grads.pitch_embed_b = pitch_embed_b_grad;
+        grads.energy_embed_w = energy_embed_w_grad;
+        grads.energy_embed_b = energy_embed_b_grad;
+
+        // caller prosody grad + injection 由来を合算 → variance predictor backward
+        let (dur_grad_flat, mut pitch_grad_flat, mut energy_grad_flat) = prosody_grads_to_flat(
+            grad_duration_pred,
+            grad_pitch_pred,
+            grad_energy_pred,
+            batch,
+            max_mora_len,
+        );
+        for i in 0..pitch_grad_flat.len() {
+            pitch_grad_flat[i] += grad_pitch_pred_flat_from_inj[i];
+            energy_grad_flat[i] += grad_energy_pred_flat_from_inj[i];
+        }
+        let (grad_from_dur, dur_grads) =
+            self.duration_predictor
+                .backward(&encoder_out, &dur_grad_flat, batch, max_mora_len);
+        let (grad_from_pitch, pitch_grads) =
+            self.pitch_predictor
+                .backward(&encoder_out, &pitch_grad_flat, batch, max_mora_len);
+        let (grad_from_energy, energy_grads) =
+            self.energy_predictor
+                .backward(&encoder_out, &energy_grad_flat, batch, max_mora_len);
+        grads.duration_predictor = dur_grads;
+        grads.pitch_predictor = pitch_grads;
+        grads.energy_predictor = energy_grads;
+
+        // grad_encoder_out = residual + 3 variance 経路
+        let mut grad_encoder_out = grad_encoder_out_injected;
+        for i in 0..grad_encoder_out.len() {
+            grad_encoder_out[i] += grad_from_dur[i] + grad_from_pitch[i] + grad_from_energy[i];
+        }
+
+        // Encoder chain backward (masked)
+        let mut grad_current = grad_encoder_out;
+        for i in (0..cfg.num_encoder_layers).rev() {
+            let (grad_in, fft_grads) = self.encoder[i].backward_masked(
+                &encoder_inputs[i],
+                &grad_current,
+                batch,
+                max_mora_len,
+                Some(&encoder_mask),
+            );
+            grads.encoder[i] = fft_grads;
+            grad_current = grad_in;
+        }
+
+        // Encoder PE + Embedding backward
+        let grad_embedded = self
+            .encoder_pos_enc
+            .backward(&grad_current, batch, max_mora_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("encoder PE bw: {e}"),
+            })?;
+        grads.embedding = embedding_backward(
+            &grad_embedded,
+            mora_ids,
+            cfg.vocab_size,
+            cfg.hidden_dim,
+            batch,
+            max_mora_len,
+        );
+
+        Ok(grads)
+    }
+
     /// Xavier uniform init for全 sub-layer + embedding Gaussian init。
     ///
     /// 決定論 seed 対応。`zeros(cfg)?` の後で `model.init_xavier(seed)` すれば学習可能な初期値。
