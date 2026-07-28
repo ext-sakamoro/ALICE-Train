@@ -156,8 +156,10 @@ pub use trainer::{EpochResult, TrainConfig, TrainableNetwork, Trainer};
 pub use tts::{
     AudioFeatureExtractor, Conv1d, Conv1dConfig, Conv1dError, LayerNorm, LayerNormConfig,
     LayerNormError, LossComponents, MhaError, MhaGrads, MultiHeadAttention,
-    MultiHeadAttentionConfig, ProsodyLoss, ProsodyLossError, ProsodyPrediction, ProsodyTarget,
-    TtsBatch, TtsBatchError, TtsDataset, TtsDatasetError, TtsManifestEntry,
+    MultiHeadAttentionConfig, PosEncError, ProsodyLoss, ProsodyLossError, ProsodyPrediction,
+    ProsodyTarget, RotaryEmbedding, RotaryEmbeddingConfig, SinusoidalPositionalEncoding,
+    SinusoidalPositionalEncodingConfig, TtsBatch, TtsBatchError, TtsDataset, TtsDatasetError,
+    TtsManifestEntry,
 };
 
 // GPU re-exports
