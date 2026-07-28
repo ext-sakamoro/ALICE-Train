@@ -2808,6 +2808,30 @@ impl FastSpeech2 {
         }
     }
 
+    /// Variance predictor 3 系統の linear layer bias を明示的に設定する (Phase E-next-4)。
+    ///
+    /// Xavier init だと linear bias = 0 → 予測初期値 ≈ 0。実際の prosody target
+    /// (log-duration ≈ 1.5、log-Hz pitch ≈ 5.0、dB energy ≈ -20) との乖離が大きく
+    /// 序盤 loss で prosody grad が mel grad を圧倒する。適切な bias 事前設定で改善する。
+    ///
+    /// 典型値:
+    /// - `duration_bias`: 1.5 (log(4 frames + 1) 相当、ProsodyTarget::to_log_duration と併用)
+    /// - `pitch_bias`: 5.0 (log(150 Hz) 相当、log-Hz pitch target 併用時) or 0.0 (raw Hz は 100+ で不適)
+    /// - `energy_bias`: -20.0 (dB scale energy target 併用時) or 0.0 (raw energy と併用時)
+    ///
+    /// `init_xavier` の後で呼び出す想定。逆順で呼ぶと Xavier init が bias を 0 に戻す。
+    pub fn init_variance_biases(&mut self, duration_bias: f32, pitch_bias: f32, energy_bias: f32) {
+        for b in self.duration_predictor.linear.bias_mut() {
+            *b = duration_bias;
+        }
+        for b in self.pitch_predictor.linear.bias_mut() {
+            *b = pitch_bias;
+        }
+        for b in self.energy_predictor.linear.bias_mut() {
+            *b = energy_bias;
+        }
+    }
+
     /// AdamW update: bias-corrected moment estimate + weight decay。
     ///
     /// state.step は自動 increment、初 call で step=1 開始。
@@ -5019,5 +5043,52 @@ mod tests {
         );
         assert_eq!(grads.linear_w.len(), cfg.predictor_hidden);
         assert_eq!(grads.linear_b.len(), 1);
+    }
+
+    #[test]
+    fn init_variance_biases_sets_bias_correctly() {
+        // Phase E-next-4: init_variance_biases が 3 predictor の linear bias を設定
+        let cfg = small_config();
+        let mut model = FastSpeech2::zeros(cfg).unwrap();
+        model.init_xavier(42);
+        // Xavier init 後は linear bias = 0
+        assert!(model
+            .duration_predictor
+            .linear
+            .bias()
+            .iter()
+            .all(|b| b.abs() < 1e-6));
+        assert!(model
+            .pitch_predictor
+            .linear
+            .bias()
+            .iter()
+            .all(|b| b.abs() < 1e-6));
+        assert!(model
+            .energy_predictor
+            .linear
+            .bias()
+            .iter()
+            .all(|b| b.abs() < 1e-6));
+
+        model.init_variance_biases(1.5, 5.0, -20.0);
+        assert!(model
+            .duration_predictor
+            .linear
+            .bias()
+            .iter()
+            .all(|b| (*b - 1.5).abs() < 1e-6));
+        assert!(model
+            .pitch_predictor
+            .linear
+            .bias()
+            .iter()
+            .all(|b| (*b - 5.0).abs() < 1e-6));
+        assert!(model
+            .energy_predictor
+            .linear
+            .bias()
+            .iter()
+            .all(|b| (*b - (-20.0)).abs() < 1e-6));
     }
 }

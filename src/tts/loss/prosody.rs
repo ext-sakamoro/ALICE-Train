@@ -163,6 +163,38 @@ impl ProsodyTarget {
             mask: Some(mask_out),
         })
     }
+
+    /// `from_batch` + `to_log_duration` を 1 step で行う helper (Phase E-next-4)。
+    ///
+    /// `duration_frames` を `log(duration_frames + 1)` に変換して保存する。
+    /// FastSpeech2 論文の慣習で、durations は log-domain で学習される (small dur を強調)。
+    /// 変換後は `FastSpeech2::init_variance_biases(1.5, ...)` の bias 事前設定と併用推奨。
+    ///
+    /// # Errors
+    ///
+    /// `from_batch` と同じ (hop_length == 0 / sample_rate == 0)。
+    pub fn from_batch_log_duration(
+        batch: &TtsBatch,
+        hop_length: usize,
+        sample_rate: u32,
+    ) -> Result<Self, ProsodyLossError> {
+        let mut target = Self::from_batch(batch, hop_length, sample_rate)?;
+        target.to_log_duration();
+        Ok(target)
+    }
+
+    /// `duration_frames` を `log(duration_frames + 1)` に in-place 変換 (Phase E-next-4)。
+    ///
+    /// 負値は 0 に clamp してから log 適用 (log(0+1) = 0 で自然に 0 になる)。
+    /// mask false 位置は変換されるが loss 計算で除外されるため影響なし。
+    pub fn to_log_duration(&mut self) {
+        for row in &mut self.duration_frames {
+            for v in row {
+                let clamped = v.max(0.0);
+                *v = clamped.ln_1p();
+            }
+        }
+    }
 }
 
 /// [`ProsodyLoss::compute`] の戻り値 — 各 loss 個別 + total。
@@ -425,6 +457,57 @@ mod tests {
             80,
         )
         .expect("valid batch")
+    }
+
+    #[test]
+    fn to_log_duration_transforms_in_place() {
+        // Phase E-next-4: log(dur + 1) 変換確認
+        let mut target = ProsodyTarget {
+            f0: vec![vec![100.0, 105.0]],
+            duration_frames: vec![vec![3.0, 7.0]],
+            energy: vec![vec![-20.0, -15.0]],
+            mask: None,
+        };
+        target.to_log_duration();
+        // log(3+1)=log(4)≈1.386、log(7+1)=log(8)≈2.079
+        let expected_1 = 4.0_f32.ln();
+        let expected_2 = 8.0_f32.ln();
+        assert!((target.duration_frames[0][0] - expected_1).abs() < 1e-6);
+        assert!((target.duration_frames[0][1] - expected_2).abs() < 1e-6);
+        // f0 / energy は不変
+        assert!((target.f0[0][0] - 100.0).abs() < 1e-6);
+        assert!((target.energy[0][0] - (-20.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn to_log_duration_negative_clamps_to_zero() {
+        // 負値 → 0 clamp → log(0+1) = 0
+        let mut target = ProsodyTarget {
+            f0: vec![vec![100.0]],
+            duration_frames: vec![vec![-5.0]],
+            energy: vec![vec![-20.0]],
+            mask: None,
+        };
+        target.to_log_duration();
+        assert!(target.duration_frames[0][0].abs() < 1e-6);
+    }
+
+    #[test]
+    fn from_batch_log_duration_applies_log_transform() {
+        // Phase E-next-4: from_batch + to_log_duration の 1-step helper
+        let batch = make_valid_batch();
+        let raw = ProsodyTarget::from_batch(&batch, 256, 24_000).expect("raw");
+        let log_target = ProsodyTarget::from_batch_log_duration(&batch, 256, 24_000).expect("log");
+        // log_target.duration_frames[b][m] = log(raw.duration_frames[b][m] + 1)
+        for (raw_row, log_row) in raw.duration_frames.iter().zip(&log_target.duration_frames) {
+            for (r, l) in raw_row.iter().zip(log_row) {
+                let expected = r.ln_1p();
+                assert!(
+                    (l - expected).abs() < 1e-6,
+                    "log_dur mismatch raw={r} log={l} expected={expected}"
+                );
+            }
+        }
     }
 
     #[test]
