@@ -12,6 +12,7 @@
 //! | [`layer_norm`] | LayerNorm (forward + 手書き backward、PyTorch nn.LayerNorm 互換) |
 //! | [`multi_head_attention`] | Multi-Head Attention (self + cross、causal / bidirectional、forward + backward) |
 //! | [`positional_encoding`] | Sinusoidal (Vaswani 2017) + Rotary (RoPE, Su 2021) positional encoding |
+//! | [`weight_norm`] | WeightNorm reparametrization `w = g * v / ||v||` (Salimans & Kingma 2016) |
 //!
 //! # ロードマップ (Phase T.0-P)
 //!
@@ -19,7 +20,9 @@
 //! - ✅ LayerNorm + backward
 //! - ✅ MultiHeadAttention + backward (causal / bidirectional 両対応、self + cross)
 //! - ✅ PositionalEncoding (sinusoidal + rotary)
-//! - ⏳ WeightNorm (optional、Vocos style)
+//! - ✅ WeightNorm (Vocos / HiFi-GAN 用の weight reparametrization)
+//!
+//! **Phase T.0-P 100% 完了、Phase T.4a FastSpeech2 architecture 実装着手可能。**
 //!
 //! # 参照
 //!
@@ -31,6 +34,7 @@ pub mod conv1d;
 pub mod layer_norm;
 pub mod multi_head_attention;
 pub mod positional_encoding;
+pub mod weight_norm;
 
 pub use conv1d::{Conv1d, Conv1dConfig, Conv1dError};
 pub use layer_norm::{LayerNorm, LayerNormConfig, LayerNormError};
@@ -39,3 +43,4 @@ pub use positional_encoding::{
     PosEncError, RotaryEmbedding, RotaryEmbeddingConfig, SinusoidalPositionalEncoding,
     SinusoidalPositionalEncodingConfig,
 };
+pub use weight_norm::{WeightNorm, WeightNormConfig, WeightNormError};

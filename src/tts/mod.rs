@@ -31,4 +31,5 @@ pub use primitives::{
     Conv1d, Conv1dConfig, Conv1dError, LayerNorm, LayerNormConfig, LayerNormError, MhaError,
     MhaGrads, MultiHeadAttention, MultiHeadAttentionConfig, PosEncError, RotaryEmbedding,
     RotaryEmbeddingConfig, SinusoidalPositionalEncoding, SinusoidalPositionalEncodingConfig,
+    WeightNorm, WeightNormConfig, WeightNormError,
 };
