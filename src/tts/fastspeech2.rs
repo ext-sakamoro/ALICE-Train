@@ -751,6 +751,25 @@ fn reshape_time_last_to_channel_first(
     out
 }
 
+/// reshape `[batch, channels, seq_len]` → `[batch, seq_len, channels]` (Phase E-next-1)。
+fn reshape_channel_first_to_time_last(
+    x: &[f32],
+    batch: usize,
+    seq_len: usize,
+    channels: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0_f32; batch * seq_len * channels];
+    for b in 0..batch {
+        for t in 0..seq_len {
+            for c in 0..channels {
+                out[b * seq_len * channels + t * channels + c] =
+                    x[b * channels * seq_len + c * seq_len + t];
+            }
+        }
+    }
+    out
+}
+
 /// element-wise add of two same-shape vectors。
 fn add(a: &[f32], b: &[f32]) -> Vec<f32> {
     a.iter().zip(b).map(|(x, y)| x + y).collect()
@@ -1138,6 +1157,20 @@ impl FastSpeech2 {
             batch,
             mora_len,
         );
+
+        // Phase E-next-1: pitch/energy embed hidden injection
+        // pitch/energy pred [batch, mora_len] → Conv1D(1→hidden, k=1) → [batch, hidden, mora_len]
+        // → reshape to [batch, mora_len, hidden] → add to encoder_input
+        let encoder_input = inject_prosody_embed(
+            &encoder_input,
+            &pitch_pred_flat,
+            &energy_pred_flat,
+            &self.pitch_embed,
+            &self.energy_embed,
+            batch,
+            mora_len,
+            cfg.hidden_dim,
+        )?;
 
         // Length Regulator + Decoder + Mel + Postnet (forward と同じロジックを直呼び出し)
         let (expanded, frame_len_per_batch) = length_regulator(
@@ -1625,8 +1658,23 @@ impl FastSpeech2 {
             encoder_current = block.forward(&encoder_current, batch, mora_len);
         }
         let encoder_out = encoder_current;
-        let (expanded, _) = length_regulator(
+
+        // Phase E-next-1: forward の変分予測 + hidden injection を再現
+        let pitch_pred_flat = self.pitch_predictor.forward(&encoder_out, batch, mora_len);
+        let energy_pred_flat = self.energy_predictor.forward(&encoder_out, batch, mora_len);
+        let encoder_out_injected = inject_prosody_embed(
             &encoder_out,
+            &pitch_pred_flat,
+            &energy_pred_flat,
+            &self.pitch_embed,
+            &self.energy_embed,
+            batch,
+            mora_len,
+            cfg.hidden_dim,
+        )?;
+
+        let (expanded, _) = length_regulator(
+            &encoder_out_injected,
             batch,
             mora_len,
             cfg.hidden_dim,
@@ -1656,7 +1704,8 @@ impl FastSpeech2 {
             .map_err(|e| FastSpeech2Error::Internal {
                 reason: format!("decoder PE bw: {e}"),
             })?;
-        let mut grad_encoder_out = length_regulator_backward(
+        // grad_encoder_out_injected: grad w.r.t. injection 後の encoder_out
+        let grad_encoder_out_injected = length_regulator_backward(
             &grad_expanded,
             batch,
             mora_len,
@@ -1664,14 +1713,57 @@ impl FastSpeech2 {
             target_durations,
         );
 
-        // Step 5.5 (Phase E): Variance predictor 3 系統 backward
-        let (dur_grad_flat, pitch_grad_flat, energy_grad_flat) = prosody_grads_to_flat(
+        // Phase E-next-1 backward: pitch/energy embed backward
+        // grad w.r.t. encoder_out (base residual) = grad_encoder_out_injected
+        // grad w.r.t. pitch_embed_out (time_last) = grad_encoder_out_injected → reshape channel_first
+        // pitch_embed.backward: input = pitch_pred_flat [B, 1, mora_len], grad_output [B, hidden, mora_len]
+        let grad_injected_channel_first = reshape_time_last_to_channel_first(
+            &grad_encoder_out_injected,
+            batch,
+            mora_len,
+            cfg.hidden_dim,
+        );
+        let (grad_pitch_pred_flat_from_inj, pitch_embed_w_grad, pitch_embed_b_grad) = self
+            .pitch_embed
+            .backward(
+                &pitch_pred_flat,
+                &grad_injected_channel_first,
+                batch,
+                mora_len,
+            )
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("pitch_embed bw: {e}"),
+            })?;
+        let (grad_energy_pred_flat_from_inj, energy_embed_w_grad, energy_embed_b_grad) = self
+            .energy_embed
+            .backward(
+                &energy_pred_flat,
+                &grad_injected_channel_first,
+                batch,
+                mora_len,
+            )
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("energy_embed bw: {e}"),
+            })?;
+        grads.pitch_embed_w = pitch_embed_w_grad;
+        grads.pitch_embed_b = pitch_embed_b_grad;
+        grads.energy_embed_w = energy_embed_w_grad;
+        grads.energy_embed_b = energy_embed_b_grad;
+
+        // Step 5.5 (Phase E): caller の prosody grad + injection 由来を合算
+        let (dur_grad_flat, mut pitch_grad_flat, mut energy_grad_flat) = prosody_grads_to_flat(
             grad_duration_pred,
             grad_pitch_pred,
             grad_energy_pred,
             batch,
             mora_len,
         );
+        // pitch/energy grad に injection 由来 (in_channels=1 なので同 layout [B*mora_len]) を加算
+        for i in 0..pitch_grad_flat.len() {
+            pitch_grad_flat[i] += grad_pitch_pred_flat_from_inj[i];
+            energy_grad_flat[i] += grad_energy_pred_flat_from_inj[i];
+        }
+        // Variance predictor 3 系統 backward (predictor 入力は encoder_out = injection 前)
         let (grad_from_dur, dur_grads) =
             self.duration_predictor
                 .backward(&encoder_out, &dur_grad_flat, batch, mora_len);
@@ -1684,7 +1776,9 @@ impl FastSpeech2 {
         grads.duration_predictor = dur_grads;
         grads.pitch_predictor = pitch_grads;
         grads.energy_predictor = energy_grads;
-        // grad_encoder_out に 3 系統の変分予測 backward からの grad を加算
+
+        // grad_encoder_out (base) = grad_encoder_out_injected (residual path) + 3 系統 variance 経路
+        let mut grad_encoder_out = grad_encoder_out_injected;
         for i in 0..grad_encoder_out.len() {
             grad_encoder_out[i] += grad_from_dur[i] + grad_from_pitch[i] + grad_from_energy[i];
         }
@@ -2476,6 +2570,18 @@ impl FastSpeech2 {
     #[must_use]
     pub fn embedding(&self) -> &[f32] {
         &self.embedding
+    }
+
+    /// `pitch_embed` weight への参照 (Phase E-next-1 テスト用 accessor)。
+    #[must_use]
+    pub fn pitch_embed_weight(&self) -> &[f32] {
+        self.pitch_embed.weight()
+    }
+
+    /// `energy_embed` weight への参照 (Phase E-next-1 テスト用 accessor)。
+    #[must_use]
+    pub fn energy_embed_weight(&self) -> &[f32] {
+        self.energy_embed.weight()
     }
 
     /// SGD update: `w -= lr * grad` を全 sub-layer weight + bias に適用する。
@@ -3533,6 +3639,50 @@ fn apply_fft_block_sgd(block: &mut FftBlock, grads: &FftBlockGrads, lr: f32) {
     {
         *b -= lr * g;
     }
+}
+
+/// pitch/energy embed hidden injection (Phase E-next-1)。
+///
+/// pitch/energy prediction ([batch, mora_len]) を Conv1D(1→hidden, k=1) で hidden dim に展開し、
+/// encoder_out ([batch, mora_len, hidden]) に加算する。
+///
+/// `pitch_flat` / `energy_flat` layout: [batch * mora_len]
+/// Conv1D input layout (in_channels=1): [batch * 1 * mora_len] = 同一 flat
+/// Conv1D output layout: [batch, hidden, mora_len] → reshape → [batch, mora_len, hidden]
+///
+/// # Errors
+///
+/// - Conv1D forward エラー
+#[allow(clippy::too_many_arguments)]
+fn inject_prosody_embed(
+    encoder_input: &[f32],
+    pitch_flat: &[f32],
+    energy_flat: &[f32],
+    pitch_embed: &Conv1d,
+    energy_embed: &Conv1d,
+    batch: usize,
+    mora_len: usize,
+    hidden_dim: usize,
+) -> Result<Vec<f32>, FastSpeech2Error> {
+    let pitch_conv_out = pitch_embed
+        .forward(pitch_flat, batch, mora_len)
+        .map_err(|e| FastSpeech2Error::Internal {
+            reason: format!("pitch_embed fw: {e}"),
+        })?;
+    let energy_conv_out = energy_embed
+        .forward(energy_flat, batch, mora_len)
+        .map_err(|e| FastSpeech2Error::Internal {
+            reason: format!("energy_embed fw: {e}"),
+        })?;
+    let pitch_time_last =
+        reshape_channel_first_to_time_last(&pitch_conv_out, batch, mora_len, hidden_dim);
+    let energy_time_last =
+        reshape_channel_first_to_time_last(&energy_conv_out, batch, mora_len, hidden_dim);
+    let mut out = encoder_input.to_vec();
+    for i in 0..out.len() {
+        out[i] += pitch_time_last[i] + energy_time_last[i];
+    }
+    Ok(out)
 }
 
 /// Variance predictor の flat [B*S] 出力 3 系統を `ProsodyPrediction` `Vec<Vec<f32>>` に整形 (Phase E)。

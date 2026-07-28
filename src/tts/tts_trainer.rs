@@ -669,6 +669,73 @@ mod tests {
     }
 
     #[test]
+    fn step_prosody_updates_pitch_embed_weights() {
+        // Phase T.4a Phase E-next-1 smoke test: pitch/energy embed hidden injection
+        // step_prosody 実行後、pitch_embed / energy_embed の weight が変化する (grad != 0)
+        let cfg = small_config();
+        let mut model = FastSpeech2::zeros(cfg).unwrap();
+        model.init_xavier(789);
+        let pitch_w_before = model.pitch_embed_weight().to_vec();
+        let energy_w_before = model.energy_embed_weight().to_vec();
+
+        let mut trainer = TtsTrainer::new(
+            model,
+            TtsTrainConfig {
+                learning_rate: 1e-3,
+                log_interval: 100,
+            },
+        );
+
+        let batch = 1;
+        let mora_len = 3;
+        let mora_ids = vec![1_u32, 2, 3];
+        let durations = vec![2_u32, 2, 2];
+        let mel_target = vec![0.3_f32; 6 * cfg.mel_dim];
+        let prosody_target = ProsodyTarget {
+            f0: vec![vec![120.0, 130.0, 125.0]],
+            duration_frames: vec![vec![2.0, 2.0, 2.0]],
+            energy: vec![vec![-20.0, -18.0, -19.0]],
+            mask: None,
+        };
+        let prosody_cfg = ProsodyLoss::default_weights();
+
+        for _ in 0..3 {
+            trainer
+                .step_prosody(
+                    &mora_ids,
+                    &durations,
+                    &mel_target,
+                    &prosody_target,
+                    prosody_cfg,
+                    batch,
+                    mora_len,
+                )
+                .expect("step_prosody");
+        }
+        let pitch_w_after = trainer.model().pitch_embed_weight().to_vec();
+        let energy_w_after = trainer.model().energy_embed_weight().to_vec();
+        // どちらも grad != 0 で更新されているはず
+        let pitch_diff: f32 = pitch_w_before
+            .iter()
+            .zip(&pitch_w_after)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        let energy_diff: f32 = energy_w_before
+            .iter()
+            .zip(&energy_w_after)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            pitch_diff > 0.0,
+            "pitch_embed weight should change after step_prosody (got diff={pitch_diff})"
+        );
+        assert!(
+            energy_diff > 0.0,
+            "energy_embed weight should change after step_prosody (got diff={energy_diff})"
+        );
+    }
+
+    #[test]
     fn step_prosody_joint_loss_finite_and_decreases() {
         // Phase T.4a Phase E smoke test: mel + prosody joint loss (SGD)
         // 5 step 走らせて mel_loss + prosody.total どちらも finite + step カウンター上昇
