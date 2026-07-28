@@ -1376,6 +1376,97 @@ impl FastSpeech2 {
         }
     }
 
+    /// AdamW update: bias-corrected moment estimate + weight decay。
+    ///
+    /// state.step は自動 increment、初 call で step=1 開始。
+    /// weight_decay=0 で通常 Adam に相当 (loshchilov 2019 AdamW と等価)。
+    ///
+    /// # 前提
+    ///
+    /// - `state` は [`FastSpeech2AdamWState::zeros_from_config`] で shape 整合済であること
+    /// - grads は [`Self::backward_full`] 返却値と互換 shape
+    pub fn apply_adamw(
+        &mut self,
+        grads: &FastSpeech2Grads,
+        state: &mut FastSpeech2AdamWState,
+        config: &AdamWConfig,
+    ) {
+        state.step += 1;
+        let step = state.step as f32;
+        let bc1 = 1.0 - config.beta1.powf(step);
+        let bc2 = 1.0 - config.beta2.powf(step);
+
+        adamw_slice(
+            &mut self.embedding,
+            &grads.embedding,
+            &mut state.embedding_m,
+            &mut state.embedding_v,
+            config,
+            bc1,
+            bc2,
+        );
+        for (i, block) in self.encoder.iter_mut().enumerate() {
+            apply_fft_block_adamw(
+                block,
+                &grads.encoder[i],
+                &mut state.encoder[i],
+                config,
+                bc1,
+                bc2,
+            );
+        }
+        for (i, block) in self.decoder.iter_mut().enumerate() {
+            apply_fft_block_adamw(
+                block,
+                &grads.decoder[i],
+                &mut state.decoder[i],
+                config,
+                bc1,
+                bc2,
+            );
+        }
+        adamw_slice(
+            self.mel_linear.weight_mut(),
+            &grads.mel_linear_w,
+            &mut state.mel_linear_m_w,
+            &mut state.mel_linear_v_w,
+            config,
+            bc1,
+            bc2,
+        );
+        adamw_slice(
+            self.mel_linear.bias_mut(),
+            &grads.mel_linear_b,
+            &mut state.mel_linear_m_b,
+            &mut state.mel_linear_v_b,
+            config,
+            bc1,
+            bc2,
+        );
+        for (i, conv) in self.postnet.iter_mut().enumerate() {
+            adamw_slice(
+                conv.weight_mut(),
+                &grads.postnet_w[i],
+                &mut state.postnet_m_w[i],
+                &mut state.postnet_v_w[i],
+                config,
+                bc1,
+                bc2,
+            );
+            adamw_slice(
+                conv.bias_mut(),
+                &grads.postnet_b[i],
+                &mut state.postnet_m_b[i],
+                &mut state.postnet_v_b[i],
+                config,
+                bc1,
+                bc2,
+            );
+        }
+        // Variance predictor / pitch/energy embed backward で grad = 0 のため update 無効化
+        // (Phase T.4a 継続で ProsodyLoss joint 時に生きる)
+    }
+
     /// SGD update: `w -= lr * grad` を全 sub-layer weight + bias に適用する。
     ///
     /// Variance predictor + pitch/energy embed は backward_full で grad が 0 になっているため
@@ -1420,6 +1511,402 @@ impl FastSpeech2 {
             }
         }
     }
+}
+
+/// AdamW optimizer 設定 (Loshchilov & Hutter 2019)。
+///
+/// FastSpeech2 論文 default (Ren et al. 2021): lr=1e-3 initial with Noam schedule、
+/// beta1=0.9、beta2=0.98、eps=1e-9、weight_decay=0。
+#[derive(Clone, Copy, Debug)]
+pub struct AdamWConfig {
+    /// 学習率。
+    pub learning_rate: f32,
+    /// 1st moment decay (通常 0.9)。
+    pub beta1: f32,
+    /// 2nd moment decay (通常 0.999 または FastSpeech2 論文の 0.98)。
+    pub beta2: f32,
+    /// 数値安定性 eps (通常 1e-8)。
+    pub eps: f32,
+    /// L2 weight decay (通常 0)。
+    pub weight_decay: f32,
+}
+
+impl Default for AdamWConfig {
+    fn default() -> Self {
+        Self {
+            learning_rate: 1e-3,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.0,
+        }
+    }
+}
+
+/// FFT block 用 AdamW state (mha + attn_norm + ffn_conv1/2 + ffn_norm の m/v)。
+#[derive(Clone, Debug, Default)]
+pub struct FftBlockAdamWState {
+    /// MHA Q/K/V/O weight m/v。
+    pub mha_m_w_q: Vec<f32>,
+    /// MHA V weight m。
+    pub mha_v_w_q: Vec<f32>,
+    /// (K)。
+    pub mha_m_w_k: Vec<f32>,
+    /// (K)。
+    pub mha_v_w_k: Vec<f32>,
+    /// (V)。
+    pub mha_m_w_v: Vec<f32>,
+    /// (V)。
+    pub mha_v_w_v: Vec<f32>,
+    /// (O)。
+    pub mha_m_w_o: Vec<f32>,
+    /// (O)。
+    pub mha_v_w_o: Vec<f32>,
+    /// MHA bias m/v。
+    pub mha_m_b_q: Vec<f32>,
+    /// (Q)。
+    pub mha_v_b_q: Vec<f32>,
+    /// (K)。
+    pub mha_m_b_k: Vec<f32>,
+    /// (K)。
+    pub mha_v_b_k: Vec<f32>,
+    /// (V)。
+    pub mha_m_b_v: Vec<f32>,
+    /// (V)。
+    pub mha_v_b_v: Vec<f32>,
+    /// (O)。
+    pub mha_m_b_o: Vec<f32>,
+    /// (O)。
+    pub mha_v_b_o: Vec<f32>,
+    /// attn_norm gamma m/v。
+    pub attn_norm_m_gamma: Vec<f32>,
+    /// (v)。
+    pub attn_norm_v_gamma: Vec<f32>,
+    /// attn_norm beta m/v。
+    pub attn_norm_m_beta: Vec<f32>,
+    /// (v)。
+    pub attn_norm_v_beta: Vec<f32>,
+    /// ffn_conv1 w m/v。
+    pub ffn_conv1_m_w: Vec<f32>,
+    /// (v)。
+    pub ffn_conv1_v_w: Vec<f32>,
+    /// ffn_conv1 b m/v。
+    pub ffn_conv1_m_b: Vec<f32>,
+    /// (v)。
+    pub ffn_conv1_v_b: Vec<f32>,
+    /// ffn_conv2 w m/v。
+    pub ffn_conv2_m_w: Vec<f32>,
+    /// (v)。
+    pub ffn_conv2_v_w: Vec<f32>,
+    /// ffn_conv2 b m/v。
+    pub ffn_conv2_m_b: Vec<f32>,
+    /// (v)。
+    pub ffn_conv2_v_b: Vec<f32>,
+    /// ffn_norm gamma m/v。
+    pub ffn_norm_m_gamma: Vec<f32>,
+    /// (v)。
+    pub ffn_norm_v_gamma: Vec<f32>,
+    /// ffn_norm beta m/v。
+    pub ffn_norm_m_beta: Vec<f32>,
+    /// (v)。
+    pub ffn_norm_v_beta: Vec<f32>,
+}
+
+/// FastSpeech2 全体の AdamW state (m/v + step)。
+#[derive(Clone, Debug, Default)]
+pub struct FastSpeech2AdamWState {
+    /// step counter (bias correction 用)。
+    pub step: usize,
+    /// Embedding m/v。
+    pub embedding_m: Vec<f32>,
+    /// (v)。
+    pub embedding_v: Vec<f32>,
+    /// Encoder FftBlock 各層 state。
+    pub encoder: Vec<FftBlockAdamWState>,
+    /// Decoder FftBlock 各層 state。
+    pub decoder: Vec<FftBlockAdamWState>,
+    /// mel_linear weight m/v。
+    pub mel_linear_m_w: Vec<f32>,
+    /// (v)。
+    pub mel_linear_v_w: Vec<f32>,
+    /// mel_linear bias m/v。
+    pub mel_linear_m_b: Vec<f32>,
+    /// (v)。
+    pub mel_linear_v_b: Vec<f32>,
+    /// Postnet 各層 weight m。
+    pub postnet_m_w: Vec<Vec<f32>>,
+    /// Postnet 各層 weight v。
+    pub postnet_v_w: Vec<Vec<f32>>,
+    /// Postnet 各層 bias m。
+    pub postnet_m_b: Vec<Vec<f32>>,
+    /// Postnet 各層 bias v。
+    pub postnet_v_b: Vec<Vec<f32>>,
+}
+
+impl FastSpeech2AdamWState {
+    /// FastSpeech2Config に合わせた 0 埋め state を構築する。
+    #[must_use]
+    pub fn zeros_from_config(cfg: &FastSpeech2Config) -> Self {
+        let h = cfg.hidden_dim;
+        let mel = cfg.mel_dim;
+        let mid = h * cfg.fft_expansion;
+        let fft_state = || FftBlockAdamWState {
+            mha_m_w_q: vec![0.0; h * h],
+            mha_v_w_q: vec![0.0; h * h],
+            mha_m_w_k: vec![0.0; h * h],
+            mha_v_w_k: vec![0.0; h * h],
+            mha_m_w_v: vec![0.0; h * h],
+            mha_v_w_v: vec![0.0; h * h],
+            mha_m_w_o: vec![0.0; h * h],
+            mha_v_w_o: vec![0.0; h * h],
+            mha_m_b_q: vec![0.0; h],
+            mha_v_b_q: vec![0.0; h],
+            mha_m_b_k: vec![0.0; h],
+            mha_v_b_k: vec![0.0; h],
+            mha_m_b_v: vec![0.0; h],
+            mha_v_b_v: vec![0.0; h],
+            mha_m_b_o: vec![0.0; h],
+            mha_v_b_o: vec![0.0; h],
+            attn_norm_m_gamma: vec![0.0; h],
+            attn_norm_v_gamma: vec![0.0; h],
+            attn_norm_m_beta: vec![0.0; h],
+            attn_norm_v_beta: vec![0.0; h],
+            ffn_conv1_m_w: vec![0.0; mid * h * cfg.fft_kernel_size],
+            ffn_conv1_v_w: vec![0.0; mid * h * cfg.fft_kernel_size],
+            ffn_conv1_m_b: vec![0.0; mid],
+            ffn_conv1_v_b: vec![0.0; mid],
+            ffn_conv2_m_w: vec![0.0; h * mid * cfg.fft_kernel_size],
+            ffn_conv2_v_w: vec![0.0; h * mid * cfg.fft_kernel_size],
+            ffn_conv2_m_b: vec![0.0; h],
+            ffn_conv2_v_b: vec![0.0; h],
+            ffn_norm_m_gamma: vec![0.0; h],
+            ffn_norm_v_gamma: vec![0.0; h],
+            ffn_norm_m_beta: vec![0.0; h],
+            ffn_norm_v_beta: vec![0.0; h],
+        };
+
+        let postnet_shapes: Vec<usize> = (0..cfg.postnet_layers)
+            .map(|i| {
+                let (in_ch, out_ch) = if i == 0 {
+                    (mel, cfg.postnet_hidden)
+                } else if i == cfg.postnet_layers - 1 {
+                    (cfg.postnet_hidden, mel)
+                } else {
+                    (cfg.postnet_hidden, cfg.postnet_hidden)
+                };
+                out_ch * in_ch * cfg.postnet_kernel_size
+            })
+            .collect();
+        let postnet_bias_shapes: Vec<usize> = (0..cfg.postnet_layers)
+            .map(|i| {
+                if i == cfg.postnet_layers - 1 {
+                    mel
+                } else {
+                    cfg.postnet_hidden
+                }
+            })
+            .collect();
+
+        Self {
+            step: 0,
+            embedding_m: vec![0.0; cfg.vocab_size * h],
+            embedding_v: vec![0.0; cfg.vocab_size * h],
+            encoder: (0..cfg.num_encoder_layers).map(|_| fft_state()).collect(),
+            decoder: (0..cfg.num_decoder_layers).map(|_| fft_state()).collect(),
+            mel_linear_m_w: vec![0.0; mel * h],
+            mel_linear_v_w: vec![0.0; mel * h],
+            mel_linear_m_b: vec![0.0; mel],
+            mel_linear_v_b: vec![0.0; mel],
+            postnet_m_w: postnet_shapes.iter().map(|&n| vec![0.0; n]).collect(),
+            postnet_v_w: postnet_shapes.iter().map(|&n| vec![0.0; n]).collect(),
+            postnet_m_b: postnet_bias_shapes.iter().map(|&n| vec![0.0; n]).collect(),
+            postnet_v_b: postnet_bias_shapes.iter().map(|&n| vec![0.0; n]).collect(),
+        }
+    }
+}
+
+/// AdamW slice update: `w -= lr * (m_hat / (sqrt(v_hat) + eps) + wd * w)`。
+fn adamw_slice(
+    w: &mut [f32],
+    g: &[f32],
+    m: &mut [f32],
+    v: &mut [f32],
+    config: &AdamWConfig,
+    bc1: f32,
+    bc2: f32,
+) {
+    for i in 0..w.len() {
+        let gi = g[i];
+        m[i] = config.beta1 * m[i] + (1.0 - config.beta1) * gi;
+        v[i] = config.beta2 * v[i] + (1.0 - config.beta2) * gi * gi;
+        let m_hat = m[i] / bc1;
+        let v_hat = v[i] / bc2;
+        w[i] -= config.learning_rate
+            * (m_hat / (v_hat.sqrt() + config.eps) + config.weight_decay * w[i]);
+    }
+}
+
+/// FftBlock AdamW update helper。
+fn apply_fft_block_adamw(
+    block: &mut FftBlock,
+    grads: &FftBlockGrads,
+    state: &mut FftBlockAdamWState,
+    config: &AdamWConfig,
+    bc1: f32,
+    bc2: f32,
+) {
+    // MHA
+    let has_bias = block.self_attn.config().bias;
+    adamw_slice(
+        block.self_attn.w_q_mut(),
+        &grads.mha.w_q,
+        &mut state.mha_m_w_q,
+        &mut state.mha_v_w_q,
+        config,
+        bc1,
+        bc2,
+    );
+    adamw_slice(
+        block.self_attn.w_k_mut(),
+        &grads.mha.w_k,
+        &mut state.mha_m_w_k,
+        &mut state.mha_v_w_k,
+        config,
+        bc1,
+        bc2,
+    );
+    adamw_slice(
+        block.self_attn.w_v_mut(),
+        &grads.mha.w_v,
+        &mut state.mha_m_w_v,
+        &mut state.mha_v_w_v,
+        config,
+        bc1,
+        bc2,
+    );
+    adamw_slice(
+        block.self_attn.w_o_mut(),
+        &grads.mha.w_o,
+        &mut state.mha_m_w_o,
+        &mut state.mha_v_w_o,
+        config,
+        bc1,
+        bc2,
+    );
+    if has_bias {
+        adamw_slice(
+            block.self_attn.b_q_mut(),
+            &grads.mha.b_q,
+            &mut state.mha_m_b_q,
+            &mut state.mha_v_b_q,
+            config,
+            bc1,
+            bc2,
+        );
+        adamw_slice(
+            block.self_attn.b_k_mut(),
+            &grads.mha.b_k,
+            &mut state.mha_m_b_k,
+            &mut state.mha_v_b_k,
+            config,
+            bc1,
+            bc2,
+        );
+        adamw_slice(
+            block.self_attn.b_v_mut(),
+            &grads.mha.b_v,
+            &mut state.mha_m_b_v,
+            &mut state.mha_v_b_v,
+            config,
+            bc1,
+            bc2,
+        );
+        adamw_slice(
+            block.self_attn.b_o_mut(),
+            &grads.mha.b_o,
+            &mut state.mha_m_b_o,
+            &mut state.mha_v_b_o,
+            config,
+            bc1,
+            bc2,
+        );
+    }
+    // attn_norm
+    adamw_slice(
+        block.attn_norm.gamma_mut(),
+        &grads.attn_norm_gamma,
+        &mut state.attn_norm_m_gamma,
+        &mut state.attn_norm_v_gamma,
+        config,
+        bc1,
+        bc2,
+    );
+    adamw_slice(
+        block.attn_norm.beta_mut(),
+        &grads.attn_norm_beta,
+        &mut state.attn_norm_m_beta,
+        &mut state.attn_norm_v_beta,
+        config,
+        bc1,
+        bc2,
+    );
+    // ffn_conv1
+    adamw_slice(
+        block.ffn_conv1.weight_mut(),
+        &grads.ffn_conv1_w,
+        &mut state.ffn_conv1_m_w,
+        &mut state.ffn_conv1_v_w,
+        config,
+        bc1,
+        bc2,
+    );
+    adamw_slice(
+        block.ffn_conv1.bias_mut(),
+        &grads.ffn_conv1_b,
+        &mut state.ffn_conv1_m_b,
+        &mut state.ffn_conv1_v_b,
+        config,
+        bc1,
+        bc2,
+    );
+    // ffn_conv2
+    adamw_slice(
+        block.ffn_conv2.weight_mut(),
+        &grads.ffn_conv2_w,
+        &mut state.ffn_conv2_m_w,
+        &mut state.ffn_conv2_v_w,
+        config,
+        bc1,
+        bc2,
+    );
+    adamw_slice(
+        block.ffn_conv2.bias_mut(),
+        &grads.ffn_conv2_b,
+        &mut state.ffn_conv2_m_b,
+        &mut state.ffn_conv2_v_b,
+        config,
+        bc1,
+        bc2,
+    );
+    // ffn_norm
+    adamw_slice(
+        block.ffn_norm.gamma_mut(),
+        &grads.ffn_norm_gamma,
+        &mut state.ffn_norm_m_gamma,
+        &mut state.ffn_norm_v_gamma,
+        config,
+        bc1,
+        bc2,
+    );
+    adamw_slice(
+        block.ffn_norm.beta_mut(),
+        &grads.ffn_norm_beta,
+        &mut state.ffn_norm_m_beta,
+        &mut state.ffn_norm_v_beta,
+        config,
+        bc1,
+        bc2,
+    );
 }
 
 /// Gaussian (Box-Muller) sampling helper (uniform → normal)。

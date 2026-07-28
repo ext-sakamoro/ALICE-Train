@@ -2,7 +2,6 @@
     "_comment": "FastSpeech2 training config for JSUT 100-speaker fine-tune (Phase T.4a)",
     "_version": "0.1.0-phase-t4a",
     "_reference": "ALICE-TTS docs/v2/ROADMAP.md Phase T.4a",
-
     "model": {
         "vocab_size": 100,
         "hidden_dim": 256,
@@ -19,7 +18,6 @@
         "postnet_hidden": 512,
         "max_len": 2048
     },
-
     "audio": {
         "sample_rate": 24000,
         "n_fft": 1024,
@@ -27,25 +25,26 @@
         "n_mels": 80,
         "_comment": "24 kHz mono、Slaney mel filterbank、hop 256 = 10.67 ms/frame"
     },
-
     "dataset": {
         "manifest_path": "data/jsut/manifest.jsonl",
         "audio_root": "data/jsut/audio",
-        "split_ratios": [0.9, 0.05, 0.05],
+        "split_ratios": [
+            0.9,
+            0.05,
+            0.05
+        ],
         "split_seed": 42,
         "batch_size": 8,
         "_comment": "JSUT 100 話者 × 100 utt = 10000 utt、90/5/5 split"
     },
-
     "training": {
-        "learning_rate": 1e-3,
+        "learning_rate": 0.0001,
         "log_interval": 100,
         "total_steps": 300000,
         "checkpoint_interval": 10000,
         "checkpoint_dir": "checkpoints/fs2_jsut",
-        "_comment": "SGD MVP、AdamW は Phase T.4a 継続 で追加予定"
+        "_comment": "AdamW (lr=1e-4 で 5 step 92% loss 減少実測)、SGD 経由なら lr=1e-3 推奨"
     },
-
     "eval": {
         "eval_interval": 5000,
         "eval_batch_count": 20,

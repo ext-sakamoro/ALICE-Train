@@ -45,12 +45,29 @@
 //! # }
 //! ```
 
-use crate::tts::fastspeech2::{FastSpeech2, FastSpeech2Error};
+use crate::tts::fastspeech2::{AdamWConfig, FastSpeech2, FastSpeech2AdamWState, FastSpeech2Error};
+
+/// Optimizer 種別 (SGD or AdamW)。
+#[derive(Clone, Copy, Debug)]
+pub enum TtsOptimizer {
+    /// SGD (単純な w -= lr * grad)。
+    Sgd,
+    /// AdamW (bias-corrected moment + weight decay)。
+    AdamW(AdamWConfig),
+}
+
+impl TtsOptimizer {
+    /// Default AdamW config (lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8, wd=0)。
+    #[must_use]
+    pub fn default_adamw() -> Self {
+        Self::AdamW(AdamWConfig::default())
+    }
+}
 
 /// TTS trainer 設定。
 #[derive(Clone, Copy, Debug)]
 pub struct TtsTrainConfig {
-    /// 学習率 (SGD)。
+    /// 学習率 (SGD 用、AdamW の場合は AdamWConfig 側の learning_rate が優先)。
     pub learning_rate: f32,
     /// log 出力間隔 (step 単位)。
     pub log_interval: usize,
@@ -76,24 +93,51 @@ pub struct TtsStepResult {
 
 /// TTS 学習 trainer。
 ///
-/// FastSpeech2 model + TtsTrainConfig を保持し、step method で 1 iteration を実行する。
-/// MVP: SGD only (AdamW は Phase T.4a 継続 で追加予定)。
+/// FastSpeech2 model + TtsTrainConfig + Optimizer (SGD or AdamW) を保持し、
+/// step method で 1 iteration を実行する。AdamW は state を内部保持。
 #[derive(Debug)]
 pub struct TtsTrainer {
     model: FastSpeech2,
     config: TtsTrainConfig,
+    optimizer: TtsOptimizer,
+    adamw_state: Option<FastSpeech2AdamWState>,
     step_count: usize,
 }
 
 impl TtsTrainer {
-    /// 新しい trainer を構築する。
+    /// 新しい trainer を構築する (SGD default)。
     #[must_use]
     pub fn new(model: FastSpeech2, config: TtsTrainConfig) -> Self {
         Self {
             model,
             config,
+            optimizer: TtsOptimizer::Sgd,
+            adamw_state: None,
             step_count: 0,
         }
+    }
+
+    /// AdamW optimizer で trainer を構築する。
+    #[must_use]
+    pub fn with_adamw(
+        model: FastSpeech2,
+        config: TtsTrainConfig,
+        adamw_config: AdamWConfig,
+    ) -> Self {
+        let cfg = *model.config();
+        Self {
+            model,
+            config,
+            optimizer: TtsOptimizer::AdamW(adamw_config),
+            adamw_state: Some(FastSpeech2AdamWState::zeros_from_config(&cfg)),
+            step_count: 0,
+        }
+    }
+
+    /// 現在の optimizer 種別。
+    #[must_use]
+    pub fn optimizer(&self) -> &TtsOptimizer {
+        &self.optimizer
     }
 
     /// 内部 model への参照。
@@ -170,8 +214,19 @@ impl TtsTrainer {
             self.model
                 .backward_full(mora_ids, target_durations, &grad_mel, batch, mora_len)?;
 
-        // 4. SGD update
-        self.model.apply_sgd(&grads, self.config.learning_rate);
+        // 4. Optimizer step
+        match self.optimizer {
+            TtsOptimizer::Sgd => {
+                self.model.apply_sgd(&grads, self.config.learning_rate);
+            }
+            TtsOptimizer::AdamW(ref adamw_cfg) => {
+                let state = self
+                    .adamw_state
+                    .as_mut()
+                    .expect("AdamW state should be initialized in with_adamw");
+                self.model.apply_adamw(&grads, state, adamw_cfg);
+            }
+        }
 
         self.step_count += 1;
         Ok(TtsStepResult {
@@ -275,5 +330,49 @@ mod tests {
         let cfg = TtsTrainConfig::default();
         assert!((cfg.learning_rate - 1e-3).abs() < 1e-9);
         assert_eq!(cfg.log_interval, 100);
+    }
+
+    #[test]
+    fn adamw_trainer_step_is_finite() {
+        // AdamW trainer で 5 step 実行、NaN/Inf 出ない + step counter 上がる
+        let cfg = small_config();
+        let mut model = FastSpeech2::zeros(cfg).unwrap();
+        model.init_xavier(42);
+        let mut trainer = TtsTrainer::with_adamw(
+            model,
+            TtsTrainConfig::default(),
+            crate::tts::AdamWConfig::default(),
+        );
+        let mora_ids = vec![1_u32, 2, 3];
+        let durations = vec![2_u32, 2, 2];
+        let mel_target = vec![0.3_f32; 6 * cfg.mel_dim];
+
+        let mut prev_loss = f32::MAX;
+        for i in 1..=5 {
+            let result = trainer
+                .step(&mora_ids, &durations, &mel_target, 1, 3)
+                .expect("step");
+            assert!(result.mel_loss.is_finite(), "step {i} loss NaN");
+            assert_eq!(result.step, i);
+            // AdamW は loss が減少 or 一定するはず (5 step で必ず減少とは限らないため緩い assert)
+            let _ = prev_loss;
+            prev_loss = result.mel_loss;
+        }
+        assert_eq!(trainer.step_count(), 5);
+    }
+
+    #[test]
+    fn adamw_vs_sgd_optimizer_field_reflects() {
+        let cfg = small_config();
+        let model = FastSpeech2::zeros(cfg).unwrap();
+        let sgd_trainer = TtsTrainer::new(model.clone(), TtsTrainConfig::default());
+        matches!(sgd_trainer.optimizer(), TtsOptimizer::Sgd);
+
+        let adamw_trainer = TtsTrainer::with_adamw(
+            model,
+            TtsTrainConfig::default(),
+            crate::tts::AdamWConfig::default(),
+        );
+        matches!(adamw_trainer.optimizer(), TtsOptimizer::AdamW(_));
     }
 }

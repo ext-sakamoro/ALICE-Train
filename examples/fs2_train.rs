@@ -52,8 +52,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "tts")]
     {
         use alice_train::tts::{
-            AudioFeatureExtractor, FastSpeech2, FastSpeech2Config, TtsDataset, TtsTrainConfig,
-            TtsTrainer,
+            AdamWConfig, AudioFeatureExtractor, FastSpeech2, FastSpeech2Config, TtsDataset,
+            TtsTrainConfig, TtsTrainer,
         };
 
         // 1. Model 構築
@@ -87,7 +87,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             learning_rate: config["training"]["learning_rate"].as_f64().unwrap_or(1e-3) as f32,
             log_interval: config["training"]["log_interval"].as_u64().unwrap_or(100) as usize,
         };
-        let mut trainer = TtsTrainer::new(model, train_config);
+        // AdamW optimizer (SGD より収束速い)
+        let adamw_config = AdamWConfig {
+            learning_rate: train_config.learning_rate,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.0,
+        };
+        let mut trainer = TtsTrainer::with_adamw(model, train_config, adamw_config);
 
         // 3. Dataset 構築
         let sample_rate = config["audio"]["sample_rate"].as_u64().unwrap_or(24_000) as u32;

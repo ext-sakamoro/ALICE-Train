@@ -267,6 +267,46 @@ impl MultiHeadAttention {
         }
     }
 
+    /// Q projection weight への可変参照 (optimizer 更新用)。
+    pub fn w_q_mut(&mut self) -> &mut [f32] {
+        &mut self.w_q
+    }
+
+    /// K projection weight への可変参照。
+    pub fn w_k_mut(&mut self) -> &mut [f32] {
+        &mut self.w_k
+    }
+
+    /// V projection weight への可変参照。
+    pub fn w_v_mut(&mut self) -> &mut [f32] {
+        &mut self.w_v
+    }
+
+    /// O projection weight への可変参照。
+    pub fn w_o_mut(&mut self) -> &mut [f32] {
+        &mut self.w_o
+    }
+
+    /// Q projection bias への可変参照。
+    pub fn b_q_mut(&mut self) -> &mut [f32] {
+        &mut self.b_q
+    }
+
+    /// K projection bias への可変参照。
+    pub fn b_k_mut(&mut self) -> &mut [f32] {
+        &mut self.b_k
+    }
+
+    /// V projection bias への可変参照。
+    pub fn b_v_mut(&mut self) -> &mut [f32] {
+        &mut self.b_v
+    }
+
+    /// O projection bias への可変参照。
+    pub fn b_o_mut(&mut self) -> &mut [f32] {
+        &mut self.b_o
+    }
+
     /// SGD update: `w -= lr * grad` を全 8 tensor に適用する (Q/K/V/O weight + bias)。
     pub fn apply_sgd(&mut self, grads: &MhaGrads, lr: f32) {
         for (w, g) in self.w_q.iter_mut().zip(&grads.w_q) {

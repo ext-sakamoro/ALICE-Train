@@ -28,7 +28,10 @@ pub mod tts_trainer;
 pub use audio::AudioFeatureExtractor;
 pub use batch::{TtsBatch, TtsBatchError};
 pub use dataset::{TtsDataset, TtsDatasetError, TtsManifestEntry};
-pub use fastspeech2::{FastSpeech2, FastSpeech2Config, FastSpeech2Error, FastSpeech2Grads};
+pub use fastspeech2::{
+    AdamWConfig, FastSpeech2, FastSpeech2AdamWState, FastSpeech2Config, FastSpeech2Error,
+    FastSpeech2Grads, FftBlockAdamWState,
+};
 pub use loss::{LossComponents, ProsodyLoss, ProsodyLossError, ProsodyPrediction, ProsodyTarget};
 pub use primitives::{
     Conv1d, Conv1dConfig, Conv1dError, LayerNorm, LayerNormConfig, LayerNormError, Linear,
@@ -36,4 +39,4 @@ pub use primitives::{
     PosEncError, RotaryEmbedding, RotaryEmbeddingConfig, SinusoidalPositionalEncoding,
     SinusoidalPositionalEncodingConfig, WeightNorm, WeightNormConfig, WeightNormError,
 };
-pub use tts_trainer::{TtsStepResult, TtsTrainConfig, TtsTrainer};
+pub use tts_trainer::{TtsOptimizer, TtsStepResult, TtsTrainConfig, TtsTrainer};
