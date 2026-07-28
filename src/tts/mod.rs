@@ -27,7 +27,7 @@ pub mod primitives;
 pub use audio::AudioFeatureExtractor;
 pub use batch::{TtsBatch, TtsBatchError};
 pub use dataset::{TtsDataset, TtsDatasetError, TtsManifestEntry};
-pub use fastspeech2::{FastSpeech2, FastSpeech2Config, FastSpeech2Error};
+pub use fastspeech2::{FastSpeech2, FastSpeech2Config, FastSpeech2Error, FastSpeech2Grads};
 pub use loss::{LossComponents, ProsodyLoss, ProsodyLossError, ProsodyPrediction, ProsodyTarget};
 pub use primitives::{
     Conv1d, Conv1dConfig, Conv1dError, LayerNorm, LayerNormConfig, LayerNormError, Linear,

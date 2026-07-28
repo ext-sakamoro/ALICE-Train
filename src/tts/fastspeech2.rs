@@ -651,6 +651,208 @@ impl FastSpeech2 {
 
         Ok(mel_after)
     }
+
+    /// FastSpeech2 backward (Phase 1 partial: **Postnet + mel_linear のみ**)。
+    ///
+    /// grad_mel を受け取り、Postnet 残差経路 + mel_linear projection の勾配を計算する。
+    /// encoder / decoder / variance predictor / embedding の勾配は現 Phase 1 では未実装
+    /// (0 埋めで返却)、Phase T.4a 継続実装で埋める予定。
+    ///
+    /// # 戻り値
+    ///
+    /// `(grads, grad_decoder_out)`:
+    /// - `grads`: [`FastSpeech2Grads`] bundle。mel_linear と postnet の grad_w / grad_b が埋まる、
+    ///   他は shape 正しい 0 埋め (encoder/decoder backward 未実装のため)
+    /// - `grad_decoder_out`: mel_linear 入力に対する grad (`[batch, frame_len, hidden_dim]` flatten)。
+    ///   Phase T.4a 継続で decoder backward に渡す入力になる。
+    ///
+    /// # 手順
+    ///
+    /// 1. Forward を再計算して mel_before と postnet 各層の中間 activation を取得
+    /// 2. `grad_mel_after` を Postnet residual add 経由で分岐: `grad_mel_before = grad_mel_after`,
+    ///    `grad_postnet_residual = grad_mel_after`
+    /// 3. Postnet chain backward: 最終 Conv1D → tanh backward → Conv1D → ... (逆順)
+    /// 4. `grad_mel_before` を mel_linear.backward で `grad_decoder_out` へ変換
+    ///
+    /// # Errors
+    ///
+    /// - shape 不整合
+    /// - forward と同じエラー
+    pub fn backward_terminal(
+        &self,
+        mora_ids: &[u32],
+        target_durations: &[u32],
+        grad_mel: &[f32],
+        batch: usize,
+        mora_len: usize,
+    ) -> Result<(FastSpeech2Grads, Vec<f32>), FastSpeech2Error> {
+        let cfg = self.config;
+        // grad_mel shape check
+        let total_frames: u32 = target_durations
+            .chunks_exact(mora_len)
+            .map(|c| c.iter().sum::<u32>())
+            .max()
+            .unwrap_or(0);
+        let frame_len = total_frames as usize;
+        let expected = batch * frame_len * cfg.mel_dim;
+        if grad_mel.len() != expected {
+            return Err(FastSpeech2Error::ShapeMismatch {
+                field: "grad_mel",
+                expected,
+                actual: grad_mel.len(),
+            });
+        }
+
+        // Step 1: Recompute forward up to decoder_out + mel_before + postnet chain
+        // (再計算コストはあるが、cache を返さない forward API 互換性を保つ)
+        let mut embedded = vec![0.0_f32; batch * mora_len * cfg.hidden_dim];
+        for b in 0..batch {
+            for t in 0..mora_len {
+                let id = mora_ids[b * mora_len + t] as usize;
+                let src = &self.embedding[id * cfg.hidden_dim..(id + 1) * cfg.hidden_dim];
+                let dst_start = b * mora_len * cfg.hidden_dim + t * cfg.hidden_dim;
+                embedded[dst_start..dst_start + cfg.hidden_dim].copy_from_slice(src);
+            }
+        }
+        let mut encoder_input = self
+            .encoder_pos_enc
+            .forward(&embedded, batch, mora_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("encoder PE: {e}"),
+            })?;
+        for block in &self.encoder {
+            encoder_input = block.forward(&encoder_input, batch, mora_len);
+        }
+        let (expanded, _) = length_regulator(
+            &encoder_input,
+            batch,
+            mora_len,
+            cfg.hidden_dim,
+            target_durations,
+        );
+        let mut decoder_input = self
+            .decoder_pos_enc
+            .forward(&expanded, batch, frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("decoder PE: {e}"),
+            })?;
+        for block in &self.decoder {
+            decoder_input = block.forward(&decoder_input, batch, frame_len);
+        }
+        let mel_before = self
+            .mel_linear
+            .forward(&decoder_input, batch * frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("mel linear: {e}"),
+            })?;
+
+        // Postnet forward で intermediate 保存 (backward 用)
+        let mel_reshaped =
+            reshape_time_last_to_channel_first(&mel_before, batch, frame_len, cfg.mel_dim);
+        let mut postnet_inputs: Vec<Vec<f32>> = Vec::with_capacity(self.postnet.len());
+        let mut postnet_pre_tanh: Vec<Vec<f32>> = Vec::with_capacity(self.postnet.len());
+        let mut current = mel_reshaped;
+        for (i, conv) in self.postnet.iter().enumerate() {
+            postnet_inputs.push(current.clone());
+            let conv_out = conv.forward(&current, batch, frame_len).map_err(|e| {
+                FastSpeech2Error::Internal {
+                    reason: format!("postnet[{i}]: {e}"),
+                }
+            })?;
+            postnet_pre_tanh.push(conv_out.clone());
+            if i < self.postnet.len() - 1 {
+                current = conv_out.iter().map(|&x| x.tanh()).collect();
+            } else {
+                current = conv_out;
+            }
+        }
+
+        // Step 2: grad_mel_after residual 分岐
+        // grad_mel_before += grad_mel_after (from add)
+        // grad_postnet_out += grad_mel_after (from add)
+        let grad_mel_before = grad_mel.to_vec();
+        // reshape grad_mel to [B, mel, frame_len] for postnet chain backward
+        let grad_postnet_out_reshaped =
+            reshape_time_last_to_channel_first(grad_mel, batch, frame_len, cfg.mel_dim);
+
+        // Step 3: Postnet chain backward (reverse order)
+        let mut postnet_w_grads: Vec<Vec<f32>> = vec![Vec::new(); self.postnet.len()];
+        let mut postnet_b_grads: Vec<Vec<f32>> = vec![Vec::new(); self.postnet.len()];
+
+        let mut grad_current = grad_postnet_out_reshaped;
+        for i in (0..self.postnet.len()).rev() {
+            // 最終層以外は tanh backward: grad_pre_tanh = grad_post_tanh * (1 - tanh²)
+            if i < self.postnet.len() - 1 {
+                let pre_tanh = &postnet_pre_tanh[i];
+                for (g, &pre) in grad_current.iter_mut().zip(pre_tanh) {
+                    let t = pre.tanh();
+                    *g *= 1.0 - t * t;
+                }
+            }
+            // Conv1D backward
+            let (grad_in, grad_w, grad_b) = self.postnet[i]
+                .backward(&postnet_inputs[i], &grad_current, batch, frame_len)
+                .map_err(|e| FastSpeech2Error::Internal {
+                    reason: format!("postnet[{i}] backward: {e}"),
+                })?;
+            postnet_w_grads[i] = grad_w;
+            postnet_b_grads[i] = grad_b;
+            grad_current = grad_in;
+        }
+        // grad_current is now in [B, mel, frame_len] layout, reshape to [B, frame_len, mel]
+        let mut grad_postnet_chain_out = vec![0.0_f32; batch * frame_len * cfg.mel_dim];
+        for b in 0..batch {
+            for t in 0..frame_len {
+                for c in 0..cfg.mel_dim {
+                    grad_postnet_chain_out[b * frame_len * cfg.mel_dim + t * cfg.mel_dim + c] =
+                        grad_current[b * cfg.mel_dim * frame_len + c * frame_len + t];
+                }
+            }
+        }
+        // grad_mel_before は 2 経路合成: mel_after からの直接 + postnet chain 経由
+        let grad_mel_before_combined: Vec<f32> = grad_mel_before
+            .iter()
+            .zip(&grad_postnet_chain_out)
+            .map(|(a, b)| a + b)
+            .collect();
+
+        // Step 4: mel_linear backward
+        let (grad_decoder_out, grad_mel_w, grad_mel_b) = self
+            .mel_linear
+            .backward(&decoder_input, &grad_mel_before_combined, batch * frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("mel_linear backward: {e}"),
+            })?;
+
+        // Bundle grads (encoder/decoder/variance は 0 埋め、Phase T.4a 継続で埋める)
+        let grads = FastSpeech2Grads {
+            embedding: vec![0.0; self.embedding.len()],
+            mel_linear_w: grad_mel_w,
+            mel_linear_b: grad_mel_b,
+            postnet_w: postnet_w_grads,
+            postnet_b: postnet_b_grads,
+        };
+
+        Ok((grads, grad_decoder_out))
+    }
+}
+
+/// FastSpeech2 backward で返される weight/bias 勾配 bundle (Phase 1: terminal-only)。
+///
+/// 現 Phase 1 では mel_linear + postnet の勾配のみ埋まる。encoder / decoder / variance predictor
+/// の勾配は Phase T.4a 継続で追加予定 (現状は本 struct に field なし = 未 return)。
+#[derive(Clone, Debug)]
+pub struct FastSpeech2Grads {
+    /// Embedding table `[vocab_size, hidden_dim]` の勾配 (現 Phase 1 は 0 埋め)。
+    pub embedding: Vec<f32>,
+    /// mel_linear weight `[mel_dim, hidden_dim]` の勾配。
+    pub mel_linear_w: Vec<f32>,
+    /// mel_linear bias `[mel_dim]` の勾配。
+    pub mel_linear_b: Vec<f32>,
+    /// Postnet 各層 Conv1D weight の勾配 (`Vec<Vec<f32>>[layer][flatten_len]`)。
+    pub postnet_w: Vec<Vec<f32>>,
+    /// Postnet 各層 Conv1D bias の勾配。
+    pub postnet_b: Vec<Vec<f32>>,
 }
 
 /// Length Regulator: mora hidden `[B, mora_len, hidden]` を duration に従って frame 単位に展開する。
@@ -891,5 +1093,44 @@ mod tests {
         assert!(s.contains("invalid FastSpeech2"));
         let boxed: Box<dyn std::error::Error> = Box::new(e);
         assert!(boxed.to_string().contains("test"));
+    }
+
+    #[test]
+    fn backward_terminal_returns_correct_shapes() {
+        let cfg = small_config();
+        let model = FastSpeech2::zeros(cfg).unwrap();
+        let mora_ids: Vec<u32> = vec![1, 2, 3];
+        let durations: Vec<u32> = vec![2, 2, 2]; // total 6 frames
+        let grad_mel = vec![1.0_f32; 6 * cfg.mel_dim];
+
+        let (grads, grad_decoder_out) = model
+            .backward_terminal(&mora_ids, &durations, &grad_mel, 1, 3)
+            .expect("backward_terminal");
+
+        // shape 検証
+        assert_eq!(grad_decoder_out.len(), 6 * cfg.hidden_dim);
+        assert_eq!(grads.embedding.len(), cfg.vocab_size * cfg.hidden_dim);
+        assert_eq!(grads.mel_linear_w.len(), cfg.mel_dim * cfg.hidden_dim);
+        assert_eq!(grads.mel_linear_b.len(), cfg.mel_dim);
+        assert_eq!(grads.postnet_w.len(), cfg.postnet_layers);
+        assert_eq!(grads.postnet_b.len(), cfg.postnet_layers);
+
+        // Phase 1 では embedding は 0 埋め (未実装)
+        for &v in &grads.embedding {
+            assert!((v).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn backward_terminal_shape_mismatch_returns_error() {
+        let cfg = small_config();
+        let model = FastSpeech2::zeros(cfg).unwrap();
+        let mora_ids: Vec<u32> = vec![1, 2, 3];
+        let durations: Vec<u32> = vec![2, 2, 2];
+        let grad_mel = vec![1.0_f32; 5 * cfg.mel_dim]; // wrong frame count
+        let err = model
+            .backward_terminal(&mora_ids, &durations, &grad_mel, 1, 3)
+            .expect_err("shape mismatch");
+        assert!(matches!(err, FastSpeech2Error::ShapeMismatch { .. }));
     }
 }
