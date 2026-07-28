@@ -158,6 +158,21 @@ impl Linear {
         &mut self.bias
     }
 
+    /// Xavier uniform init: `w ~ U(-a, +a)`, `a = sqrt(6 / (in_features + out_features))`。
+    ///
+    /// bias は 0 で初期化 (PyTorch default)。
+    pub fn init_xavier<R: rand::Rng>(&mut self, rng: &mut R) {
+        let fan_in = self.config.in_features;
+        let fan_out = self.config.out_features;
+        let a = (6.0_f32 / (fan_in + fan_out) as f32).sqrt();
+        for w in &mut self.weight {
+            *w = rng.gen_range(-a..=a);
+        }
+        for b in &mut self.bias {
+            *b = 0.0;
+        }
+    }
+
     /// forward pass。
     ///
     /// # 引数

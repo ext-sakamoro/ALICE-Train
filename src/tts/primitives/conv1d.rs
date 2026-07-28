@@ -260,6 +260,22 @@ impl Conv1d {
         &mut self.bias
     }
 
+    /// Xavier uniform init: `w ~ U(-a, +a)`, `a = sqrt(6 / (fan_in + fan_out))`。
+    ///
+    /// bias は 0 で初期化 (PyTorch default)。fan_in/out は Conv1D の per-output 計算量:
+    /// `fan_in = in_channels/groups * kernel_size`, `fan_out = out_channels/groups * kernel_size`。
+    pub fn init_xavier<R: rand::Rng>(&mut self, rng: &mut R) {
+        let fan_in = (self.config.in_channels / self.config.groups) * self.config.kernel_size;
+        let fan_out = (self.config.out_channels / self.config.groups) * self.config.kernel_size;
+        let a = (6.0_f32 / (fan_in + fan_out) as f32).sqrt();
+        for w in &mut self.weight {
+            *w = rng.gen_range(-a..=a);
+        }
+        for b in &mut self.bias {
+            *b = 0.0;
+        }
+    }
+
     /// forward pass。
     ///
     /// # 引数

@@ -78,8 +78,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             postnet_hidden: config["model"]["postnet_hidden"].as_u64().unwrap_or(512) as usize,
             max_len: config["model"]["max_len"].as_u64().unwrap_or(2048) as usize,
         };
-        println!("[info] Building FastSpeech2 model (zeros init)...");
-        let model = FastSpeech2::zeros(fs2_config)?;
+        println!("[info] Building FastSpeech2 model (zeros init + Xavier init seed=42)...");
+        let mut model = FastSpeech2::zeros(fs2_config)?;
+        model.init_xavier(42);
 
         // 2. Trainer 構築
         let train_config = TtsTrainConfig {

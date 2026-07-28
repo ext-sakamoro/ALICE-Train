@@ -1335,6 +1335,47 @@ impl FastSpeech2 {
         Ok(grads)
     }
 
+    /// Xavier uniform init for全 sub-layer + embedding Gaussian init。
+    ///
+    /// 決定論 seed 対応。`zeros(cfg)?` の後で `model.init_xavier(seed)` すれば学習可能な初期値。
+    ///
+    /// - Embedding: N(0, 0.02) (transformer 慣習)
+    /// - Conv1D / Linear / MHA projections: Xavier uniform
+    /// - LayerNorm gamma/beta: default (gamma=1, beta=0)
+    /// - Positional encoding: init 不要
+    /// - Variance predictor + pitch/energy embed + Postnet も Xavier
+    pub fn init_xavier(&mut self, seed: u64) {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+
+        // Embedding: N(0, 0.02)
+        let std = 0.02_f32;
+        for w in &mut self.embedding {
+            *w = gaussian(&mut rng, 0.0, std);
+        }
+
+        // Encoder + Decoder FftBlocks
+        for block in &mut self.encoder {
+            init_fft_block_xavier(block, &mut rng);
+        }
+        for block in &mut self.decoder {
+            init_fft_block_xavier(block, &mut rng);
+        }
+
+        // Variance predictors
+        init_variance_predictor_xavier(&mut self.duration_predictor, &mut rng);
+        init_variance_predictor_xavier(&mut self.pitch_predictor, &mut rng);
+        init_variance_predictor_xavier(&mut self.energy_predictor, &mut rng);
+
+        // pitch/energy embed (Conv1D 1x1) + mel_linear + postnet
+        self.pitch_embed.init_xavier(&mut rng);
+        self.energy_embed.init_xavier(&mut rng);
+        self.mel_linear.init_xavier(&mut rng);
+        for conv in &mut self.postnet {
+            conv.init_xavier(&mut rng);
+        }
+    }
+
     /// SGD update: `w -= lr * grad` を全 sub-layer weight + bias に適用する。
     ///
     /// Variance predictor + pitch/energy embed は backward_full で grad が 0 になっているため
@@ -1379,6 +1420,31 @@ impl FastSpeech2 {
             }
         }
     }
+}
+
+/// Gaussian (Box-Muller) sampling helper (uniform → normal)。
+fn gaussian<R: rand::Rng>(rng: &mut R, mean: f32, std: f32) -> f32 {
+    let u1: f32 = rng.gen_range(1e-9_f32..1.0); // avoid log(0)
+    let u2: f32 = rng.gen();
+    let z = (-2.0_f32 * u1.ln()).sqrt() * (2.0_f32 * std::f32::consts::PI * u2).cos();
+    mean + std * z
+}
+
+/// FftBlock Xavier init helper (private struct、同 module 内)。
+fn init_fft_block_xavier<R: rand::Rng>(block: &mut FftBlock, rng: &mut R) {
+    block.self_attn.init_xavier(rng);
+    // attn_norm gamma=1, beta=0 は default_init のまま (触らない)
+    block.ffn_conv1.init_xavier(rng);
+    block.ffn_conv2.init_xavier(rng);
+    // ffn_norm も同上
+}
+
+/// VariancePredictor Xavier init helper (private struct、同 module 内)。
+fn init_variance_predictor_xavier<R: rand::Rng>(vp: &mut VariancePredictor, rng: &mut R) {
+    vp.conv1.init_xavier(rng);
+    vp.conv2.init_xavier(rng);
+    vp.linear.init_xavier(rng);
+    // norm1/norm2 gamma=1, beta=0 は default_init のまま
 }
 
 /// FftBlock SGD update helper (private struct のため同 module 内 helper)。
@@ -2050,6 +2116,60 @@ mod tests {
         assert!((grad_emb[3] - 8.0).abs() < 1e-6);
         assert!((grad_emb[4] - 3.0).abs() < 1e-6);
         assert!((grad_emb[5] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn init_xavier_changes_weights_deterministically() {
+        let cfg = small_config();
+        let mut model_a = FastSpeech2::zeros(cfg).unwrap();
+        let mut model_b = FastSpeech2::zeros(cfg).unwrap();
+
+        // 同 seed で 2 model init → weight 完全一致 (決定論)
+        model_a.init_xavier(42);
+        model_b.init_xavier(42);
+        assert_eq!(model_a.embedding, model_b.embedding);
+        assert_eq!(model_a.mel_linear.weight(), model_b.mel_linear.weight());
+
+        // 異なる seed → 異なる weight
+        let mut model_c = FastSpeech2::zeros(cfg).unwrap();
+        model_c.init_xavier(43);
+        assert_ne!(model_a.embedding, model_c.embedding);
+    }
+
+    #[test]
+    fn init_xavier_produces_non_zero_weights() {
+        let cfg = small_config();
+        let mut model = FastSpeech2::zeros(cfg).unwrap();
+        model.init_xavier(42);
+
+        // 少なくとも 1 つは 0 以外
+        let has_nonzero_embedding = model.embedding.iter().any(|&w| w.abs() > 1e-6);
+        assert!(has_nonzero_embedding);
+
+        let has_nonzero_mel_linear = model.mel_linear.weight().iter().any(|&w| w.abs() > 1e-6);
+        assert!(has_nonzero_mel_linear);
+
+        // MHA も同様 (最初 encoder block を verify)
+        let mha_q_grad = model.encoder[0].self_attn.w_q();
+        let has_nonzero_q = mha_q_grad.iter().any(|&w| w.abs() > 1e-6);
+        assert!(has_nonzero_q);
+    }
+
+    #[test]
+    fn init_xavier_weights_are_finite() {
+        let cfg = small_config();
+        let mut model = FastSpeech2::zeros(cfg).unwrap();
+        model.init_xavier(42);
+
+        for &w in &model.embedding {
+            assert!(w.is_finite());
+        }
+        for &w in model.mel_linear.weight() {
+            assert!(w.is_finite());
+        }
+        for &w in model.encoder[0].self_attn.w_q() {
+            assert!(w.is_finite());
+        }
     }
 
     #[test]

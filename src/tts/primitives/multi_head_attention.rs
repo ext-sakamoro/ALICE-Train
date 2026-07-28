@@ -240,6 +240,33 @@ impl MultiHeadAttention {
         &self.b_q
     }
 
+    /// Xavier uniform init for Q/K/V/O projections + zero bias。
+    ///
+    /// 各 projection weight `[embed_dim, embed_dim]` に対して:
+    /// `a = sqrt(6 / (embed_dim + embed_dim))`、`w ~ U(-a, +a)`。
+    pub fn init_xavier<R: rand::Rng>(&mut self, rng: &mut R) {
+        let e = self.config.embed_dim;
+        let a = (6.0_f32 / (2 * e) as f32).sqrt();
+        for w in self
+            .w_q
+            .iter_mut()
+            .chain(self.w_k.iter_mut())
+            .chain(self.w_v.iter_mut())
+            .chain(self.w_o.iter_mut())
+        {
+            *w = rng.gen_range(-a..=a);
+        }
+        for b in self
+            .b_q
+            .iter_mut()
+            .chain(self.b_k.iter_mut())
+            .chain(self.b_v.iter_mut())
+            .chain(self.b_o.iter_mut())
+        {
+            *b = 0.0;
+        }
+    }
+
     /// SGD update: `w -= lr * grad` を全 8 tensor に適用する (Q/K/V/O weight + bias)。
     pub fn apply_sgd(&mut self, grads: &MhaGrads, lr: f32) {
         for (w, g) in self.w_q.iter_mut().zip(&grads.w_q) {
