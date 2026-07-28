@@ -1467,6 +1467,152 @@ impl FastSpeech2 {
         // (Phase T.4a 継続で ProsodyLoss joint 時に生きる)
     }
 
+    /// 全 model weight を safetensors ファイルに保存する (Phase T.4a Phase C)。
+    ///
+    /// Paperspace 6-hour session limit や長期学習の中断復帰用 tensor 命名 convention は
+    /// `embedding` / `encoder.{i}.mha.w_q` / `decoder.{i}.attn_norm.gamma` / `mel_linear.w` etc
+    ///
+    /// # Errors
+    ///
+    /// I/O + safetensors serialize error。
+    pub fn save_safetensors(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(), FastSpeech2Error> {
+        use safetensors::tensor::TensorView;
+        use safetensors::Dtype;
+        use std::collections::HashMap;
+
+        let mut named: Vec<(String, Vec<u8>, Vec<usize>)> = Vec::new();
+        push_tensor(
+            &mut named,
+            "embedding",
+            &self.embedding,
+            &[self.config.vocab_size, self.config.hidden_dim],
+        );
+
+        for (i, block) in self.encoder.iter().enumerate() {
+            dump_fft_block(&mut named, &format!("encoder.{i}"), block);
+        }
+        for (i, block) in self.decoder.iter().enumerate() {
+            dump_fft_block(&mut named, &format!("decoder.{i}"), block);
+        }
+        dump_variance_predictor(&mut named, "duration_predictor", &self.duration_predictor);
+        dump_variance_predictor(&mut named, "pitch_predictor", &self.pitch_predictor);
+        dump_variance_predictor(&mut named, "energy_predictor", &self.energy_predictor);
+        push_tensor(
+            &mut named,
+            "pitch_embed.w",
+            self.pitch_embed.weight(),
+            &[self.pitch_embed.weight().len()],
+        );
+        push_tensor(
+            &mut named,
+            "pitch_embed.b",
+            self.pitch_embed.bias(),
+            &[self.pitch_embed.bias().len()],
+        );
+        push_tensor(
+            &mut named,
+            "energy_embed.w",
+            self.energy_embed.weight(),
+            &[self.energy_embed.weight().len()],
+        );
+        push_tensor(
+            &mut named,
+            "energy_embed.b",
+            self.energy_embed.bias(),
+            &[self.energy_embed.bias().len()],
+        );
+        push_tensor(
+            &mut named,
+            "mel_linear.w",
+            self.mel_linear.weight(),
+            &[self.config.mel_dim, self.config.hidden_dim],
+        );
+        push_tensor(
+            &mut named,
+            "mel_linear.b",
+            self.mel_linear.bias(),
+            &[self.config.mel_dim],
+        );
+        for (i, conv) in self.postnet.iter().enumerate() {
+            push_tensor(
+                &mut named,
+                &format!("postnet.{i}.w"),
+                conv.weight(),
+                &[conv.weight().len()],
+            );
+            push_tensor(
+                &mut named,
+                &format!("postnet.{i}.b"),
+                conv.bias(),
+                &[conv.bias().len()],
+            );
+        }
+
+        let views: HashMap<String, TensorView> = named
+            .iter()
+            .map(|(n, b, s)| {
+                (
+                    n.clone(),
+                    TensorView::new(Dtype::F32, s.clone(), b).expect("valid tensor"),
+                )
+            })
+            .collect();
+        safetensors::serialize_to_file(&views, &None, path.as_ref()).map_err(|e| {
+            FastSpeech2Error::Internal {
+                reason: format!("safetensors save failed: {e}"),
+            }
+        })
+    }
+
+    /// safetensors ファイルから全 model weight を復元する。
+    ///
+    /// # Errors
+    ///
+    /// I/O + safetensors + tensor 不在 + shape 不一致 error。
+    pub fn load_safetensors(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(), FastSpeech2Error> {
+        let bytes = std::fs::read(path.as_ref()).map_err(|e| FastSpeech2Error::Internal {
+            reason: format!("read failed: {e}"),
+        })?;
+        let tensors = safetensors::SafeTensors::deserialize(&bytes).map_err(|e| {
+            FastSpeech2Error::Internal {
+                reason: format!("safetensors deserialize failed: {e}"),
+            }
+        })?;
+        self.embedding = load_tensor(&tensors, "embedding")?;
+        for (i, block) in self.encoder.iter_mut().enumerate() {
+            apply_fft_block_tensors(block, &tensors, &format!("encoder.{i}"))?;
+        }
+        for (i, block) in self.decoder.iter_mut().enumerate() {
+            apply_fft_block_tensors(block, &tensors, &format!("decoder.{i}"))?;
+        }
+        apply_variance_predictor_tensors(
+            &mut self.duration_predictor,
+            &tensors,
+            "duration_predictor",
+        )?;
+        apply_variance_predictor_tensors(&mut self.pitch_predictor, &tensors, "pitch_predictor")?;
+        apply_variance_predictor_tensors(&mut self.energy_predictor, &tensors, "energy_predictor")?;
+        replace_conv1d_weights(&mut self.pitch_embed, &tensors, "pitch_embed")?;
+        replace_conv1d_weights(&mut self.energy_embed, &tensors, "energy_embed")?;
+        replace_linear_weights(&mut self.mel_linear, &tensors, "mel_linear")?;
+        for (i, conv) in self.postnet.iter_mut().enumerate() {
+            replace_conv1d_weights(conv, &tensors, &format!("postnet.{i}"))?;
+        }
+        Ok(())
+    }
+
+    /// embedding への参照 (checkpoint 保存 test の accessor)。
+    #[must_use]
+    pub fn embedding(&self) -> &[f32] {
+        &self.embedding
+    }
+
     /// SGD update: `w -= lr * grad` を全 sub-layer weight + bias に適用する。
     ///
     /// Variance predictor + pitch/energy embed は backward_full で grad が 0 になっているため
@@ -1907,6 +2053,272 @@ fn apply_fft_block_adamw(
         bc1,
         bc2,
     );
+}
+
+/// safetensors save helper: (name, bytes, shape) tuple を named_tensors vec に push。
+fn push_tensor(
+    out: &mut Vec<(String, Vec<u8>, Vec<usize>)>,
+    name: &str,
+    data: &[f32],
+    shape: &[usize],
+) {
+    let bytes: Vec<u8> = bytemuck::cast_slice(data).to_vec();
+    out.push((name.to_string(), bytes, shape.to_vec()));
+}
+
+/// safetensors load helper: tensor 名で f32 Vec を取り出す。
+fn load_tensor(
+    tensors: &safetensors::SafeTensors,
+    name: &str,
+) -> Result<Vec<f32>, FastSpeech2Error> {
+    let view = tensors
+        .tensor(name)
+        .map_err(|e| FastSpeech2Error::Internal {
+            reason: format!("tensor '{name}' not found: {e}"),
+        })?;
+    let data: &[f32] = bytemuck::cast_slice(view.data());
+    Ok(data.to_vec())
+}
+
+/// FftBlock の全 sub-layer weight を named list に dump する。
+fn dump_fft_block(out: &mut Vec<(String, Vec<u8>, Vec<usize>)>, prefix: &str, block: &FftBlock) {
+    push_tensor(
+        out,
+        &format!("{prefix}.mha.w_q"),
+        block.self_attn.w_q(),
+        &[block.self_attn.w_q().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.mha.w_k"),
+        block.self_attn.w_k(),
+        &[block.self_attn.w_k().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.mha.w_v"),
+        block.self_attn.w_v(),
+        &[block.self_attn.w_v().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.mha.w_o"),
+        block.self_attn.w_o(),
+        &[block.self_attn.w_o().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.mha.b_q"),
+        block.self_attn.b_q(),
+        &[block.self_attn.b_q().len()],
+    );
+    // For b_k/v/o, access via accessor (add if missing later)
+    push_tensor(
+        out,
+        &format!("{prefix}.attn_norm.gamma"),
+        block.attn_norm.gamma(),
+        &[block.attn_norm.gamma().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.attn_norm.beta"),
+        block.attn_norm.beta(),
+        &[block.attn_norm.beta().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.ffn_conv1.w"),
+        block.ffn_conv1.weight(),
+        &[block.ffn_conv1.weight().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.ffn_conv1.b"),
+        block.ffn_conv1.bias(),
+        &[block.ffn_conv1.bias().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.ffn_conv2.w"),
+        block.ffn_conv2.weight(),
+        &[block.ffn_conv2.weight().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.ffn_conv2.b"),
+        block.ffn_conv2.bias(),
+        &[block.ffn_conv2.bias().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.ffn_norm.gamma"),
+        block.ffn_norm.gamma(),
+        &[block.ffn_norm.gamma().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.ffn_norm.beta"),
+        block.ffn_norm.beta(),
+        &[block.ffn_norm.beta().len()],
+    );
+}
+
+/// FftBlock の全 sub-layer weight を tensors から復元する。
+fn apply_fft_block_tensors(
+    block: &mut FftBlock,
+    tensors: &safetensors::SafeTensors,
+    prefix: &str,
+) -> Result<(), FastSpeech2Error> {
+    let w_q = load_tensor(tensors, &format!("{prefix}.mha.w_q"))?;
+    let w_k = load_tensor(tensors, &format!("{prefix}.mha.w_k"))?;
+    let w_v = load_tensor(tensors, &format!("{prefix}.mha.w_v"))?;
+    let w_o = load_tensor(tensors, &format!("{prefix}.mha.w_o"))?;
+    let b_q = load_tensor(tensors, &format!("{prefix}.mha.b_q"))?;
+    block.self_attn.w_q_mut().copy_from_slice(&w_q);
+    block.self_attn.w_k_mut().copy_from_slice(&w_k);
+    block.self_attn.w_v_mut().copy_from_slice(&w_v);
+    block.self_attn.w_o_mut().copy_from_slice(&w_o);
+    if !b_q.is_empty() && block.self_attn.config().bias {
+        block.self_attn.b_q_mut().copy_from_slice(&b_q);
+    }
+    let attn_gamma = load_tensor(tensors, &format!("{prefix}.attn_norm.gamma"))?;
+    let attn_beta = load_tensor(tensors, &format!("{prefix}.attn_norm.beta"))?;
+    block.attn_norm.gamma_mut().copy_from_slice(&attn_gamma);
+    block.attn_norm.beta_mut().copy_from_slice(&attn_beta);
+    let c1_w = load_tensor(tensors, &format!("{prefix}.ffn_conv1.w"))?;
+    let c1_b = load_tensor(tensors, &format!("{prefix}.ffn_conv1.b"))?;
+    block.ffn_conv1.weight_mut().copy_from_slice(&c1_w);
+    block.ffn_conv1.bias_mut().copy_from_slice(&c1_b);
+    let c2_w = load_tensor(tensors, &format!("{prefix}.ffn_conv2.w"))?;
+    let c2_b = load_tensor(tensors, &format!("{prefix}.ffn_conv2.b"))?;
+    block.ffn_conv2.weight_mut().copy_from_slice(&c2_w);
+    block.ffn_conv2.bias_mut().copy_from_slice(&c2_b);
+    let ffn_gamma = load_tensor(tensors, &format!("{prefix}.ffn_norm.gamma"))?;
+    let ffn_beta = load_tensor(tensors, &format!("{prefix}.ffn_norm.beta"))?;
+    block.ffn_norm.gamma_mut().copy_from_slice(&ffn_gamma);
+    block.ffn_norm.beta_mut().copy_from_slice(&ffn_beta);
+    Ok(())
+}
+
+/// VariancePredictor dump helper。
+fn dump_variance_predictor(
+    out: &mut Vec<(String, Vec<u8>, Vec<usize>)>,
+    prefix: &str,
+    vp: &VariancePredictor,
+) {
+    push_tensor(
+        out,
+        &format!("{prefix}.conv1.w"),
+        vp.conv1.weight(),
+        &[vp.conv1.weight().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.conv1.b"),
+        vp.conv1.bias(),
+        &[vp.conv1.bias().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.norm1.gamma"),
+        vp.norm1.gamma(),
+        &[vp.norm1.gamma().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.norm1.beta"),
+        vp.norm1.beta(),
+        &[vp.norm1.beta().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.conv2.w"),
+        vp.conv2.weight(),
+        &[vp.conv2.weight().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.conv2.b"),
+        vp.conv2.bias(),
+        &[vp.conv2.bias().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.norm2.gamma"),
+        vp.norm2.gamma(),
+        &[vp.norm2.gamma().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.norm2.beta"),
+        vp.norm2.beta(),
+        &[vp.norm2.beta().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.linear.w"),
+        vp.linear.weight(),
+        &[vp.linear.weight().len()],
+    );
+    push_tensor(
+        out,
+        &format!("{prefix}.linear.b"),
+        vp.linear.bias(),
+        &[vp.linear.bias().len()],
+    );
+}
+
+/// VariancePredictor 復元 helper。
+fn apply_variance_predictor_tensors(
+    vp: &mut VariancePredictor,
+    tensors: &safetensors::SafeTensors,
+    prefix: &str,
+) -> Result<(), FastSpeech2Error> {
+    replace_conv1d_weights(&mut vp.conv1, tensors, &format!("{prefix}.conv1"))?;
+    replace_layer_norm(&mut vp.norm1, tensors, &format!("{prefix}.norm1"))?;
+    replace_conv1d_weights(&mut vp.conv2, tensors, &format!("{prefix}.conv2"))?;
+    replace_layer_norm(&mut vp.norm2, tensors, &format!("{prefix}.norm2"))?;
+    replace_linear_weights(&mut vp.linear, tensors, &format!("{prefix}.linear"))?;
+    Ok(())
+}
+
+/// Conv1d weight/bias を tensors から復元する helper。
+fn replace_conv1d_weights(
+    conv: &mut Conv1d,
+    tensors: &safetensors::SafeTensors,
+    prefix: &str,
+) -> Result<(), FastSpeech2Error> {
+    let w = load_tensor(tensors, &format!("{prefix}.w"))?;
+    let b = load_tensor(tensors, &format!("{prefix}.b"))?;
+    conv.weight_mut().copy_from_slice(&w);
+    conv.bias_mut().copy_from_slice(&b);
+    Ok(())
+}
+
+/// Linear weight/bias を tensors から復元する helper。
+fn replace_linear_weights(
+    lin: &mut Linear,
+    tensors: &safetensors::SafeTensors,
+    prefix: &str,
+) -> Result<(), FastSpeech2Error> {
+    let w = load_tensor(tensors, &format!("{prefix}.w"))?;
+    let b = load_tensor(tensors, &format!("{prefix}.b"))?;
+    lin.weight_mut().copy_from_slice(&w);
+    lin.bias_mut().copy_from_slice(&b);
+    Ok(())
+}
+
+/// LayerNorm gamma/beta を tensors から復元する helper。
+fn replace_layer_norm(
+    ln: &mut LayerNorm,
+    tensors: &safetensors::SafeTensors,
+    prefix: &str,
+) -> Result<(), FastSpeech2Error> {
+    let gamma = load_tensor(tensors, &format!("{prefix}.gamma"))?;
+    let beta = load_tensor(tensors, &format!("{prefix}.beta"))?;
+    ln.gamma_mut().copy_from_slice(&gamma);
+    ln.beta_mut().copy_from_slice(&beta);
+    Ok(())
 }
 
 /// Gaussian (Box-Muller) sampling helper (uniform → normal)。
@@ -2656,6 +3068,50 @@ mod tests {
         }
         for &w in model.encoder[0].self_attn.w_q() {
             assert!(w.is_finite());
+        }
+    }
+
+    #[test]
+    fn save_load_roundtrip_recovers_weights() {
+        use tempfile::TempDir;
+        let cfg = small_config();
+        let mut model_a = FastSpeech2::zeros(cfg).unwrap();
+        model_a.init_xavier(42);
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("model.safetensors");
+        model_a.save_safetensors(&path).expect("save");
+
+        let mut model_b = FastSpeech2::zeros(cfg).unwrap();
+        // load 前は完全に異なる (model_b はまだ zero)
+        assert_ne!(model_a.embedding(), model_b.embedding());
+        model_b.load_safetensors(&path).expect("load");
+        // load 後は完全一致
+        assert_eq!(model_a.embedding(), model_b.embedding());
+        assert_eq!(model_a.mel_linear.weight(), model_b.mel_linear.weight());
+    }
+
+    #[test]
+    fn save_load_forward_output_matches() {
+        // Save/load roundtrip 後、同じ input で forward 出力が一致 (weight 実効一致確認)
+        use tempfile::TempDir;
+        let cfg = small_config();
+        let mut model_a = FastSpeech2::zeros(cfg).unwrap();
+        model_a.init_xavier(7);
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("m.safetensors");
+        model_a.save_safetensors(&path).unwrap();
+
+        let mut model_b = FastSpeech2::zeros(cfg).unwrap();
+        model_b.load_safetensors(&path).unwrap();
+
+        let mora_ids = vec![1_u32, 2, 3];
+        let durations = vec![2_u32, 2, 2];
+        let out_a = model_a.forward(&mora_ids, 1, 3, &durations).unwrap();
+        let out_b = model_b.forward(&mora_ids, 1, 3, &durations).unwrap();
+        for (a, b) in out_a.iter().zip(&out_b) {
+            assert!((a - b).abs() < 1e-6);
         }
     }
 

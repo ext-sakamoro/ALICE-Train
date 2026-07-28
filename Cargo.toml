@@ -12,17 +12,18 @@ publish = false
 
 [features]
 default = []
-gpu = ["wgpu", "pollster", "bytemuck"]
+gpu = ["wgpu", "pollster", "dep:bytemuck"]
 cuda = ["cudarc"]
-qat-cli = ["safetensors", "clap"]
+qat-cli = ["dep:safetensors", "clap"]
 qat-gpu = ["gpu", "qat-cli"]
 qat-cuda = ["cuda", "qat-cli"]
-# ALICE-TTS v2.0 対応 (Feature Request R1-R4)
+# ALICE-TTS v2.0 対応 (Feature Request R1-R4 + Phase T.4a)
 # R1: TtsBatch (serde 流用、追加 dep 無し)
 # R4: AudioFeatureExtractor (STFT + mel filterbank + F0 (YIN) + energy) — rustfft 使用
 # R2: TtsDataset loader (manifest jsonl + WAV load) — hound 使用
-# R3: ProsodyLoss — 追加 dep 無し (予定)
-tts = ["dep:rustfft", "dep:hound"]
+# R3: ProsodyLoss — 追加 dep 無し
+# Phase T.4a Phase C: Checkpoint save/load — safetensors + bytemuck (f32 ↔ u8 cast)
+tts = ["dep:rustfft", "dep:hound", "dep:safetensors", "dep:bytemuck"]
 
 [[bin]]
 name = "train-qat-70b"
