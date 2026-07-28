@@ -469,7 +469,7 @@ impl MultiHeadAttention {
 
         // scaled dot-product returns (attn_out, attn_weights) for backward reuse
         let (attn_out, attn_weights) = self.scaled_dot_product_attention_with_weights(
-            &q_proj, &k_proj, &v_proj, batch, seq_q, seq_k, causal,
+            &q_proj, &k_proj, &v_proj, batch, seq_q, seq_k, causal, None,
         );
 
         // === backward ===
@@ -545,6 +545,203 @@ impl MultiHeadAttention {
         ))
     }
 
+    /// self-attention forward with key_mask (Phase T.4a Phase D)。
+    ///
+    /// `key_mask`: `[batch, seq_len]` bool、false = padded position (attention から除外)。
+    ///
+    /// # Errors
+    ///
+    /// shape mismatch。
+    pub fn forward_self_attention_masked(
+        &self,
+        input: &[f32],
+        batch: usize,
+        seq_len: usize,
+        causal: bool,
+        key_mask: &[bool],
+    ) -> Result<Vec<f32>, MhaError> {
+        self.forward_masked(
+            input,
+            input,
+            input,
+            batch,
+            seq_len,
+            seq_len,
+            causal,
+            Some(key_mask),
+        )
+    }
+
+    /// cross-attention forward with optional key_mask。
+    ///
+    /// # Errors
+    ///
+    /// - shape 不整合 (q/k/v/`key_mask`)
+    /// - forward path のエラー
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_masked(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        batch: usize,
+        seq_q: usize,
+        seq_k: usize,
+        causal: bool,
+        key_mask: Option<&[bool]>,
+    ) -> Result<Vec<f32>, MhaError> {
+        let cfg = self.config;
+        let e = cfg.embed_dim;
+        check_input_shape("q", q.len(), batch * seq_q * e)?;
+        check_input_shape("k", k.len(), batch * seq_k * e)?;
+        check_input_shape("v", v.len(), batch * seq_k * e)?;
+        if let Some(m) = key_mask {
+            check_input_shape("key_mask", m.len(), batch * seq_k)?;
+        }
+        let q_proj = linear_forward(q, &self.w_q, &self.b_q, batch * seq_q, e, e, cfg.bias);
+        let k_proj = linear_forward(k, &self.w_k, &self.b_k, batch * seq_k, e, e, cfg.bias);
+        let v_proj = linear_forward(v, &self.w_v, &self.b_v, batch * seq_k, e, e, cfg.bias);
+        let (attn_out, _) = self.scaled_dot_product_attention_with_weights(
+            &q_proj, &k_proj, &v_proj, batch, seq_q, seq_k, causal, key_mask,
+        );
+        let output = linear_forward(
+            &attn_out,
+            &self.w_o,
+            &self.b_o,
+            batch * seq_q,
+            e,
+            e,
+            cfg.bias,
+        );
+        Ok(output)
+    }
+
+    /// self-attention backward with key_mask (Phase T.4a Phase D)。
+    ///
+    /// # Errors
+    ///
+    /// shape mismatch。
+    pub fn backward_self_attention_masked(
+        &self,
+        input: &[f32],
+        grad_output: &[f32],
+        batch: usize,
+        seq_len: usize,
+        causal: bool,
+        key_mask: &[bool],
+    ) -> Result<(Vec<f32>, MhaGrads), MhaError> {
+        let (grad_q, grad_k, grad_v, grads) = self.backward_masked(
+            input,
+            input,
+            input,
+            grad_output,
+            batch,
+            seq_len,
+            seq_len,
+            causal,
+            Some(key_mask),
+        )?;
+        let mut grad_input = grad_q;
+        for i in 0..grad_input.len() {
+            grad_input[i] += grad_k[i] + grad_v[i];
+        }
+        Ok((grad_input, grads))
+    }
+
+    /// cross-attention backward with optional key_mask。
+    ///
+    /// # Errors
+    ///
+    /// - shape 不整合 (q/k/v/`grad_output`/`key_mask`)
+    /// - backward path のエラー
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward_masked(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        grad_output: &[f32],
+        batch: usize,
+        seq_q: usize,
+        seq_k: usize,
+        causal: bool,
+        key_mask: Option<&[bool]>,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, MhaGrads), MhaError> {
+        let cfg = self.config;
+        let e = cfg.embed_dim;
+        check_input_shape("q", q.len(), batch * seq_q * e)?;
+        check_input_shape("k", k.len(), batch * seq_k * e)?;
+        check_input_shape("v", v.len(), batch * seq_k * e)?;
+        check_input_shape("grad_output", grad_output.len(), batch * seq_q * e)?;
+        if let Some(m) = key_mask {
+            check_input_shape("key_mask", m.len(), batch * seq_k)?;
+        }
+        let q_proj = linear_forward(q, &self.w_q, &self.b_q, batch * seq_q, e, e, cfg.bias);
+        let k_proj = linear_forward(k, &self.w_k, &self.b_k, batch * seq_k, e, e, cfg.bias);
+        let v_proj = linear_forward(v, &self.w_v, &self.b_v, batch * seq_k, e, e, cfg.bias);
+        let (attn_out, attn_weights) = self.scaled_dot_product_attention_with_weights(
+            &q_proj, &k_proj, &v_proj, batch, seq_q, seq_k, causal, key_mask,
+        );
+        let (grad_attn_out, grad_w_o, grad_b_o) = linear_backward(
+            &attn_out,
+            grad_output,
+            &self.w_o,
+            batch * seq_q,
+            e,
+            e,
+            cfg.bias,
+        );
+        let (grad_attn_weights, grad_v_proj) = attn_matmul_v_backward(
+            &attn_weights,
+            &v_proj,
+            &grad_attn_out,
+            batch,
+            seq_q,
+            seq_k,
+            cfg.num_heads,
+            cfg.head_dim(),
+        );
+        let grad_scores = softmax_backward_4d(
+            &attn_weights,
+            &grad_attn_weights,
+            batch,
+            cfg.num_heads,
+            seq_q,
+            seq_k,
+        );
+        let (grad_q_proj, grad_k_proj) = score_backward(
+            &q_proj,
+            &k_proj,
+            &grad_scores,
+            batch,
+            seq_q,
+            seq_k,
+            cfg.num_heads,
+            cfg.head_dim(),
+        );
+        let (grad_q, grad_w_q, grad_b_q) =
+            linear_backward(q, &grad_q_proj, &self.w_q, batch * seq_q, e, e, cfg.bias);
+        let (grad_k, grad_w_k, grad_b_k) =
+            linear_backward(k, &grad_k_proj, &self.w_k, batch * seq_k, e, e, cfg.bias);
+        let (grad_v, grad_w_v, grad_b_v) =
+            linear_backward(v, &grad_v_proj, &self.w_v, batch * seq_k, e, e, cfg.bias);
+        Ok((
+            grad_q,
+            grad_k,
+            grad_v,
+            MhaGrads {
+                w_q: grad_w_q,
+                w_k: grad_w_k,
+                w_v: grad_w_v,
+                w_o: grad_w_o,
+                b_q: grad_b_q,
+                b_k: grad_b_k,
+                b_v: grad_b_v,
+                b_o: grad_b_o,
+            },
+        ))
+    }
+
     /// scaled dot-product attention forward (attn weights は捨てる版、forward 用)。
     fn scaled_dot_product_attention(
         &self,
@@ -557,12 +754,14 @@ impl MultiHeadAttention {
         causal: bool,
     ) -> Vec<f32> {
         let (attn_out, _) = self.scaled_dot_product_attention_with_weights(
-            q_proj, k_proj, v_proj, batch, seq_q, seq_k, causal,
+            q_proj, k_proj, v_proj, batch, seq_q, seq_k, causal, None,
         );
         attn_out
     }
 
     /// scaled dot-product attention forward (attn weights も保存、backward 用)。
+    ///
+    /// `key_mask` (optional): `[batch, seq_k]` bool、false = padded key を attention から除外。
     fn scaled_dot_product_attention_with_weights(
         &self,
         q_proj: &[f32],
@@ -572,6 +771,7 @@ impl MultiHeadAttention {
         seq_q: usize,
         seq_k: usize,
         causal: bool,
+        key_mask: Option<&[bool]>,
     ) -> (Vec<f32>, Vec<f32>) {
         let cfg = self.config;
         let h = cfg.num_heads;
@@ -607,6 +807,17 @@ impl MultiHeadAttention {
                     for sq in 0..seq_q {
                         for sk in (sq + 1)..seq_k {
                             scores[sq * seq_k + sk] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
+
+                // 2b. key_mask: false 位置の key を attention から除外 (score = -inf)
+                if let Some(mask) = key_mask {
+                    for sq in 0..seq_q {
+                        for sk in 0..seq_k {
+                            if !mask[b * seq_k + sk] {
+                                scores[sq * seq_k + sk] = f32::NEG_INFINITY;
+                            }
                         }
                     }
                 }

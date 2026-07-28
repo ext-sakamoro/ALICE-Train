@@ -181,12 +181,31 @@ impl FftBlock {
 
     /// FFT block forward: input `[batch, seq_len, hidden]` → output 同 shape。
     fn forward(&self, input: &[f32], batch: usize, seq_len: usize) -> Vec<f32> {
+        self.forward_masked(input, batch, seq_len, None)
+    }
+
+    /// FFT block forward with optional key_mask (Phase T.4a Phase D)。
+    fn forward_masked(
+        &self,
+        input: &[f32],
+        batch: usize,
+        seq_len: usize,
+        key_mask: Option<&[bool]>,
+    ) -> Vec<f32> {
         let h = self.self_attn.config().embed_dim;
-        // 1. Self-attention (bidirectional)
-        let attn_out = self
-            .self_attn
-            .forward_self_attention(input, batch, seq_len, false)
-            .expect("attn");
+        // 1. Self-attention (bidirectional、optional mask)
+        let attn_out = key_mask.map_or_else(
+            || {
+                self.self_attn
+                    .forward_self_attention(input, batch, seq_len, false)
+                    .expect("attn")
+            },
+            |m| {
+                self.self_attn
+                    .forward_self_attention_masked(input, batch, seq_len, false, m)
+                    .expect("attn masked")
+            },
+        );
         // 2. Add & LayerNorm
         let residual = add(input, &attn_out);
         let after_attn = self
@@ -195,7 +214,6 @@ impl FftBlock {
             .expect("norm");
 
         // 3. FFN: hidden → mid via Conv1D (需要 [B, hidden, seq_len] layout)
-        // reshape [B, seq_len, hidden] → [B, hidden, seq_len]
         let bs_hs = batch * seq_len * h;
         let mut reshaped = vec![0.0_f32; bs_hs];
         for b in 0..batch {
@@ -206,22 +224,15 @@ impl FftBlock {
                 }
             }
         }
-
-        // Conv1D 1 (hidden → mid), same padding
-        let mid = self.ffn_conv1.config().out_channels;
         let ffn_mid = self
             .ffn_conv1
             .forward(&reshaped, batch, seq_len)
             .expect("ffn1");
-        // ReLU
         let ffn_mid_relu: Vec<f32> = ffn_mid.iter().map(|&x| x.max(0.0)).collect();
-        // Conv1D 2 (mid → hidden)
-        let _ = mid;
         let ffn_out_ch = self
             .ffn_conv2
             .forward(&ffn_mid_relu, batch, seq_len)
             .expect("ffn2");
-        // reshape back [B, hidden, seq_len] → [B, seq_len, hidden]
         let mut ffn_out = vec![0.0_f32; bs_hs];
         for b in 0..batch {
             for t in 0..seq_len {
@@ -255,13 +266,34 @@ impl FftBlock {
         batch: usize,
         seq_len: usize,
     ) -> (Vec<f32>, FftBlockGrads) {
+        self.backward_masked(input, grad_output, batch, seq_len, None)
+    }
+
+    /// FFT block backward with optional key_mask (Phase T.4a Phase D)。
+    #[allow(dead_code)] // 将来 FastSpeech2::backward_full_variable から呼ばれる
+    fn backward_masked(
+        &self,
+        input: &[f32],
+        grad_output: &[f32],
+        batch: usize,
+        seq_len: usize,
+        key_mask: Option<&[bool]>,
+    ) -> (Vec<f32>, FftBlockGrads) {
         let h = self.self_attn.config().embed_dim;
 
         // === Forward 再計算 (中間 activation 保持) ===
-        let attn_out = self
-            .self_attn
-            .forward_self_attention(input, batch, seq_len, false)
-            .expect("attn");
+        let attn_out = key_mask.map_or_else(
+            || {
+                self.self_attn
+                    .forward_self_attention(input, batch, seq_len, false)
+                    .expect("attn")
+            },
+            |m| {
+                self.self_attn
+                    .forward_self_attention_masked(input, batch, seq_len, false, m)
+                    .expect("attn masked")
+            },
+        );
         let residual1 = add(input, &attn_out);
         let after_attn = self
             .attn_norm
@@ -357,11 +389,26 @@ impl FftBlock {
         // Step 9: Add branch: grad_input_add = grad_residual1, grad_attn_out = grad_residual1
         let mut grad_input = grad_residual1.clone();
 
-        // Step 10: MHA backward (self-attention Q=K=V=input)
-        let (grad_attn_input, mha_grads) = self
-            .self_attn
-            .backward_self_attention(input, &grad_residual1, batch, seq_len, false)
-            .expect("mha bw");
+        // Step 10: MHA backward (self-attention Q=K=V=input, optional mask)
+        let (grad_attn_input, mha_grads) = key_mask.map_or_else(
+            || {
+                self.self_attn
+                    .backward_self_attention(input, &grad_residual1, batch, seq_len, false)
+                    .expect("mha bw")
+            },
+            |m| {
+                self.self_attn
+                    .backward_self_attention_masked(
+                        input,
+                        &grad_residual1,
+                        batch,
+                        seq_len,
+                        false,
+                        m,
+                    )
+                    .expect("mha bw masked")
+            },
+        );
 
         // Step 11: sum both branches
         for (dst, src) in grad_input.iter_mut().zip(&grad_attn_input) {
@@ -1330,6 +1377,431 @@ impl FastSpeech2 {
             cfg.hidden_dim,
             batch,
             mora_len,
+        );
+
+        Ok(grads)
+    }
+
+    /// Variable-length forward (Phase T.4a Phase D)。
+    ///
+    /// Per-sample mora length + attention mask 対応。padding 位置は encoder / decoder attention
+    /// で除外され、Length Regulator は padding mora (duration=0 前提) を expand しない。
+    ///
+    /// # 引数
+    ///
+    /// - `mora_ids`: `[batch, max_mora_len]` flatten。padding は任意 valid id (mask で無視される)
+    /// - `target_durations`: `[batch, max_mora_len]`、padding 位置は 0 必須
+    /// - `batch`: batch size
+    /// - `max_mora_len`: batch 内最大 mora 長 (padding 込み)
+    /// - `mora_lens`: 各 sample の実 mora 長 `[batch]` (mora_lens[b] <= max_mora_len)
+    ///
+    /// # 戻り値
+    ///
+    /// `(mel, frame_lens, max_frame_len)`:
+    /// - `mel`: `[batch, max_frame_len, mel_dim]` flatten (padding 領域は attention mask 経由で 0 近似)
+    /// - `frame_lens`: 各 sample の実 frame 長 (= sum of durations for valid mora)
+    /// - `max_frame_len`: batch 内最大 frame 長
+    ///
+    /// # Errors
+    ///
+    /// - shape 不整合
+    /// - `mora_lens[b] > max_mora_len`
+    /// - `max_frame_len > cfg.max_len`
+    pub fn forward_variable(
+        &self,
+        mora_ids: &[u32],
+        target_durations: &[u32],
+        batch: usize,
+        max_mora_len: usize,
+        mora_lens: &[usize],
+    ) -> Result<(Vec<f32>, Vec<usize>, usize), FastSpeech2Error> {
+        let cfg = self.config;
+        if mora_ids.len() != batch * max_mora_len {
+            return Err(FastSpeech2Error::ShapeMismatch {
+                field: "mora_ids",
+                expected: batch * max_mora_len,
+                actual: mora_ids.len(),
+            });
+        }
+        if target_durations.len() != batch * max_mora_len {
+            return Err(FastSpeech2Error::ShapeMismatch {
+                field: "target_durations",
+                expected: batch * max_mora_len,
+                actual: target_durations.len(),
+            });
+        }
+        if mora_lens.len() != batch {
+            return Err(FastSpeech2Error::ShapeMismatch {
+                field: "mora_lens",
+                expected: batch,
+                actual: mora_lens.len(),
+            });
+        }
+        for (b, &ml) in mora_lens.iter().enumerate() {
+            if ml > max_mora_len {
+                return Err(FastSpeech2Error::Internal {
+                    reason: format!("mora_lens[{b}]={ml} > max_mora_len={max_mora_len}"),
+                });
+            }
+        }
+        for &id in mora_ids {
+            if id as usize >= cfg.vocab_size {
+                return Err(FastSpeech2Error::VocabOverflow {
+                    id: id as usize,
+                    vocab_size: cfg.vocab_size,
+                });
+            }
+        }
+
+        // Encoder mask [batch * max_mora_len]
+        let mut encoder_mask = vec![false; batch * max_mora_len];
+        for b in 0..batch {
+            for t in 0..mora_lens[b] {
+                encoder_mask[b * max_mora_len + t] = true;
+            }
+        }
+
+        // 1. Embedding lookup + positional encoding
+        let mut embedded = vec![0.0_f32; batch * max_mora_len * cfg.hidden_dim];
+        for b in 0..batch {
+            for t in 0..max_mora_len {
+                let id = mora_ids[b * max_mora_len + t] as usize;
+                let src = &self.embedding[id * cfg.hidden_dim..(id + 1) * cfg.hidden_dim];
+                let dst_start = b * max_mora_len * cfg.hidden_dim + t * cfg.hidden_dim;
+                embedded[dst_start..dst_start + cfg.hidden_dim].copy_from_slice(src);
+            }
+        }
+        let mut encoder_input = self
+            .encoder_pos_enc
+            .forward(&embedded, batch, max_mora_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("encoder PE: {e}"),
+            })?;
+
+        // 2. Encoder stack with mask
+        for block in &self.encoder {
+            encoder_input =
+                block.forward_masked(&encoder_input, batch, max_mora_len, Some(&encoder_mask));
+        }
+
+        // 3. Length Regulator: expand mora → frame (padding mora は duration=0 で自然 skip)
+        let (expanded, frame_len_per_batch) = length_regulator(
+            &encoder_input,
+            batch,
+            max_mora_len,
+            cfg.hidden_dim,
+            target_durations,
+        );
+        let max_frame_len = *frame_len_per_batch.iter().max().unwrap_or(&0);
+        if max_frame_len > cfg.max_len {
+            return Err(FastSpeech2Error::SeqLenExceedsMax {
+                seq_len: max_frame_len,
+                max_len: cfg.max_len,
+            });
+        }
+
+        // Decoder mask
+        let mut decoder_mask = vec![false; batch * max_frame_len];
+        for b in 0..batch {
+            for t in 0..frame_len_per_batch[b] {
+                decoder_mask[b * max_frame_len + t] = true;
+            }
+        }
+
+        // 4. Decoder: PE + FFT block stack with mask
+        let mut decoder_input = self
+            .decoder_pos_enc
+            .forward(&expanded, batch, max_frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("decoder PE: {e}"),
+            })?;
+        for block in &self.decoder {
+            decoder_input =
+                block.forward_masked(&decoder_input, batch, max_frame_len, Some(&decoder_mask));
+        }
+
+        // 5. Mel projection
+        let mel_before = self
+            .mel_linear
+            .forward(&decoder_input, batch * max_frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("mel linear: {e}"),
+            })?;
+
+        // 6. Postnet residual
+        let mel_reshaped =
+            reshape_time_last_to_channel_first(&mel_before, batch, max_frame_len, cfg.mel_dim);
+        let mut postnet_out = mel_reshaped;
+        for (i, conv) in self.postnet.iter().enumerate() {
+            let conv_out = conv
+                .forward(&postnet_out, batch, max_frame_len)
+                .map_err(|e| FastSpeech2Error::Internal {
+                    reason: format!("postnet[{i}]: {e}"),
+                })?;
+            if i < self.postnet.len() - 1 {
+                postnet_out = conv_out.iter().map(|&x| x.tanh()).collect();
+            } else {
+                postnet_out = conv_out;
+            }
+        }
+        let mut postnet_out_reshaped = vec![0.0_f32; batch * max_frame_len * cfg.mel_dim];
+        for b in 0..batch {
+            for t in 0..max_frame_len {
+                for c in 0..cfg.mel_dim {
+                    postnet_out_reshaped[b * max_frame_len * cfg.mel_dim + t * cfg.mel_dim + c] =
+                        postnet_out[b * cfg.mel_dim * max_frame_len + c * max_frame_len + t];
+                }
+            }
+        }
+        let mel_after: Vec<f32> = mel_before
+            .iter()
+            .zip(&postnet_out_reshaped)
+            .map(|(a, b)| a + b)
+            .collect();
+
+        Ok((mel_after, frame_len_per_batch, max_frame_len))
+    }
+
+    /// Variable-length full backward (Phase T.4a Phase D)。
+    ///
+    /// `forward_variable` に対する完全 backward chain (encoder mask + decoder mask 経由)。
+    /// grad_mel の padding 領域は呼び出し側で 0 済み前提 (masked loss を通せば自動)。
+    ///
+    /// # Errors
+    ///
+    /// - shape 不整合
+    /// - forward_variable と同じエラー
+    pub fn backward_full_variable(
+        &self,
+        mora_ids: &[u32],
+        target_durations: &[u32],
+        grad_mel: &[f32],
+        batch: usize,
+        max_mora_len: usize,
+        mora_lens: &[usize],
+    ) -> Result<FastSpeech2Grads, FastSpeech2Error> {
+        let cfg = self.config;
+
+        // Encoder mask
+        let mut encoder_mask = vec![false; batch * max_mora_len];
+        for b in 0..batch {
+            for t in 0..mora_lens[b] {
+                encoder_mask[b * max_mora_len + t] = true;
+            }
+        }
+
+        // Forward 再計算: encoder path
+        let mut embedded = vec![0.0_f32; batch * max_mora_len * cfg.hidden_dim];
+        for b in 0..batch {
+            for t in 0..max_mora_len {
+                let id = mora_ids[b * max_mora_len + t] as usize;
+                let src = &self.embedding[id * cfg.hidden_dim..(id + 1) * cfg.hidden_dim];
+                let dst_start = b * max_mora_len * cfg.hidden_dim + t * cfg.hidden_dim;
+                embedded[dst_start..dst_start + cfg.hidden_dim].copy_from_slice(src);
+            }
+        }
+        let encoder_pe_out = self
+            .encoder_pos_enc
+            .forward(&embedded, batch, max_mora_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("encoder PE fw: {e}"),
+            })?;
+        let mut encoder_inputs: Vec<Vec<f32>> = Vec::with_capacity(cfg.num_encoder_layers);
+        let mut encoder_current = encoder_pe_out;
+        for block in &self.encoder {
+            encoder_inputs.push(encoder_current.clone());
+            encoder_current =
+                block.forward_masked(&encoder_current, batch, max_mora_len, Some(&encoder_mask));
+        }
+        let encoder_out = encoder_current;
+
+        // LR forward
+        let (expanded, frame_len_per_batch) = length_regulator(
+            &encoder_out,
+            batch,
+            max_mora_len,
+            cfg.hidden_dim,
+            target_durations,
+        );
+        let max_frame_len = *frame_len_per_batch.iter().max().unwrap_or(&0);
+
+        // Decoder mask
+        let mut decoder_mask = vec![false; batch * max_frame_len];
+        for b in 0..batch {
+            for t in 0..frame_len_per_batch[b] {
+                decoder_mask[b * max_frame_len + t] = true;
+            }
+        }
+
+        // Decoder path
+        let decoder_pe_out = self
+            .decoder_pos_enc
+            .forward(&expanded, batch, max_frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("decoder PE fw: {e}"),
+            })?;
+        let mut decoder_inputs: Vec<Vec<f32>> = Vec::with_capacity(cfg.num_decoder_layers);
+        let mut decoder_current = decoder_pe_out;
+        for block in &self.decoder {
+            decoder_inputs.push(decoder_current.clone());
+            decoder_current =
+                block.forward_masked(&decoder_current, batch, max_frame_len, Some(&decoder_mask));
+        }
+        let decoder_out = decoder_current;
+
+        let mel_before = self
+            .mel_linear
+            .forward(&decoder_out, batch * max_frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("mel linear fw: {e}"),
+            })?;
+
+        // Postnet re-forward + cache
+        let mel_reshaped =
+            reshape_time_last_to_channel_first(&mel_before, batch, max_frame_len, cfg.mel_dim);
+        let mut postnet_inputs: Vec<Vec<f32>> = Vec::with_capacity(self.postnet.len());
+        let mut postnet_pre_act: Vec<Vec<f32>> = Vec::with_capacity(self.postnet.len());
+        let mut current = mel_reshaped;
+        for (i, conv) in self.postnet.iter().enumerate() {
+            postnet_inputs.push(current.clone());
+            let pre = conv.forward(&current, batch, max_frame_len).map_err(|e| {
+                FastSpeech2Error::Internal {
+                    reason: format!("postnet[{i}] fw: {e}"),
+                }
+            })?;
+            postnet_pre_act.push(pre.clone());
+            if i < self.postnet.len() - 1 {
+                current = pre.iter().map(|&x| x.tanh()).collect();
+            } else {
+                current = pre;
+            }
+        }
+
+        // grad_mel [B, F, mel_dim] → grad_mel_before + grad_postnet_residual (both = grad_mel)
+        let grad_mel_after = grad_mel;
+
+        // Postnet residual reshape [B, F, mel_dim] → [B, mel_dim, F]
+        let mut grad_postnet_out = vec![0.0_f32; batch * cfg.mel_dim * max_frame_len];
+        for b in 0..batch {
+            for t in 0..max_frame_len {
+                for c in 0..cfg.mel_dim {
+                    grad_postnet_out[b * cfg.mel_dim * max_frame_len + c * max_frame_len + t] =
+                        grad_mel_after[b * max_frame_len * cfg.mel_dim + t * cfg.mel_dim + c];
+                }
+            }
+        }
+        // Postnet chain backward (reverse)
+        let mut grads = FastSpeech2Grads::zeros_from_config(&cfg);
+        let mut grad_current = grad_postnet_out;
+        for i in (0..self.postnet.len()).rev() {
+            let pre = &postnet_pre_act[i];
+            let input = &postnet_inputs[i];
+            // tanh backward for i < last
+            let grad_pre: Vec<f32> = if i < self.postnet.len() - 1 {
+                pre.iter()
+                    .zip(&grad_current)
+                    .map(|(&z, &g)| g * (1.0 - z.tanh() * z.tanh()))
+                    .collect()
+            } else {
+                grad_current
+            };
+            let (grad_in, grad_w, grad_b) = self.postnet[i]
+                .backward(input, &grad_pre, batch, max_frame_len)
+                .map_err(|e| FastSpeech2Error::Internal {
+                    reason: format!("postnet[{i}] bw: {e}"),
+                })?;
+            grads.postnet_w[i] = grad_w;
+            grads.postnet_b[i] = grad_b;
+            grad_current = grad_in;
+        }
+        // reshape grad_current [B, mel_dim, F] → [B, F, mel_dim]
+        let mut grad_postnet_residual = vec![0.0_f32; batch * max_frame_len * cfg.mel_dim];
+        for b in 0..batch {
+            for t in 0..max_frame_len {
+                for c in 0..cfg.mel_dim {
+                    grad_postnet_residual[b * max_frame_len * cfg.mel_dim + t * cfg.mel_dim + c] =
+                        grad_current[b * cfg.mel_dim * max_frame_len + c * max_frame_len + t];
+                }
+            }
+        }
+        // grad_mel_before = grad_mel_after + grad_postnet_residual
+        let grad_mel_before: Vec<f32> = grad_mel_after
+            .iter()
+            .zip(&grad_postnet_residual)
+            .map(|(a, b)| a + b)
+            .collect();
+
+        // mel_linear backward
+        let (grad_decoder_out, grad_mel_w, grad_mel_b) = self
+            .mel_linear
+            .backward(&decoder_out, &grad_mel_before, batch * max_frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("mel_linear bw: {e}"),
+            })?;
+        grads.mel_linear_w = grad_mel_w;
+        grads.mel_linear_b = grad_mel_b;
+
+        // Decoder FftBlock chain backward (reverse) with mask
+        let mut grad_current = grad_decoder_out;
+        for i in (0..cfg.num_decoder_layers).rev() {
+            let (grad_in, fft_grads) = self.decoder[i].backward_masked(
+                &decoder_inputs[i],
+                &grad_current,
+                batch,
+                max_frame_len,
+                Some(&decoder_mask),
+            );
+            grads.decoder[i] = fft_grads;
+            grad_current = grad_in;
+        }
+
+        // Decoder PE backward
+        let grad_expanded = self
+            .decoder_pos_enc
+            .backward(&grad_current, batch, max_frame_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("decoder PE bw: {e}"),
+            })?;
+
+        // Length Regulator backward (padding mora は duration=0 で grad=0)
+        let grad_encoder_out = length_regulator_backward(
+            &grad_expanded,
+            batch,
+            max_mora_len,
+            cfg.hidden_dim,
+            target_durations,
+        );
+
+        // Encoder FftBlock chain backward (reverse) with mask
+        let mut grad_current = grad_encoder_out;
+        for i in (0..cfg.num_encoder_layers).rev() {
+            let (grad_in, fft_grads) = self.encoder[i].backward_masked(
+                &encoder_inputs[i],
+                &grad_current,
+                batch,
+                max_mora_len,
+                Some(&encoder_mask),
+            );
+            grads.encoder[i] = fft_grads;
+            grad_current = grad_in;
+        }
+
+        // Encoder PE backward
+        let grad_embedded = self
+            .encoder_pos_enc
+            .backward(&grad_current, batch, max_mora_len)
+            .map_err(|e| FastSpeech2Error::Internal {
+                reason: format!("encoder PE bw: {e}"),
+            })?;
+
+        // Embedding backward (mora_ids で accumulate、padding 位置は grad_embedded が 0 なので自然)
+        grads.embedding = embedding_backward(
+            &grad_embedded,
+            mora_ids,
+            cfg.vocab_size,
+            cfg.hidden_dim,
+            batch,
+            max_mora_len,
         );
 
         Ok(grads)
