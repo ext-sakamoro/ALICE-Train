@@ -1,13 +1,13 @@
 # ALICE-Train
 
-Backpropagation & Training Framework for ALICE-ML ternary networks.
+ALICE-ML 三値ネットワーク向け Backpropagation & 学習フレームワーク
 
-[日本語 README はこちら / Japanese README](./README.ja.md)
+[English README](./README.md)
 
-## Architecture
+## アーキテクチャ
 
 ```
-ALICE-ML (Inference)          ALICE-Train (Learning)
+ALICE-ML (推論)                ALICE-Train (学習)
 ┌──────────────────┐          ┌─────────────────────────────┐
 │ BitLinear        │          │ backward.rs                 │
 │   forward()      │◀────────│   ternary_matvec_backward   │
@@ -19,7 +19,7 @@ ALICE-ML (Inference)          ALICE-Train (Learning)
                               ├─────────────────────────────┤
                               │ trainer.rs                  │
                               │   TrainableNetwork trait    │
-                              │   Trainer (grad accumulation)│
+                              │   Trainer (勾配累積)          │
                               │   train_with_scheduler()    │
                               │   train_tokens()            │
                               ├─────────────────────────────┤
@@ -28,7 +28,7 @@ ALICE-ML (Inference)          ALICE-Train (Learning)
                               │   ConstantScheduler         │
                               ├─────────────────────────────┤
                               │ checkpoint.rs               │
-                              │   ALICETRN binary format    │
+                              │   ALICETRN バイナリ形式       │
                               │   save / load               │
                               ├─────────────────────────────┤
                               │ dataloader.rs               │
@@ -36,7 +36,7 @@ ALICE-ML (Inference)          ALICE-Train (Learning)
                               │   DataLoader + Batch        │
                               ├─────────────────────────────┤
                               │ evaluator.rs                │
-                              │   perplexity evaluation     │
+                              │   perplexity 評価            │
                               │   BestCheckpointTracker     │
                               ├─────────────────────────────┤
                               │ logger.rs                   │
@@ -44,8 +44,8 @@ ALICE-ML (Inference)          ALICE-Train (Learning)
                               │   compute_grad_norm         │
                               ├─────────────────────────────┤
                               │ mixed_precision.rs          │
-                              │   Bf16 conversion           │
-                              │   LossScaler (dynamic)      │
+                              │   BF16 変換                 │
+                              │   LossScaler (動的)          │
                               ├─────────────────────────────┤
                               │ qat.rs                      │
                               │   FakeQuantize              │
@@ -54,11 +54,11 @@ ALICE-ML (Inference)          ALICE-Train (Learning)
                               ├─────────────────────────────┤
                               │ distill.rs                  │
                               │   DistillTrainer            │
-                              │   KL-div + hard label mix   │
+                              │   KL-div + hard label 混合   │
                               ├─────────────────────────────┤
                               │ pipeline.rs                 │
-                              │   QatPipeline (orchestrator)│
-                              │   FP32→BF16→Ternary loop   │
+                              │   QatPipeline (統合)        │
+                              │   FP32→BF16→Ternary ループ  │
                               ├─────────────────────────────┤
                               │ offload.rs                  │
                               │   OffloadOptimizer (AdamW)  │
@@ -70,34 +70,40 @@ ALICE-ML (Inference)          ALICE-Train (Learning)
                               │ gpu_backward.rs [gpu feature]│
                               │   GpuBackwardEngine         │
                               │   WGSL compute shader       │
+                              ├─────────────────────────────┤
+                              │ tts/            [tts feature]│
+                              │   FastSpeech2 acoustic model │
+                              │   VarianceAdaptor + Postnet │
+                              │   ProsodyLoss joint training │
+                              │   TtsTrainer (SGD/AdamW)    │
                               └─────────────────────────────┘
 ```
 
-## Features
+## 機能一覧
 
-| Feature | Description |
-|---------|-------------|
-| Ternary backward | W^T * dy using add/sub only (no multiplication) |
-| RMSNorm backward | Full gradient through pre-normalization |
-| STE weight grad | Straight-Through Estimator for latent FP32 weights |
-| Activation backward | ReLU, SiLU, GELU with numerical gradient verification |
-| Training loop | `TrainableNetwork` trait + `Trainer` with MSE/CE/MAE loss |
-| Gradient accumulation | Micro-batch accumulation for effective batch size scaling |
+| 機能 | 説明 |
+|------|------|
+| Ternary backward | W^T * dy を加算/減算のみで計算 (乗算不使用) |
+| RMSNorm backward | pre-normalization の完全 gradient |
+| STE weight grad | Straight-Through Estimator による latent FP32 weight 勾配 |
+| Activation backward | ReLU / SiLU / GELU + finite diff 数値検証 |
+| 学習ループ | `TrainableNetwork` trait + `Trainer` (MSE/CE/MAE loss) |
+| 勾配累積 | micro-batch 累積で実効 batch size 拡大 |
 | LR scheduling | Warmup + Cosine Decay / Constant scheduler |
-| Checkpoint | Binary format (ALICETRN magic + JSON header + raw weights) |
-| Memory-mapped data | `MmapDataset` for large token files via memmap2 |
-| Token-based training | `train_tokens()` with DataLoader + scheduler integration |
-| Perplexity evaluation | `evaluate()` + `BestCheckpointTracker` for auto-save |
-| Training log | CSV / JSON export of loss, lr, grad_norm per step |
-| Mixed precision | BF16 conversion + dynamic loss scaling (NaN/Inf detection) |
-| QAT | `FakeQuantize`, `QatTrainer`, `CalibrationStats` |
-| Knowledge distillation | KL-divergence + hard label mixed loss |
-| QAT Pipeline | Full orchestration: FP32→BF16→Ternary with scheduler, checkpoint, eval |
-| GPU backward | wgpu compute shader for `ternary_matvec_backward` (feature: `gpu`) |
-| ZeRO-Offload | AdamW optimizer state (m/v) offloaded to CPU RAM — 50% VRAM reduction |
-| **TTS (FastSpeech2)** | Non-autoregressive TTS acoustic model with variance adaptor, `ProsodyLoss` joint training, variable-length + masked attention (feature: `tts`) |
+| Checkpoint | ALICETRN バイナリ形式 (magic + JSON header + raw weights) |
+| memmap データ | `MmapDataset` で大規模 token file を memmap2 経由読み込み |
+| Token-based 学習 | `train_tokens()` + DataLoader + scheduler 統合 |
+| Perplexity 評価 | `evaluate()` + `BestCheckpointTracker` 自動保存 |
+| 学習ログ | CSV / JSON で loss / lr / grad_norm を step 毎記録 |
+| Mixed precision | BF16 変換 + 動的 loss scaling (NaN/Inf 検知) |
+| QAT | `FakeQuantize` / `QatTrainer` / `CalibrationStats` |
+| 知識蒸留 | KL-div + hard label 混合 loss |
+| QAT Pipeline | FP32→BF16→Ternary 完全パイプライン (scheduler + checkpoint + eval) |
+| GPU backward | wgpu compute shader で `ternary_matvec_backward` (feature: `gpu`) |
+| ZeRO-Offload | AdamW state (m/v) を CPU RAM に offload — VRAM 50% 削減 |
+| **TTS (FastSpeech2)** | Non-autoregressive TTS acoustic model + variance adaptor + `ProsodyLoss` joint + 可変長 masked attention (feature: `tts`) |
 
-## Quick Start
+## クイックスタート
 
 ```rust
 use alice_train::{ternary_matvec_backward, relu_backward};
@@ -115,7 +121,7 @@ assert!((grad_input[0] - 1.0).abs() < 1e-6);
 assert!((grad_input[1] - 0.0).abs() < 1e-6);
 ```
 
-### Training with scheduler and checkpoint
+### Scheduler + Checkpoint 付き学習
 
 ```rust
 use alice_train::{
@@ -143,7 +149,7 @@ log.save_csv_to_file("train_log.csv").unwrap();
 ```rust
 use alice_train::{LossScaler, MixedPrecisionConfig, f32_to_bf16_vec};
 
-let config = MixedPrecisionConfig::default(); // dynamic scaling enabled
+let config = MixedPrecisionConfig::default(); // 動的 scaling 有効
 let mut scaler = LossScaler::new(config);
 
 let weights_bf16 = f32_to_bf16_vec(&weights_f32);
@@ -154,16 +160,16 @@ let valid = LossScaler::check_gradients(&gradients);
 scaler.update(valid);
 ```
 
-### ZeRO-Offload — VRAM 50% reduction
+### ZeRO-Offload — VRAM 50% 削減
 
 ```rust
 use alice_train::{OffloadOptimizer, OffloadConfig, MemoryBudget};
 
-// 7B model memory estimate
+// 7B モデルのメモリ見積り
 let budget = MemoryBudget::estimate(7_000_000_000);
-// VRAM: 56 GB (weights + gradients only)
-// CPU RAM: 56 GB (m + v offloaded)
-// Without offload: 112 GB VRAM needed
+// VRAM: 56 GB (weights + gradients のみ)
+// CPU RAM: 56 GB (m + v を offload)
+// offload なしなら: 112 GB VRAM 必要
 
 let config = OffloadConfig {
     beta1: 0.9,
@@ -174,7 +180,7 @@ let config = OffloadConfig {
 };
 let mut optimizer = OffloadOptimizer::new(param_count, config);
 
-// Training loop: GPU forward/backward → CPU update
+// 学習ループ: GPU forward/backward → CPU update
 optimizer.step(&mut weights, &mut gradients, lr);
 ```
 
@@ -186,9 +192,9 @@ use alice_train::{GpuContext, GpuBackwardEngine};
 let ctx = GpuContext::new_blocking().expect("GPU required");
 let engine = GpuBackwardEngine::new(&ctx);
 
-// GPU-accelerated: dx = W^T * dy
+// GPU 加速: dx = W^T * dy
 engine.ternary_matvec_backward(&grad_output, &kernel, &mut grad_input);
-// Bit-exact match with CPU version
+// CPU 版と bit-exact 一致
 ```
 
 ### QAT Pipeline — FP32 → Ternary
@@ -204,7 +210,7 @@ let config = QatPipelineConfig {
     warmup_steps: 100,
     gradient_accumulation_steps: 4,
     eval_interval: 5,
-    mixed_precision: MixedPrecisionConfig::default(), // BF16 enabled
+    mixed_precision: MixedPrecisionConfig::default(), // BF16 有効
     ..QatPipelineConfig::default()
 };
 let mut pipeline = QatPipeline::new(config);
@@ -217,17 +223,17 @@ let result = pipeline.run(
     Some(&eval_data),
 );
 
-// Export final ternary weights
+// 最終 ternary weights を書き出し
 let mut ternary = vec![0.0f32; latent_weights.len()];
 pipeline.finalize_weights(&latent_weights, &mut ternary);
 ```
 
 ### TTS (FastSpeech2) — feature: `tts`
 
-Non-autoregressive TTS acoustic model based on FastSpeech2 (Ren et al. 2021).
-Enable with `--features tts`. Reference implementation: [Wataru-Nakata/FastSpeech2-JSUT](https://github.com/Wataru-Nakata/FastSpeech2-JSUT).
+FastSpeech2 (Ren et al. 2021) ベースの non-autoregressive TTS acoustic model。
+`--features tts` で有効化。参照実装: [Wataru-Nakata/FastSpeech2-JSUT](https://github.com/Wataru-Nakata/FastSpeech2-JSUT)
 
-**Architecture**:
+**アーキテクチャ**:
 
 ```
 mora_ids [B, N]  ──► Embedding + PE ──► Encoder (FFT blocks × M)
@@ -246,19 +252,19 @@ mora_ids [B, N]  ──► Embedding + PE ──► Encoder (FFT blocks × M)
                               mel_linear → Postnet residual → mel_after
 ```
 
-**Sub-modules** (`src/tts/`):
+**サブモジュール** (`src/tts/`):
 
-| Module | Purpose |
-|--------|---------|
-| `primitives/` | Conv1D / LayerNorm / MultiHeadAttention / Linear / PositionalEncoding / WeightNorm — hand-written forward+backward |
+| モジュール | 役割 |
+|-----------|------|
+| `primitives/` | Conv1D / LayerNorm / MultiHeadAttention / Linear / PositionalEncoding / WeightNorm — 手書き forward + backward |
 | `audio/` | STFT + Mel filterbank + F0 (YIN) + Energy — `AudioFeatureExtractor` |
 | `dataset/` | Manifest jsonl + streaming loader + WAV I/O |
-| `loss/` | `ProsodyLoss` (F0 L1 + Duration MSE + Energy MSE weighted joint) |
-| `batch/` | `TtsBatch` (11-field batch struct with validation) |
+| `loss/` | `ProsodyLoss` (F0 L1 + Duration MSE + Energy MSE の重み付き joint) |
+| `batch/` | `TtsBatch` (11 field batch struct + 検証) |
 | `fastspeech2` | `FastSpeech2` (Config, forward/forward_variable/forward_with_prosody, backward_full/backward_full_variable/backward_full_with_prosody, apply_sgd/apply_adamw, save/load safetensors) |
-| `tts_trainer` | `TtsTrainer` (SGD/AdamW switch, `step`/`step_variable`/`step_prosody`/`step_variable_prosody`) |
+| `tts_trainer` | `TtsTrainer` (SGD/AdamW 切替、`step`/`step_variable`/`step_prosody`/`step_variable_prosody`) |
 
-**Quick Start — FastSpeech2 training** (SGD):
+**クイックスタート — FastSpeech2 学習**:
 
 ```rust
 use alice_train::tts::{
@@ -276,7 +282,7 @@ let cfg = FastSpeech2Config {
 };
 let mut model = FastSpeech2::zeros(cfg).expect("model");
 model.init_xavier(42);
-// Phase E-next-4: log-domain bias tuning (log(4+1)=1.5 duration, log(150Hz)=5.0 pitch, -20dB energy)
+// Phase E-next-4: log-domain bias 事前設定 (log(4+1)=1.5 duration, log(150Hz)=5.0 pitch, -20dB energy)
 model.init_variance_biases(1.5, 5.0, -20.0);
 
 let mut trainer = TtsTrainer::with_adamw(
@@ -285,14 +291,14 @@ let mut trainer = TtsTrainer::with_adamw(
     AdamWConfig::default(),
 );
 
-// Simple mel-only training:
+// シンプルな mel のみ学習:
 let mora_ids: Vec<u32> = vec![1, 2, 3];
-let durations: Vec<u32> = vec![2, 2, 2];  // 6 frames total
+let durations: Vec<u32> = vec![2, 2, 2];  // 合計 6 frames
 let mel_target = vec![0.0_f32; 6 * 80];
 let result = trainer.step(&mora_ids, &durations, &mel_target, 1, 3).unwrap();
 println!("step {}: mel_loss={}", result.step, result.mel_loss);
 
-// Joint mel + prosody training (recommended, use log-duration target):
+// mel + prosody joint 学習 (推奨、log-duration target 使用):
 let prosody_target = ProsodyTarget {
     f0: vec![vec![120.0, 130.0, 125.0]],
     duration_frames: vec![vec![2.0_f32.ln_1p(), 2.0_f32.ln_1p(), 2.0_f32.ln_1p()]],
@@ -306,16 +312,16 @@ let result = trainer
 println!("total={}, mel={}, prosody={}", result.total_loss, result.mel_loss, result.prosody.total);
 ```
 
-**Checkpoint save/load** (safetensors format for Paperspace 6h session resume):
+**Checkpoint save/load** (Paperspace 6h セッション対応の safetensors 形式):
 
 ```rust
 model.save_safetensors("checkpoints/fs2_step10000.safetensors").unwrap();
-// Later:
+// 後で:
 let mut model2 = FastSpeech2::zeros(cfg).unwrap();
 model2.load_safetensors("checkpoints/fs2_step10000.safetensors").unwrap();
 ```
 
-**Variable-length training** (batch > 1 with different mora/frame lengths):
+**可変長学習** (batch > 1 で mora/frame 長が異なる場合):
 
 ```rust
 let batch = 2;
@@ -330,7 +336,7 @@ let result = trainer
     .unwrap();
 ```
 
-**Roadmap** (Phase T.4a completed features):
+**ロードマップ** (Phase T.4a 完了機能):
 
 - ✅ MVP forward-only + backward Phase 1-3
 - ✅ Phase 4 `TtsTrainer` (SGD)
@@ -338,56 +344,56 @@ let result = trainer
 - ✅ Phase A Xavier init
 - ✅ Phase B AdamW optimizer
 - ✅ Phase C Checkpoint save/load (safetensors)
-- ✅ Phase D Variable frame length + attention mask
-- ✅ Phase E ProsodyLoss joint training
+- ✅ Phase D 可変 frame 長 + attention mask
+- ✅ Phase E ProsodyLoss joint 学習
 - ✅ Phase E-next-1 pitch/energy embed hidden injection
-- ✅ Phase E-next-2 AdamW variance state expansion
-- ✅ Phase E-next-3 variable-length prosody
+- ✅ Phase E-next-2 AdamW variance state 拡張
+- ✅ Phase E-next-3 可変長 prosody
 - ✅ Phase E-next-4 VariancePredictor init tune (log-domain bias)
-- 🔜 Paperspace JSUT fine-tune (300k steps, ~7 sessions × 6h)
+- 🔜 Paperspace JSUT fine-tune (300k steps、~7 sessions × 6h)
 
-## Design Decisions
+## 設計方針
 
-- **Separate crate**: ALICE-ML stays `no_std` / zero-allocation for inference; training requires `std` and heap allocation for gradient buffers.
-- **DPS pattern**: All backward functions write into caller-provided buffers (`grad_input: &mut [f32]`).
-- **STE for ternary weights**: Discrete {-1, 0, +1} weights can't be differentiated directly. Latent FP32 weights are maintained and quantized during forward.
-- **Loss/Optimizer reuse**: `alice_ml::training` provides MSE, CrossEntropy, MAE, SGD, Adam.
-- **Binary checkpoint format**: ALICETRN magic + JSON metadata header + raw f32 weights + optimizer state. Compact and fast to load.
-- **Byte-level mmap access**: `MmapDataset` reads tokens via `u32::from_le_bytes()` instead of pointer casting, avoiding alignment issues.
-- **Dynamic loss scaling**: `LossScaler` tracks consecutive good steps, grows scale on stability, halves on NaN/Inf. Floor at 1.0.
-- **Callback-based token training**: `train_tokens()` takes `token_embed_fn` / `target_embed_fn` closures to decouple token representation from the training loop.
-- **GPU backward via wgpu**: WGSL compute shader mirrors CPU logic. Each thread handles one `grad_input[col]`, iterating over all rows. Feature-gated (`gpu`).
-- **ZeRO-Offload**: AdamW m/v stored in CPU RAM. Reduces VRAM from 4N to 2N parameters. Includes gradient clipping, bias correction, and memory budget estimation.
-- **TTS module isolation**: `feature = "tts"` gate ensures TTS-specific dependencies (rustfft, hound, safetensors, bytemuck) don't bloat the base LLM training binary. Additional deps only pulled when `--features tts`.
-- **Log-domain prosody target**: FastSpeech2 paper convention. `ProsodyTarget::to_log_duration()` transforms `duration_frames → log(dur + 1)`, and `FastSpeech2::init_variance_biases(1.5, ...)` pre-sets predictor linear bias to typical log-mean values for faster convergence.
+- **クレート分離**: ALICE-ML は推論特化で `no_std` / ゼロアロケーション、学習は `std` + heap alloc が必要なため本クレートに分離
+- **DPS pattern**: 全 backward 関数は呼び出し側から `grad_input: &mut [f32]` を受け取り書き込む
+- **STE for ternary weights**: 離散 {-1, 0, +1} は直接微分不能。latent FP32 weights を保持し forward 時に量子化
+- **Loss/Optimizer 再利用**: `alice_ml::training` の MSE / CrossEntropy / MAE / SGD / Adam を活用
+- **Binary checkpoint 形式**: ALICETRN magic + JSON metadata header + raw f32 weights + optimizer state。コンパクトで高速 load
+- **Byte-level mmap access**: `MmapDataset` は `u32::from_le_bytes()` で token を読み、pointer cast による alignment 問題を回避
+- **動的 loss scaling**: `LossScaler` が連続成功 step をカウント、安定時は scale を倍増、NaN/Inf 検出時は半減。下限 1.0
+- **Callback-based token training**: `train_tokens()` は `token_embed_fn` / `target_embed_fn` closure を受け取り、token 表現と学習ループを分離
+- **GPU backward via wgpu**: WGSL compute shader が CPU logic をミラー。各 thread が 1 つの `grad_input[col]` を担当し全 row を走査。feature-gated (`gpu`)
+- **ZeRO-Offload**: AdamW m/v を CPU RAM 格納。VRAM を 4N → 2N params に削減。gradient clipping、bias correction、memory budget 見積り込み
+- **TTS モジュール隔離**: `feature = "tts"` gate により TTS 特有 dep (rustfft, hound, safetensors, bytemuck) が base LLM 学習 binary を膨らませない。`--features tts` 指定時のみ追加 dep 引き込み
+- **Log-domain prosody target**: FastSpeech2 論文慣習。`ProsodyTarget::to_log_duration()` で `duration_frames → log(dur + 1)` 変換し、`FastSpeech2::init_variance_biases(1.5, ...)` で predictor linear bias を典型 log-mean 値に事前設定して序盤収束を改善
 
-## Dependencies
+## 依存クレート
 
-| Crate | Purpose |
-|-------|---------|
-| `alice-ml` | Inference engine (forward, loss, optimizer) |
-| `memmap2` | Memory-mapped file I/O for large datasets |
-| `rand` | Shuffle for DataLoader |
-| `serde` | Checkpoint metadata serialization |
-| `serde_json` | JSON format for checkpoint header and training log |
+| Crate | 用途 |
+|-------|------|
+| `alice-ml` | 推論エンジン (forward, loss, optimizer) |
+| `memmap2` | 大規模データセット用の memory-mapped file I/O |
+| `rand` | DataLoader の shuffle |
+| `serde` | Checkpoint metadata シリアライズ |
+| `serde_json` | Checkpoint header と training log の JSON 形式 |
 | `wgpu` | GPU compute (optional, feature: `gpu`) |
-| `pollster` | Async→sync bridge for wgpu (optional, feature: `gpu`) |
-| `bytemuck` | Zero-copy GPU buffer casting (optional, features: `gpu` / `tts`) |
+| `pollster` | wgpu 用 async→sync bridge (optional, feature: `gpu`) |
+| `bytemuck` | Zero-copy GPU buffer cast (optional, features: `gpu` / `tts`) |
 | `safetensors` | Model checkpoint I/O (optional, features: `qat-cli` / `tts`) |
-| `rustfft` | STFT for `AudioFeatureExtractor` (optional, feature: `tts`) |
-| `hound` | WAV I/O for `TtsDataset` (optional, feature: `tts`) |
+| `rustfft` | `AudioFeatureExtractor` の STFT (optional, feature: `tts`) |
+| `hound` | `TtsDataset` の WAV I/O (optional, feature: `tts`) |
 
-## Quality
+## 品質基準
 
-| Metric | Value |
-|--------|-------|
-| Tests | 467 (default) / 672 (with `tts` feature) |
+| 指標 | 値 |
+|------|-----|
+| テスト数 | 467 (default) / 672 (`tts` feature 込み) |
 | Doc-tests | 7 |
 | Clippy (pedantic+nursery) | 0 warnings |
 | Doc warnings | 0 |
 | fmt | clean |
-| Score | 100/100 |
+| スコア | 100/100 |
 
-## License
+## ライセンス
 
 AGPL-3.0
