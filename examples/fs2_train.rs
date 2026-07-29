@@ -281,31 +281,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let t0 = std::time::Instant::now();
                 let result = trainer.step(mora_ids, &durations_scaled, &mel_target, 1, mora_len)?;
                 let dt = t0.elapsed().as_secs_f32();
-                step_count = result.step;
-                if step_count <= 3 || step_count.is_multiple_of(log_interval) {
+                // Bug fix: 真の累積 step = resume 元 step + このセッション内 trainer.step_count()
+                // 旧実装は step_count = result.step で resume_step を毎回上書き → checkpoint 名衝突
+                let session_step = result.step;
+                step_count = resume_step + session_step;
+                if session_step <= 3 || session_step.is_multiple_of(log_interval) {
                     println!(
-                        "[step {}] epoch={} mel_loss={:.4} step_time={:.2}s mora={} frames={}",
-                        step_count, epoch, result.mel_loss, dt, mora_len, frames
+                        "[step {} (session {})] epoch={} mel_loss={:.4} step_time={:.2}s mora={} frames={}",
+                        step_count, session_step, epoch, result.mel_loss, dt, mora_len, frames
                     );
                 }
 
-                if step_count > 0 && step_count.is_multiple_of(checkpoint_interval) {
+                // Checkpoint は accumulated step で命名 (単調増加、上書きなし)
+                if session_step > 0 && session_step.is_multiple_of(checkpoint_interval) {
                     let ckpt_path = format!("{}/step_{}.safetensors", ckpt_dir, step_count);
                     match trainer.model().save_safetensors(&ckpt_path) {
-                        Ok(_) => println!("[ckpt] saved {}", ckpt_path),
+                        Ok(_) => println!("[ckpt] saved {} (accumulated step)", ckpt_path),
                         Err(e) => eprintln!("[ckpt] save failed: {e}"),
                     }
                 }
 
                 if step_count >= total_steps {
-                    println!("[info] Total steps reached, stopping");
+                    println!("[info] Total steps reached ({}), stopping", step_count);
                     break 'outer;
                 }
             }
         }
 
         println!(
-            "[info] Training complete. Total steps: {}",
+            "[info] Training complete. Accumulated steps: {} (session {})",
+            step_count,
             trainer.step_count()
         );
     }
