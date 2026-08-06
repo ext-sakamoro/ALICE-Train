@@ -402,4 +402,67 @@ mod tests {
         let err = (f0[mid] - 120.0).abs() / 120.0;
         assert!(err < 0.03, "f0={} err={:.4}", f0[mid], err);
     }
+
+    /// harmonic 440Hz sine を YIN と alice-world で処理、両者 shape 一致 +
+    /// 両者 voiced detect すること (Bridge C 統合の基本動作)。
+    #[test]
+    fn f0_algorithm_switching_produces_same_shape() {
+        let ex = AudioFeatureExtractor::new(24_000, 1024, 256, 80);
+        let sr = 24_000_f32;
+        let wav: Vec<f32> = (0..24_000)
+            .map(|i| {
+                let t = (i as f32) / sr;
+                let phase = 2.0 * std::f32::consts::PI * 440.0 * t;
+                phase.sin() + 0.5 * (2.0 * phase).sin() + 0.25 * (3.0 * phase).sin()
+            })
+            .collect();
+
+        let (f0_yin, voiced_yin) = ex.extract_f0_with_algorithm(&wav, F0Algorithm::Yin);
+        let (f0_aw, voiced_aw) =
+            ex.extract_f0_with_algorithm(&wav, F0Algorithm::AliceWorldDioStoneMask);
+
+        // Shape 一致 (両者とも 1 + wav.len() / hop_length frame)
+        assert_eq!(f0_yin.len(), f0_aw.len());
+        assert_eq!(voiced_yin.len(), voiced_aw.len());
+        assert_eq!(f0_yin.len(), 1 + wav.len() / 256);
+
+        // 中央 frame 両方 voiced
+        let mid = f0_yin.len() / 2;
+        assert!(voiced_yin[mid], "YIN center should be voiced");
+        assert!(voiced_aw[mid], "alice-world center should be voiced");
+    }
+
+    /// harmonic 440Hz sine で YIN / alice-world 両者とも sub-Hz 精度で動作すること。
+    ///
+    /// 【実測結果】: 静止 integer Hz signal では YIN (0.024 Hz err) と
+    /// alice-world (0.034 Hz err) が同 order。alice-world の真価は
+    /// 時変 F0 / vibrato / jitter / 実音声で multi-harmonic averaging robustness で発揮。
+    /// この test は「両者とも sub-Hz 精度で動作する」ことを保証する regression detector。
+    #[test]
+    fn both_f0_algorithms_sub_hz_precision_on_pure_signal() {
+        let ex = AudioFeatureExtractor::new(24_000, 1024, 256, 80);
+        let sr = 24_000_f32;
+        let target = 440.0_f32;
+        let wav: Vec<f32> = (0..24_000)
+            .map(|i| {
+                let t = (i as f32) / sr;
+                let phase = 2.0 * std::f32::consts::PI * target * t;
+                phase.sin() + 0.5 * (2.0 * phase).sin() + 0.25 * (3.0 * phase).sin()
+            })
+            .collect();
+
+        let (f0_yin, _) = ex.extract_f0_with_algorithm(&wav, F0Algorithm::Yin);
+        let (f0_aw, _) = ex.extract_f0_with_algorithm(&wav, F0Algorithm::AliceWorldDioStoneMask);
+
+        let mid = f0_yin.len() / 2;
+        let err_yin = (f0_yin[mid] - target).abs();
+        let err_aw = (f0_aw[mid] - target).abs();
+
+        // 両者とも sub-Hz 精度 (regression detector)
+        assert!(err_yin < 1.0, "YIN F0 err too large on 440Hz: {err_yin} Hz");
+        assert!(
+            err_aw < 1.0,
+            "alice-world F0 err too large on 440Hz: {err_aw} Hz"
+        );
+    }
 }
