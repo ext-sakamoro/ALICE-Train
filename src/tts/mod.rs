@@ -25,7 +25,7 @@ pub mod loss;
 pub mod primitives;
 pub mod tts_trainer;
 
-pub use audio::AudioFeatureExtractor;
+pub use audio::{AudioFeatureExtractor, F0Algorithm};
 pub use batch::{TtsBatch, TtsBatchError};
 pub use dataset::{TtsDataset, TtsDatasetError, TtsManifestEntry};
 pub use fastspeech2::{

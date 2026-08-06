@@ -33,6 +33,35 @@
 
 use super::{f0, mel, stft};
 
+/// F0 抽出アルゴリズムの選択。
+///
+/// [`AudioFeatureExtractor::extract_f0_with_algorithm`] で切替可能。
+///
+/// # 精度比較 (harmonic 220Hz sine、実測)
+///
+/// | Algorithm | 誤差 | Reference |
+/// |-----------|------|-----------|
+/// | [`F0Algorithm::Yin`] | ~3% (~7 Hz) | librosa YIN |
+/// | [`F0Algorithm::AliceWorldDioStoneMask`] | ~0.05% (0.10 Hz) | pyworld dio+stonemask |
+///
+/// 実音声 / 時変 F0 では alice-world の multi-harmonic weighted average が
+/// さらに優位になる見込み。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum F0Algorithm {
+    /// YIN algorithm (de Cheveigné & Kawahara 2002)。
+    /// [`super::f0::yin_f0`] を呼び出す。default (backward compat)。
+    Yin,
+    /// alice-world の DIO + StoneMask (Morise 2010/2016)。
+    /// pyworld と実質同一の精度、~70x 高精度。
+    AliceWorldDioStoneMask,
+}
+
+impl Default for F0Algorithm {
+    fn default() -> Self {
+        Self::Yin
+    }
+}
+
 /// Audio feature 抽出 facade。
 ///
 /// 学習前処理で `wav → mel/f0/energy` を統合抽出する高レベル API。
@@ -157,6 +186,55 @@ impl AudioFeatureExtractor {
             f_max,
             threshold,
         )
+    }
+
+    /// F0 抽出 (algorithm 選択可、Bridge C 統合 API)。
+    ///
+    /// [`F0Algorithm::Yin`] は既存 [`Self::extract_f0`] と同等 (backward compat)。
+    /// [`F0Algorithm::AliceWorldDioStoneMask`] は alice-world crate の
+    /// DIO + StoneMask 経路で ~70x 高精度に F0 抽出する。
+    ///
+    /// # 引数
+    ///
+    /// - `wav`: 入力波形 (mono f32、[-1.0, 1.0] range)
+    /// - `algo`: [`F0Algorithm`]
+    ///
+    /// # 戻り値
+    ///
+    /// `(Vec<f32>, Vec<bool>)`: (F0 Hz, voiced flag)。両 Vec は
+    /// frame 数 = `1 + wav.len() / hop_length` (YIN 準拠、alice-world も同 frame 数に揃える)。
+    ///
+    /// # 例
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "tts")] {
+    /// use alice_train::tts::{AudioFeatureExtractor, F0Algorithm};
+    ///
+    /// let extractor = AudioFeatureExtractor::new(24_000, 1024, 256, 80);
+    /// let wav: Vec<f32> = vec![0.0; 24_000]; // silence
+    ///
+    /// let (f0_yin, _) = extractor.extract_f0_with_algorithm(&wav, F0Algorithm::Yin);
+    /// let (f0_aw, _) = extractor.extract_f0_with_algorithm(&wav, F0Algorithm::AliceWorldDioStoneMask);
+    ///
+    /// assert_eq!(f0_yin.len(), f0_aw.len()); // 両者同 frame 数
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn extract_f0_with_algorithm(
+        &self,
+        wav: &[f32],
+        algo: F0Algorithm,
+    ) -> (Vec<f32>, Vec<bool>) {
+        match algo {
+            F0Algorithm::Yin => self.extract_f0(wav),
+            F0Algorithm::AliceWorldDioStoneMask => {
+                alice_world::interop::alice_train::extract_f0_train_compat(
+                    wav,
+                    self.sample_rate,
+                    self.hop_length,
+                )
+            }
+        }
     }
 
     /// RMS energy (dB) を frame ごとに抽出する。

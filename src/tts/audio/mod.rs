@@ -39,4 +39,4 @@ pub mod feature;
 pub mod mel;
 pub mod stft;
 
-pub use feature::AudioFeatureExtractor;
+pub use feature::{AudioFeatureExtractor, F0Algorithm};
