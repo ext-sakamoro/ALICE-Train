@@ -23,7 +23,7 @@ qat-cuda = ["cuda", "qat-cli"]
 # R2: TtsDataset loader (manifest jsonl + WAV load) — hound 使用
 # R3: ProsodyLoss — 追加 dep 無し
 # Phase T.4a Phase C: Checkpoint save/load — safetensors + bytemuck (f32 ↔ u8 cast)
-tts = ["dep:rustfft", "dep:hound", "dep:safetensors", "dep:bytemuck"]
+tts = ["dep:rustfft", "dep:hound", "dep:safetensors", "dep:bytemuck", "dep:alice-world"]
 # Linux OpenBLAS backend for CPU BLAS (Phase T.4b: TTS 学習高速化)
 # apt-get install libopenblas-dev で system openblas を install してから使用
 blas-openblas = []
@@ -104,6 +104,10 @@ rustfft = { version = "6", optional = true }
 
 # ALICE-TTS v2.0 R2 TtsDataset 用 WAV I/O (feature = "tts" gate)
 hound = { version = "3", optional = true }
+
+# ALICE-World interop (feature = "tts" gate、Bridge C: F0 抽出を YIN → DIO+StoneMask 切替可能に)
+# 精度: YIN ~7Hz err @220Hz → alice-world DIO+StoneMask ~0.1Hz err @220Hz (~70x 向上)
+alice-world = { path = "../ALICE-World", features = ["interop-alice-train"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
