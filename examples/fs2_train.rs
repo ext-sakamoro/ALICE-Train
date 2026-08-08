@@ -321,10 +321,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("feature 'tts' not enabled".into());
     }
 
+    #[cfg(feature = "tts")]
     Ok(())
 }
 
 /// checkpoint_dir 内で `step_N.safetensors` の最大 N を持つ file を返す (Phase T.4a Phase C resume)。
+#[cfg(feature = "tts")]
 fn find_latest_checkpoint(ckpt_dir: &str) -> Option<(PathBuf, usize)> {
     let dir = PathBuf::from(ckpt_dir);
     if !dir.exists() {
@@ -380,7 +382,3 @@ fn run_sanity_check(
     Ok(())
 }
 
-#[cfg(not(feature = "tts"))]
-fn run_sanity_check() -> Result<(), Box<dyn std::error::Error>> {
-    Err("feature 'tts' not enabled".into())
-}

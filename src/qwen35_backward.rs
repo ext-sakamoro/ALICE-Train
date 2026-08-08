@@ -886,7 +886,7 @@ pub fn full_attn_layer_backward(
     // Skip o_proj weight grads for now (SGD updates projections in-place during forward)
 
     // ── 3. GQA Attention backward ──
-    let llama_compat = crate::llama::LlamaConfig {
+    let _llama_compat = crate::llama::LlamaConfig {
         vocab_size: config.vocab_size,
         hidden_dim: hidden,
         intermediate_dim: inter,
@@ -1584,6 +1584,10 @@ pub fn deltanet_layer_gc_fused(
     d_input
 }
 
+/// Backward pass for one Qwen3.5 hybrid layer. Dispatches on the layer type
+/// stored in `cache` / `weights` (DeltaNet vs Full Attention) and returns the
+/// gradient with respect to the layer input plus the accumulated weight
+/// gradients ([`Qwen35WeightGrads`]).
 pub fn qwen35_layer_backward(
     d_output: &[f32],
     cache: &crate::qwen35_forward::Qwen35LayerCache,

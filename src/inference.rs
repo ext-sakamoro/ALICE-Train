@@ -8,8 +8,8 @@ use crate::export::{
 };
 use crate::qwen35::{LayerType, Qwen35Config, Qwen35LayerWeights};
 use crate::tokenizer::BpeTokenizer;
-use std::io::{self, BufReader, Read, Seek};
-use std::path::{Path, PathBuf};
+use std::io::{self, BufReader, Read};
+use std::path::Path;
 
 /// ロード済みモデル。
 pub struct AliceModel {
@@ -1028,7 +1028,8 @@ struct PackedRef {
     packed_off: usize,
     /// packed bytes 数。
     packed_len: usize,
-    /// 要素数。
+    /// 要素数 (未使用だが `.alice` header と unpack 対称性のため保持)。
+    #[allow(dead_code)]
     count: usize,
 }
 
@@ -1342,7 +1343,7 @@ impl StreamingAliceModel {
         token_id: u32,
         cache: &mut InferenceCache,
     ) -> io::Result<Vec<f32>> {
-        use crate::blas::{blas_matmul_bt, blas_rmsnorm, ternary_matmul_bt, ternary_swiglu_ffn};
+        use crate::blas::{blas_matmul_bt, blas_rmsnorm};
 
         let config = self.config();
         let hidden = config.hidden_size;

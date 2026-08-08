@@ -373,7 +373,13 @@ impl Conv1d {
     /// im2col で input を [batch * out_len, in_ch * k] に unfold し、
     /// weight [out_ch, in_ch * k] と blas_matmul_bt で一気に計算する。
     /// naive triple loop の 3-5× 高速化 (BLAS/CUDA 経由)。
-    fn forward_im2col(&self, input: &[f32], batch: usize, in_len: usize, out_len: usize) -> Vec<f32> {
+    fn forward_im2col(
+        &self,
+        input: &[f32],
+        batch: usize,
+        in_len: usize,
+        out_len: usize,
+    ) -> Vec<f32> {
         let cfg = &self.config;
         let in_ch = cfg.in_channels;
         let out_ch = cfg.out_channels;
@@ -405,7 +411,14 @@ impl Conv1d {
 
         // matmul: output_2d[col_rows, out_ch] = col[col_rows, col_cols] × weight[out_ch, col_cols]^T
         let mut output_2d = vec![0.0_f32; col_rows * out_ch];
-        crate::blas::blas_matmul_bt(&col, &self.weight, &mut output_2d, col_rows, out_ch, col_cols);
+        crate::blas::blas_matmul_bt(
+            &col,
+            &self.weight,
+            &mut output_2d,
+            col_rows,
+            out_ch,
+            col_cols,
+        );
 
         // rearrange output_2d [batch, out_len, out_ch] → output [batch, out_ch, out_len]
         let mut output = vec![0.0_f32; col_rows * out_ch];
