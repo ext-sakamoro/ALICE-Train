@@ -19,10 +19,8 @@ use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    let ckpt_path =
-        parse_arg(&args, "--checkpoint").unwrap_or_else(|| {
-            PathBuf::from("checkpoints/fs2_jsut/step_8000.safetensors")
-        });
+    let ckpt_path = parse_arg(&args, "--checkpoint")
+        .unwrap_or_else(|| PathBuf::from("checkpoints/fs2_jsut/step_8000.safetensors"));
     let config_path =
         parse_arg(&args, "--config").unwrap_or_else(|| PathBuf::from("configs/fs2_jsut.json"));
     let output_path =
@@ -73,21 +71,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[info] Building FastSpeech2 model + loading checkpoint...");
         let mut model = FastSpeech2::zeros(fs2_config)?;
         model.load_safetensors(&ckpt_path)?;
-        println!("[info] Model loaded (hidden_dim={}, layers={}/{})", fs2_config.hidden_dim,
-                 fs2_config.num_encoder_layers, fs2_config.num_decoder_layers);
+        println!(
+            "[info] Model loaded (hidden_dim={}, layers={}/{})",
+            fs2_config.hidden_dim, fs2_config.num_encoder_layers, fs2_config.num_decoder_layers
+        );
 
         // 適当な mora sequence: "aiueo aiueo" 相当 (mora vocab は JSUT で 42、a=5, i=18, u=4, e=12, o=32)
         // 実 vocab file: data/jsut/mora_vocab.txt (a=5, i=18, u=4, e=12, o=32 が今の設定)
         let mora_ids: Vec<u32> = vec![5, 18, 4, 12, 32, 5, 18, 4, 12, 32]; // aiueo × 2
         let durations: Vec<u32> = vec![10, 10, 10, 10, 10, 10, 10, 10, 10, 10]; // 10 frame each
         let mora_len = mora_ids.len();
-        println!("[info] Synthesizing: {} moras, total {} frames",
-                 mora_len, durations.iter().sum::<u32>());
+        println!(
+            "[info] Synthesizing: {} moras, total {} frames",
+            mora_len,
+            durations.iter().sum::<u32>()
+        );
 
         let mel = model.forward(&mora_ids, 1, mora_len, &durations)?;
         let frames: usize = durations.iter().map(|&d| d as usize).sum();
         let mel_dim = fs2_config.mel_dim;
-        println!("[info] Mel shape: [{}, {}] (frames × mel_dim)", frames, mel_dim);
+        println!(
+            "[info] Mel shape: [{}, {}] (frames × mel_dim)",
+            frames, mel_dim
+        );
 
         // mel は [batch=1, frames, mel_dim] flat、log-scale
         // Statistics
@@ -112,9 +118,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sample_rate, n_fft, hop_length
         );
 
-        let wav = griffin_lim_from_mel(&linear_mel, frames, mel_dim, n_fft, hop_length, sample_rate, gl_iter);
-        println!("[info] Waveform generated: {} samples ({:.2}s)",
-                 wav.len(), wav.len() as f32 / sample_rate as f32);
+        let wav = griffin_lim_from_mel(
+            &linear_mel,
+            frames,
+            mel_dim,
+            n_fft,
+            hop_length,
+            sample_rate,
+            gl_iter,
+        );
+        println!(
+            "[info] Waveform generated: {} samples ({:.2}s)",
+            wav.len(),
+            wav.len() as f32 / sample_rate as f32
+        );
 
         // WAV 書き込み
         let spec = hound::WavSpec {
@@ -227,12 +244,7 @@ fn griffin_lim_from_mel(
 }
 
 #[cfg(feature = "tts")]
-fn istft(
-    stft_complex: &[(f32, f32)],
-    frames: usize,
-    n_fft: usize,
-    hop_length: usize,
-) -> Vec<f32> {
+fn istft(stft_complex: &[(f32, f32)], frames: usize, n_fft: usize, hop_length: usize) -> Vec<f32> {
     use rustfft::{num_complex::Complex, FftPlanner};
     let mut planner = FftPlanner::<f32>::new();
     let ifft = planner.plan_fft_inverse(n_fft);
@@ -277,12 +289,7 @@ fn istft(
 }
 
 #[cfg(feature = "tts")]
-fn stft_simple(
-    wav: &[f32],
-    n_fft: usize,
-    hop_length: usize,
-    frames: usize,
-) -> Vec<(f32, f32)> {
+fn stft_simple(wav: &[f32], n_fft: usize, hop_length: usize, frames: usize) -> Vec<(f32, f32)> {
     use rustfft::{num_complex::Complex, FftPlanner};
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(n_fft);

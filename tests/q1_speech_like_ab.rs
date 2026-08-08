@@ -68,7 +68,7 @@ fn speech_like_signal(seed: u64) -> Vec<f32> {
         } else {
             // Voiced: vibrato + jitter な F0 で harmonic 合成
             let vibrato = 20.0 * (2.0 * PI * 5.5 * t).sin(); // ±20 Hz vibrato
-            // Micro-jitter (LCG-based deterministic)
+                                                             // Micro-jitter (LCG-based deterministic)
             jitter_state = jitter_state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
@@ -230,8 +230,14 @@ fn q1_voiced_f0_rmse_comparison() {
     );
 
     // 両者とも finite + reasonable range
-    assert!(rmse_yin.is_finite() && rmse_yin < 50.0, "YIN RMSE: {rmse_yin}");
-    assert!(rmse_aw.is_finite() && rmse_aw < 50.0, "alice-world RMSE: {rmse_aw}");
+    assert!(
+        rmse_yin.is_finite() && rmse_yin < 50.0,
+        "YIN RMSE: {rmse_yin}"
+    );
+    assert!(
+        rmse_aw.is_finite() && rmse_aw < 50.0,
+        "alice-world RMSE: {rmse_aw}"
+    );
 }
 
 #[test]
