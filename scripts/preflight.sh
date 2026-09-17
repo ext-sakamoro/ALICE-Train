@@ -20,6 +20,9 @@ relint() { git ls-files | grep -E '(^|/)src/(lib|main)\.rs$' | xargs -r touch; }
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing tool: $1 ($2)" >&2; exit 1; }; }
 has_toolchain() { rustup toolchain list | grep -q "^$1"; }
 
+# Steps CI runs that this file cannot reproduce locally (they can only fail remotely):
+#   - ci.yml:test:Strip the private optional path dep (alice-world / tts) (needs network / runner-only)
+
 need actionlint "brew install actionlint"
 
 step "ci.yml / fmt: Check formatting"

@@ -53,6 +53,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ALICE-Train
+      # `alice-world` is an optional path dep on a private sibling (feature
+      # `tts`); cargo resolves every path dep's manifest even when the feature
+      # is off (罠 #42), so strip it — the default-features test surface does
+      # not use it.
+      - name: Strip the private optional path dep (alice-world / tts)
+        working-directory: ALICE-Train
+        run: |
+          set -euo pipefail
+          sed -i.bak '/^alice-world = {/d; /^tts = \[/d' Cargo.toml
+          rm -f Cargo.toml.bak
+          ! grep -n "^alice-world = " Cargo.toml
       - name: Test (default features)
         working-directory: ALICE-Train
         run: cargo test
