@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- `tests/analytic_oracle.rs` — 閉形式 / f64 参照との突合 oracle 10 本 (CLAUDE.md § 解析解突合テスト規律、2026-09-17): activation backward の解析微分 / 数値微分、ternary linear の dx = γ·Wᵀg と dW = g·xᵀ (STE)、pre-norm BitLinear の有限差分、BitNet b1.58 ternary / int8 / int4 (tensor-wise + group-wise) の量子化閉形式と Δ/2 再構成 bound、bf16 round-to-nearest-even、dynamic loss scaling の閉形式 schedule、BLAS 3 variant の f64 参照 + rmsnorm、warmup-cosine LR
+- CI `test` job (default features、alice-ml sibling checkout) — それまで fmt + actionlint のみで test が CI で走っていなかった
+
+### Fixed (oracle 先行 red 2 → 修正)
+- **`ternary_matvec_backward` が kernel の scale γ を落としていた**: forward は `y = γ·W·x` (alice-ml `ternary_matvec_kernel`) なのに backward は `Wᵀ·dy` → `from_ternary_scaled` の kernel で dx が 1/γ 倍 (γ ≈ 0.01〜0.5 の実 layer で 2〜100 倍過大)、`bitlinear_backward` も経由で同じ → `γ·Wᵀ·dy` に
+- **tensor-wise int8 / int4 `calibrate_scale` が mean(|W|) を range にしていた**: `|w| > mean|w|` (layer の約半分) が ±mean に clip、実測 worst 再構成誤差 2.26 (正しい step 0.024 の Δ/2 = 0.012 のはず) → absmax (`max|W|`、group-wise 経路と同じ法則) に ternary は BitNet b1.58 の mean|W| のまま
+
 ## [0.2.0] - 2026-06-23
 
 ### Added

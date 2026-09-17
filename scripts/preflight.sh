@@ -32,4 +32,7 @@ if [[ $quick -eq 1 ]]; then
   echo; echo "preflight --quick OK (test / bench suites skipped)"; exit 0
 fi
 
+step "ci.yml / test: Test (default features)"
+( export CARGO_TERM_COLOR="always"; cargo test )
+
 echo; echo "preflight OK"

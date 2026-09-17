@@ -32,3 +32,27 @@ jobs:
           fail_level: error
           reporter: github-check
 
+
+  # 2026-09-17 新設: それまで fmt + actionlint のみで test は CI 未実行だった
+  # (解析解 oracle `tests/analytic_oracle.rs` を feature-gated でなくても必ず走らせる、
+  # CLAUDE.md § 解析解突合テスト規律 (5) / strict-eval 16) alice-ml は path dep
+  # (`../ALICE-ML`) なので sibling を checkout する (public repo)
+  test:
+    name: Test (default features, CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: ALICE-Train
+      - uses: actions/checkout@v5
+        with:
+          repository: ext-sakamoro/ALICE-ML
+          path: ALICE-ML
+      # toolchain は ALICE-Train/rust-toolchain.toml の pin (1.92.0) が効く
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ALICE-Train
+      - name: Test (default features)
+        working-directory: ALICE-Train
+        run: cargo test

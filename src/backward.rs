@@ -20,7 +20,8 @@ use alice_ml::ops::TernaryWeightKernel;
 ///
 /// - `grad_output` — 出力勾配 dy (長さ = `out_features`)
 /// - `weights` — forward と同じ `TernaryWeightKernel`
-/// - `grad_input` — 入力勾配 dx の書き込み先 (長さ = `in_features`)
+/// - `grad_input` — 入力勾配 dx = γ·Wᵀ·dy の書き込み先 (長さ = `in_features`、
+///   γ は kernel の scale、forward `y = γ·W·x` と対)
 ///
 /// # Panics
 ///
@@ -43,8 +44,14 @@ pub fn ternary_matvec_backward(
     let words_per_row = weights.words_per_row();
     let plus_bits = weights.plus_bits();
     let minus_bits = weights.minus_bits();
+    // forward is y = γ · W x (alice-ml `ternary_matvec_kernel` multiplies by
+    // `weights.scale`), so dx = γ · Wᵀ dy.  Until 2026-09-17 γ was dropped
+    // here (dx was 1/γ too large for every scaled kernel; oracle
+    // `tests/analytic_oracle.rs`).
+    let scale = weights.scale();
 
     for (j, &dy_j) in grad_output.iter().enumerate() {
+        let dy_j = dy_j * scale;
         if dy_j == 0.0 {
             continue;
         }

@@ -194,7 +194,9 @@ impl FakeQuantize {
 
     /// Weights から scale factor を calibrate する。
     ///
-    /// - `group_size == None`: BitNet b1.58 式 γ = mean(|W|)（tensor-wise）。
+    /// - `group_size == None`, ternary: BitNet b1.58 式 γ = mean(|W|)（tensor-wise）。
+    /// - `group_size == None`, int4 / int8: 対称 absmax、range = max(|W|)、
+    ///   step = range / half_levels（全重みが range 内に入る）。
     /// - `group_size == Some(N)`: グループ毎に γ = max(|W_group|) / half_levels
     ///   (Q4_0 互換のシンメトリック per-group scaling)。
     ///
@@ -228,11 +230,31 @@ impl FakeQuantize {
             }
             return;
         }
-        let mut sum = 0.0f64;
-        for &w in weights {
-            sum += w.abs() as f64;
-        }
-        self.scale = (sum / weights.len() as f64) as f32;
+        self.scale = match self.config.bits {
+            // BitNet b1.58: γ = mean(|W|), levels {−γ, 0, +γ}
+            QuantBits::Ternary | QuantBits::Binary2 => {
+                let mut sum = 0.0f64;
+                for &w in weights {
+                    sum += w.abs() as f64;
+                }
+                (sum / weights.len() as f64) as f32
+            }
+            // Symmetric absmax: the range is max(|W|), step = range / half_levels.
+            // History (2026-09-17, oracle `tests/analytic_oracle.rs`): this used
+            // mean(|W|) as the range, so every weight above the mean absolute
+            // value (roughly half of a layer) was clipped to ±mean — worst
+            // reconstruction error 2.26 on a tensor whose step should be 0.024.
+            QuantBits::Int4 | QuantBits::Int8 => {
+                let mut max_abs = 0.0f32;
+                for &w in weights {
+                    let a = w.abs();
+                    if a > max_abs {
+                        max_abs = a;
+                    }
+                }
+                max_abs
+            }
+        };
         if self.scale < 1e-10 {
             self.scale = 1e-10;
         }
