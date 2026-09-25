@@ -696,10 +696,22 @@ fn main() -> std::io::Result<()> {
             let (d_gpu, g_gpu_raw) = {
                 let cuda_mtx = alice_train::blas::CUDA_MATMUL.get().expect("CUDA 未初期化");
                 let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+                // CUDA backward は同じ layer の forward が書いた ws を前提にするので、
+                // 直前に recompute する (これを省くと stale ws で全層が乖離して見える)
+                let mut recompute_hidden = caches_cpu[l].residual_attn.clone();
+                let fresh = alice_train::cuda_matmul::cuda_layer_forward_ws_vram(
+                    &cuda,
+                    &mut recompute_hidden,
+                    &base_layers[l],
+                    &vram_layers[l],
+                    &config,
+                    seq_len,
+                    &mut cuda_ws,
+                );
                 alice_train::cuda_matmul::cuda_layer_backward_ws_vram(
                     &cuda,
                     &d_hidden,
-                    &caches_cpu[l],
+                    &fresh,
                     &base_layers[l],
                     &vram_layers[l],
                     &config,
@@ -865,10 +877,26 @@ fn main() -> std::io::Result<()> {
                     let cuda_mtx = alice_train::blas::CUDA_MATMUL.get().expect("CUDA 未初期化");
                     let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
                     for l in (0..config.num_layers).rev() {
+                        // `cuda_layer_backward_ws_vram` は **同じ layer の forward が
+                        // 書いた workspace** を前提にしている (内部で ws の中間値を読む)。
+                        // 全層 forward → 逆順 backward と並べると最終層以外 ws が stale に
+                        // なり、勾配が壊れて NaN に至る。既存の train-qat-70b と同じく
+                        // backward の直前にその layer の forward を recompute する
+                        // (activation recomputation)。layer の入力は cache.residual_attn。
+                        let mut recompute_hidden = caches[l].residual_attn.clone();
+                        let fresh = alice_train::cuda_matmul::cuda_layer_forward_ws_vram(
+                            &cuda,
+                            &mut recompute_hidden,
+                            &base_layers[l],
+                            &vram_layers[l],
+                            &config,
+                            seq_len,
+                            &mut cuda_ws,
+                        );
                         let (d_in, grads) = alice_train::cuda_matmul::cuda_layer_backward_ws_vram(
                             &cuda,
                             &d_hidden,
-                            &caches[l],
+                            &fresh,
                             &base_layers[l],
                             &vram_layers[l],
                             &config,

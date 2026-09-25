@@ -916,6 +916,21 @@ struct GpuBuf {
 }
 
 /// CUDA matmul エンジン。
+
+/// 正確な sigmoid。
+///
+/// 以前は `fast_math::fast_sigmoid` (= `fast_exp` の bit-hack、相対誤差 < 5%) を
+/// SwiGLU の forward / backward で使っていたが、
+/// `silu'(x) = σ(x)(1 + x(1 − σ(x)))` は x ≲ −1.28 で **符号が変わる**関数なので、
+/// 零点付近では 5% の誤差が **符号を反転させる**。実測で CPU path との
+/// backward parity が `max_rel` 厳密 2.000 (= 符号反転) になっていた。
+///
+/// elementwise は 1 層 188ms のうち 5.5ms なので、正確な `exp` にしても速度影響は無い。
+#[inline]
+fn exact_sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
 pub struct CudaMatmul {
     stream: Arc<CudaStream>,
     blas: CudaBlas,
@@ -1835,7 +1850,7 @@ impl CudaMatmul {
             .zip(intermediate.par_iter_mut())
             .zip(gate.par_iter().zip(up.par_iter()))
             .for_each(|((gs, im), (&g, &u))| {
-                let s = g * crate::fast_math::fast_sigmoid(g);
+                let s = g * exact_sigmoid(g);
                 *gs = s;
                 *im = s * u;
             });
@@ -1946,7 +1961,7 @@ impl CudaMatmul {
             d_up[i] = d_intermediate[i] * gate_silu[i];
             // SiLU derivative: silu'(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
             let x = gate[i];
-            let sig = crate::fast_math::fast_sigmoid(x);
+            let sig = exact_sigmoid(x);
             let silu_grad = sig * (1.0 + x * (1.0 - sig));
             d_gate[i] = d_gate_silu * silu_grad;
         }
@@ -2629,7 +2644,7 @@ pub fn cuda_layer_forward_eval(
         .par_iter_mut()
         .zip(gate.par_iter().zip(up.par_iter()))
         .for_each(|(im, (&g, &u))| {
-            let s = g * crate::fast_math::fast_sigmoid(g);
+            let s = g * exact_sigmoid(g);
             *im = s * u;
         });
     drop(gate);
@@ -2832,7 +2847,7 @@ pub fn cuda_layer_backward(
             let d_gate_silu = d_intermediate[idx] * cache.up[idx];
             *du = d_intermediate[idx] * cache.gate_silu[idx];
             let x = cache.gate[idx];
-            let sig = crate::fast_math::fast_sigmoid(x);
+            let sig = exact_sigmoid(x);
             let silu_grad = sig * (1.0 + x * (1.0 - sig));
             *dg = d_gate_silu * silu_grad;
         });
@@ -3213,7 +3228,7 @@ pub fn cuda_layer_forward_eval_ws(
         .par_iter_mut()
         .zip(ws.gate[..total].par_iter().zip(ws.up[..total].par_iter()))
         .for_each(|(im, (&g, &u))| {
-            let s = g * crate::fast_math::fast_sigmoid(g);
+            let s = g * exact_sigmoid(g);
             *im = s * u;
         });
 
@@ -3416,7 +3431,7 @@ pub fn cuda_layer_forward_eval_ws_vram(
         .par_iter_mut()
         .zip(ws.gate[..total].par_iter().zip(ws.up[..total].par_iter()))
         .for_each(|(im, (&g, &u))| {
-            let s = g * crate::fast_math::fast_sigmoid(g);
+            let s = g * exact_sigmoid(g);
             *im = s * u;
         });
 
@@ -3593,7 +3608,7 @@ pub fn cuda_layer_forward_ws(
                 .zip(ws.up[..inter_len].par_iter()),
         )
         .for_each(|((gs, im), (&g, &u))| {
-            let s = g * crate::fast_math::fast_sigmoid(g);
+            let s = g * exact_sigmoid(g);
             *gs = s;
             *im = s * u;
         });
@@ -3856,7 +3871,7 @@ pub fn cuda_layer_backward_ws(
             let d_gate_silu = ws.d_intermediate[idx] * cache.up[idx];
             *du = ws.d_intermediate[idx] * cache.gate_silu[idx];
             let x = cache.gate[idx];
-            let sig = crate::fast_math::fast_sigmoid(x);
+            let sig = exact_sigmoid(x);
             let silu_grad = sig * (1.0 + x * (1.0 - sig));
             *dg = d_gate_silu * silu_grad;
         });
@@ -4169,7 +4184,7 @@ pub fn cuda_layer_backward_ws_vram(
             let d_gate_silu = ws.d_intermediate[idx] * cache.up[idx];
             *du = ws.d_intermediate[idx] * cache.gate_silu[idx];
             let x = cache.gate[idx];
-            let sig = crate::fast_math::fast_sigmoid(x);
+            let sig = exact_sigmoid(x);
             let silu_grad = sig * (1.0 + x * (1.0 - sig));
             *dg = d_gate_silu * silu_grad;
         });
