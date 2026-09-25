@@ -886,7 +886,12 @@ pub fn full_attn_layer_backward(
     // Skip o_proj weight grads for now (SGD updates projections in-place during forward)
 
     // ── 3. GQA Attention backward ──
-    let _llama_compat = crate::llama::LlamaConfig {
+    // cuda feature 有効時のみ GQA backward に渡す。OFF のときは未使用になるので
+    // 未使用警告だけを黙らせる (以前は `_llama_compat` と改名していたが、
+    // それだと cuda ビルドが E0425 で壊れる — CI が default features しか回していないため
+    // 長期間検出されなかった)
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    let llama_compat = crate::llama::LlamaConfig {
         vocab_size: config.vocab_size,
         hidden_dim: hidden,
         intermediate_dim: inter,
