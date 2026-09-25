@@ -89,6 +89,13 @@ struct Args {
     /// CPU path と CUDA path を層ごとに突合して終了する (GPU 必須、学習しない)
     #[arg(long, default_value_t = false)]
     verify_cuda_parity: bool,
+    /// CUDA が使える環境でも layer は CPU path で回す
+    ///
+    /// CUDA layer path は 2026-09-25 時点で backward の勾配が CPU path と符号レベルで
+    /// 食い違っており (`--verify-cuda-parity` で再現)、CPU path の方だけが
+    /// 数値微分 oracle (`tests/layer_backward_oracle.rs`) を通っている。
+    #[arg(long, default_value_t = false)]
+    force_cpu_layers: bool,
 }
 
 // system prompt は **埋め込まない**。
@@ -547,9 +554,11 @@ fn main() -> std::io::Result<()> {
     #[cfg(feature = "cuda")]
     let mut vram_layers: Vec<VramLayerWeights> = Vec::new();
     #[cfg(feature = "cuda")]
-    let use_cuda_layers = alice_train::blas::cuda_blas_available();
+    let use_cuda_layers = alice_train::blas::cuda_blas_available() && !args.force_cpu_layers;
     #[cfg(not(feature = "cuda"))]
     let use_cuda_layers = false;
+    #[cfg(not(feature = "cuda"))]
+    let _ = args.force_cpu_layers;
 
     // merged 重みを全層 VRAM に載せ直す (起動時 + optimizer step ごと)
     #[cfg(feature = "cuda")]
