@@ -114,26 +114,27 @@ pub fn matmul_bt_backward(
     n: usize,
     k: usize,
 ) {
-    // dA = dC × B  (m×n) × (n×k) → (m×k)
-    for i in 0..m {
-        for j in 0..k {
-            let mut sum = 0.0f32;
-            for h in 0..n {
-                sum = d_output[i * n + h].mul_add(b[h * k + j], sum);
-            }
-            d_a[i * k + j] += sum;
-        }
+    // `blas.rs` に委譲する (CUDA 初期化済なら cuBLAS TF32 / macOS は Accelerate /
+    // それ以外は tiled CPU)。以前はここに素朴な三重ループがあり、backward 全体が
+    // 単コア scalar で回っていた。
+    //
+    // blas_* は C を **上書き** するが、本関数は勾配累積のため `+=` が契約なので、
+    // 一時バッファに出してから加算する。
+    //
+    // dA = dC × B     (m×n) × (n×k) → (m×k)   … nn
+    let mut tmp_a = vec![0.0f32; m * k];
+    crate::blas::blas_matmul_nn(d_output, b, &mut tmp_a, m, k, n);
+    for (dst, src) in d_a.iter_mut().zip(tmp_a.iter()) {
+        *dst += src;
     }
 
-    // dB = dC^T × A  (n×m) × (m×k) → (n×k)
-    for i in 0..n {
-        for j in 0..k {
-            let mut sum = 0.0f32;
-            for h in 0..m {
-                sum = d_output[h * n + i].mul_add(a[h * k + j], sum);
-            }
-            d_b[i * k + j] += sum;
-        }
+    // dB = dC^T × A   (n×m) × (m×k) → (n×k)   … tn (共有次元は m)
+    // blas_matmul_tn(a, b, c, m, n, k) は A:(k×m), B:(k×n) → C:(m×n), C = A^T × B
+    // → their(m, n, k) = (n_mine, k_mine, m_mine)
+    let mut tmp_b = vec![0.0f32; n * k];
+    crate::blas::blas_matmul_tn(d_output, a, &mut tmp_b, n, k, m);
+    for (dst, src) in d_b.iter_mut().zip(tmp_b.iter()) {
+        *dst += src;
     }
 }
 

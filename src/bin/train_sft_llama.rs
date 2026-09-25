@@ -337,6 +337,24 @@ fn main() -> std::io::Result<()> {
     let t_start = Instant::now();
 
     println!("[sft] model_dir = {}", args.model_dir.display());
+
+    // BLAS dispatch を初期化する。これを呼ばないと `blas.rs` の CUDA 経路が
+    // 使われず、行列積が tiled CPU に落ちる (llama path は `blas.rs` 経由なので
+    // 効果は forward / backward の両方に効く)。
+    #[cfg(feature = "cuda")]
+    {
+        alice_train::blas::init_cuda_blas();
+        println!(
+            "[sft] CUDA BLAS: {}",
+            if alice_train::blas::cuda_blas_available() {
+                "有効 (cuBLAS TF32)"
+            } else {
+                "初期化失敗 → CPU fallback"
+            }
+        );
+    }
+    #[cfg(not(feature = "cuda"))]
+    println!("[sft] CUDA BLAS: 無効 (feature off) → CPU 経路");
     let config = load_config(&args.model_dir)?;
     println!(
         "[sft] config: layers {} hidden {} inter {} heads {}/{} head_dim {} vocab {} rope_theta {} eps {}",

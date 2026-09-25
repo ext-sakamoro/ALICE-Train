@@ -41,32 +41,18 @@ pub struct LayerCache {
 /// A: (m × k), B: (n × k) → C: (m × n)
 /// B は転置して掛ける（weight が [out_features × in_features] 格納のため）。
 pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
-    for i in 0..m {
-        let a_row = &a[i * k..(i + 1) * k];
-        for j in 0..n {
-            let b_row = &b[j * k..(j + 1) * k];
-            let mut sum = 0.0f32;
-            for h in 0..k {
-                sum = a_row[h].mul_add(b_row[h], sum);
-            }
-            c[i * n + j] = sum;
-        }
-    }
+    // `blas.rs` に委譲する: CUDA 初期化済なら cuBLAS TF32、macOS なら Accelerate、
+    // それ以外は tiled CPU。以前はここに素朴な三重ループがあり、llama path 全体が
+    // 単コア scalar で回っていた (2.5B の 1 sample に 440s 超、GPU 使用率 0%)。
+    crate::blas::blas_matmul_bt(a, b, c, m, n, k);
 }
 
 /// 行列-行列積: C = A × B (行優先)。
 ///
 /// A: (m × k), B: (k × n) → C: (m × n)
 pub fn matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
-    for i in 0..m {
-        for j in 0..n {
-            let mut sum = 0.0f32;
-            for h in 0..k {
-                sum = a[i * k + h].mul_add(b[h * n + j], sum);
-            }
-            c[i * n + j] = sum;
-        }
-    }
+    // `blas.rs` に委譲 (matmul_bt と同じ理由)。
+    crate::blas::blas_matmul_nn(a, b, c, m, n, k);
 }
 
 // ── RMSNorm ────────────────────────────────────────────────────────────────
