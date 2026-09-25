@@ -67,3 +67,46 @@ jobs:
       - name: Test (default features)
         working-directory: ALICE-Train
         run: cargo test
+
+  # 2026-09-25 新設: それまで default features しか compile しておらず、非 default
+  # feature の code path が腐っていた (`cuda` feature の qwen35_backward が E0425 で
+  # 壊れており、Paperspace で GPU ビルドを試みて初めて発覚) cudarc は
+  # dynamic-loading なので CUDA 不在の runner でも compile / test できる。
+  # canonical: reference_alice_ci_canonical_template §4.6 feature-powerset +
+  # 罠 #37 (feature ごとの step は build ではなく test にする)
+  features:
+    name: Feature powerset + cuda test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: ALICE-Train
+      - uses: actions/checkout@v5
+        with:
+          repository: ext-sakamoro/ALICE-ML
+          path: ALICE-ML
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ALICE-Train
+      - uses: taiki-e/install-action@cargo-hack
+      - name: Strip the private optional path dep (alice-world / tts)
+        working-directory: ALICE-Train
+        run: |
+          set -euo pipefail
+          sed -i.bak '/^alice-world = {/d; /^tts = \[/d' Cargo.toml
+          rm -f Cargo.toml.bak
+          ! grep -n "^alice-world = " Cargo.toml
+      # tts は private sibling を要求するので除外、blas-openblas は system
+      # libopenblas の link を要求するので除外
+      - name: Feature powerset (depth 2)
+        working-directory: ALICE-Train
+        run: cargo hack check --lib --feature-powerset --depth 2 --exclude-features tts,blas-openblas
+      - name: Test (cuda feature)
+        working-directory: ALICE-Train
+        # cuda_matmul::tests は実 GPU 必須 (driver 不在で cudarc が panic) なので skip
+        # compile と他 test は cuda cfg 有効で走るので E0425 の類は検出できる
+        run: cargo test --lib --features cuda -- --skip cuda_matmul
+      - name: Check (qat-cuda, all bins)
+        working-directory: ALICE-Train
+        run: cargo check --features qat-cuda --bins

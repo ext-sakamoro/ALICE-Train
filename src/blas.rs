@@ -6,6 +6,33 @@
 //! - macOS: Accelerate framework の `cblas_sgemm` (ゼロ依存 FFI)
 //! - Linux/その他: タイル matmul (キャッシュライン最適化、ナイーブ比 5-10x)
 
+// ── dispatch カウンタ ────────────────────────────────────────────────────────
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// 本 module の gemm が呼ばれた回数。
+static GEMM_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// `blas_matmul_{bt,tn,nn}` の累積呼び出し回数。
+///
+/// 用途は 2 つ:
+/// - 観測性: 1 step あたり何回 gemm が走っているかを log に出せる
+/// - **gate**: 呼び出し側が本 module に委譲しているかを test で検査できる
+///   (`llama_forward::matmul_bt` が手書きループに戻ると増えなくなる。
+///   bit 一致では検出できない — macOS Accelerate は小さい k で素朴実装と
+///   同じ値を返すため)
+///
+/// 1 回の gemm は最低でもマイクロ秒級なので、relaxed な加算のコストは無視できる。
+#[must_use]
+pub fn gemm_call_count() -> u64 {
+    GEMM_CALLS.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn count_gemm() {
+    GEMM_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
 // ── CUDA グローバルディスパッチ ──────────────────────────────────────────────
 
 #[cfg(feature = "cuda")]
@@ -102,6 +129,7 @@ const CBLAS_TRANS: i32 = 112;
 /// macOS: Accelerate cblas_sgemm。
 /// その他: タイル matmul。
 pub fn blas_matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    count_gemm();
     #[cfg(feature = "cuda")]
     if let Some(cuda_mtx) = CUDA_MATMUL.get() {
         let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
@@ -152,6 +180,7 @@ pub fn blas_matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k
 /// A: (k × m), B: (k × n) → C: (m × n)。
 /// A を転置して掛ける (grad_weight = grad_output^T × input で使用)。
 pub fn blas_matmul_tn(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    count_gemm();
     #[cfg(feature = "cuda")]
     if let Some(cuda_mtx) = CUDA_MATMUL.get() {
         // Phase T.4c: CUDA 経路 (既存 matmul_tn_inplace の param 命名差異を吸収)
@@ -205,6 +234,7 @@ pub fn blas_matmul_tn(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k
 ///
 /// A: (m × k), B: (k × n) → C: (m × n)。
 pub fn blas_matmul_nn(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    count_gemm();
     #[cfg(feature = "cuda")]
     if let Some(cuda_mtx) = CUDA_MATMUL.get() {
         let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");

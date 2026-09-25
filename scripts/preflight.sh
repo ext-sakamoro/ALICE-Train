@@ -38,4 +38,20 @@ fi
 step "ci.yml / test: Test (default features)"
 ( export CARGO_TERM_COLOR="always"; cargo test )
 
+step "ci.yml / features: Test (cuda feature)"
+# cudarc は dynamic-loading なので CUDA 不在の Mac でも compile / test できる。
+# default features しか回していなかったため cuda 経路が E0425 で壊れていた事案の gate。
+# cuda_matmul::tests は実 GPU を要求し、driver 不在だと cudarc が panic するので skip
+( export CARGO_TERM_COLOR="always"; cargo test --lib --features cuda -- --skip cuda_matmul )
+
+step "ci.yml / features: Check (qat-cuda, all bins)"
+( export CARGO_TERM_COLOR="always"; cargo check --features qat-cuda --bins )
+
+if command -v cargo-hack >/dev/null 2>&1; then
+  step "ci.yml / features: Feature powerset (depth 2)"
+  ( export CARGO_TERM_COLOR="always"; cargo hack check --lib --feature-powerset --depth 2 --exclude-features tts,blas-openblas )
+else
+  echo "  (skip) cargo-hack 未 install — CI 側の feature-powerset だけが gate になる: cargo install cargo-hack"
+fi
+
 echo; echo "preflight OK"
