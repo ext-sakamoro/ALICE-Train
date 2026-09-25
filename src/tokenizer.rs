@@ -36,7 +36,33 @@ struct TokenizerJson {
 #[derive(Deserialize)]
 struct TokenizerModel {
     vocab: HashMap<String, u32>,
-    merges: Vec<String>,
+    merges: Vec<MergeEntry>,
+}
+
+/// merges 1 エントリ。HF tokenizers の形式が 2 通りあるため両対応する。
+///
+/// - 旧形式 (tokenizers < 0.20): `"Ġ t"` — 空白区切りの 1 文字列
+/// - 新形式 (tokenizers >= 0.20): `["Ġ", "t"]` — 2 要素配列
+///
+/// MiniCPM5-2B は新形式。旧形式しか読めないと
+/// `invalid type: sequence, expected a string` で load に失敗する。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MergeEntry {
+    /// `["Ġ", "t"]`
+    Pair(String, String),
+    /// `"Ġ t"`
+    Joined(String),
+}
+
+impl MergeEntry {
+    /// (left, right) に正規化する。分割できない旧形式は `None`。
+    fn split(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Pair(l, r) => Some((l.as_str(), r.as_str())),
+            Self::Joined(s) => s.split_once(' '),
+        }
+    }
 }
 
 /// tokenizer.json の added_tokens エントリ。
@@ -84,10 +110,10 @@ impl BpeTokenizer {
             }
         }
 
-        // merges: "Ġ Ġ" → (left="Ġ", right="Ġ") with priority
+        // merges: "Ġ Ġ" / ["Ġ", "Ġ"] → (left, right) with priority
         let mut merges = HashMap::with_capacity(tj.model.merges.len());
-        for (priority, merge_str) in tj.model.merges.iter().enumerate() {
-            if let Some((left, right)) = merge_str.split_once(' ') {
+        for (priority, entry) in tj.model.merges.iter().enumerate() {
+            if let Some((left, right)) = entry.split() {
                 merges.insert((left.to_string(), right.to_string()), priority);
             }
         }
@@ -340,6 +366,38 @@ fn pre_tokenize_words(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// merges の旧形式 (`"a b"`) と新形式 (`["a","b"]`) が同じ結果になること。
+    ///
+    /// MiniCPM5-2B の tokenizer.json は新形式で、旧形式だけを受けていた頃は
+    /// `invalid type: sequence, expected a string` で load 不能だった。
+    #[test]
+    fn merges_old_and_new_formats_agree() {
+        let body = |merges: &str| {
+            format!(
+                r#"{{"model":{{"type":"BPE","vocab":{{"a":0,"b":1,"ab":2}},"merges":{merges}}}}}"#
+            )
+        };
+        let old = BpeTokenizer::from_json(&body(r#"["a b"]"#)).expect("旧形式が読めない");
+        let new = BpeTokenizer::from_json(&body(r#"[["a","b"]]"#)).expect("新形式が読めない");
+        let key = ("a".to_string(), "b".to_string());
+        assert_eq!(
+            old.merges.get(&key),
+            Some(&0),
+            "旧形式の merge が入っていない"
+        );
+        assert_eq!(
+            new.merges.get(&key),
+            Some(&0),
+            "新形式の merge が入っていない"
+        );
+        assert_eq!(old.merges, new.merges, "両形式で merge 表が一致しない");
+        assert_eq!(
+            old.encode("ab"),
+            new.encode("ab"),
+            "encode 結果が一致しない"
+        );
+    }
 
     fn mini_tokenizer_json() -> String {
         r#"{

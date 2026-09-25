@@ -48,6 +48,9 @@ struct Args {
     /// チェックポイント出力ディレクトリ
     #[arg(long)]
     out: PathBuf,
+    /// system prompt の text file (llm_bench.rs から機械抽出したもの、逐語一致が必須)
+    #[arg(long)]
+    system_prompt_file: PathBuf,
     /// LoRA rank
     #[arg(long, default_value_t = 16)]
     rank: usize,
@@ -83,11 +86,16 @@ struct Args {
     resume: bool,
 }
 
-/// `llm_bench` (`alice-lol/examples/llm_bench.rs`) と逐語一致させる system prompt。
-///
-/// baseline (grammar 7/20 / think 9/20) はこの prompt で測られているため、
-/// SFT 側で書式を変えると測定差分が SFT の効果に帰属できなくなる。
-const SYSTEM_PROMPT: &str = "You write ALICE-LOL, a tiny SDF DSL. Output exactly one expression and nothing else: no comments, no indentation, single spaces only, no trailing text.";
+// system prompt は **埋め込まない**。
+//
+// baseline (grammar 7/20 / think 9/20) は `alice-lol/examples/llm_bench.rs` の
+// `SYSTEM_PROMPT` (8 行 1,306 文字) で測られているため、SFT 側が 1 文字でも違うと
+// 測定差分を SFT の効果に帰属できない。ここに手でコピーすると law の二重管理になる
+// (canonical source rule) ので、`--system-prompt-file` で外から与える。
+//
+// file は llm_bench.rs から機械抽出して作る (手写し禁止):
+//   python3 scripts/extract_system_prompt.py \
+//       ../ALICE-LOL/alice-lol/examples/llm_bench.rs data/lol_system_prompt.txt
 
 /// 学習サンプル 1 件。
 struct Sample {
@@ -164,12 +172,13 @@ fn build_sample(
     tok: &BpeTokenizer,
     im_start: u32,
     im_end: u32,
+    system: &str,
     caption: &str,
     lol: &str,
 ) -> Sample {
     let mut t = Vec::with_capacity(256);
     t.push(im_start);
-    t.extend(tok.encode(&format!("system\n{SYSTEM_PROMPT}")));
+    t.extend(tok.encode(&format!("system\n{system}")));
     t.push(im_end);
     t.extend(tok.encode("\n"));
     t.push(im_start);
@@ -193,6 +202,7 @@ fn load_samples(
     tok: &BpeTokenizer,
     im_start: u32,
     im_end: u32,
+    system: &str,
     max_seq: usize,
     limit: usize,
 ) -> std::io::Result<(Vec<Sample>, usize)> {
@@ -219,7 +229,7 @@ fn load_samples(
             eprintln!("  JSONL 行を skip (caption_en / lol が無い)");
             continue;
         };
-        let s = build_sample(tok, im_start, im_end, caption, lol);
+        let s = build_sample(tok, im_start, im_end, system, caption, lol);
         if s.tokens.len() > max_seq {
             skipped_too_long += 1;
             continue;
@@ -354,9 +364,26 @@ fn main() -> std::io::Result<()> {
         tok.vocab_size()
     );
 
+    // ── system prompt (逐語一致が要るので埋め込まず file から) ──
+    let raw_system = fs::read_to_string(&args.system_prompt_file)?;
+    let system_prompt = raw_system.strip_suffix('\n').unwrap_or(&raw_system);
+    println!(
+        "[sft] system prompt: {} chars, {} lines ({})",
+        system_prompt.chars().count(),
+        system_prompt.lines().count(),
+        args.system_prompt_file.display()
+    );
+
     // ── データ ──
-    let (samples, skipped) =
-        load_samples(&args.data, &tok, im_start, im_end, args.max_seq, args.limit)?;
+    let (samples, skipped) = load_samples(
+        &args.data,
+        &tok,
+        im_start,
+        im_end,
+        system_prompt,
+        args.max_seq,
+        args.limit,
+    )?;
     assert!(!samples.is_empty(), "学習サンプルが 0 件");
     let total_completion_tokens: usize = samples
         .iter()
