@@ -145,8 +145,18 @@ pub fn matmul_bt_backward(
 /// `d_output`: 出力勾配 (seq_len × dim)
 /// `input`: forward 前の入力 (seq_len × dim)
 /// `weight`: norm weight (dim)
-/// `d_input`: 入力勾配 (seq_len × dim) — 累積
-/// `d_weight`: 重み勾配 (dim) — 累積
+/// `d_input`: 入力勾配 (seq_len × dim) — **上書き** (呼び出し側の zero 化は不要)
+/// `d_weight`: 重み勾配 (dim) — 累積 (呼び出し側が zero 化するか fresh を渡す)
+///
+/// # `d_input` を上書きにしている理由
+///
+/// 以前は `d_input` も累積 (`+=`) で、「呼び出し側が毎回 zero 化する」ことが
+/// 暗黙の契約だった。`CudaLayerWorkspace` のように **同じ buffer を層をまたいで
+/// 使い回す** 呼び出し側 (`cuda_layer_backward_ws[_vram]`) が zero 化を漏らしており、
+/// 2 回目以降の呼び出しで前の層の `d_input` が積み上がって勾配が壊れていた
+/// (42 層で累積 → NaN、`--verify-cuda-parity` で「最初の 1 層だけ CPU と一致」)。
+/// 行 (token) は互いに素で全域が書かれるので、上書きにすれば契約が消える。
+/// 回帰は `tests/cuda_layer_oracle.rs` の 2 組連続 test が検出する。
 pub fn rmsnorm_backward(
     d_output: &[f32],
     input: &[f32],
@@ -175,7 +185,8 @@ pub fn rmsnorm_backward(
 
             for d in 0..dim {
                 let d_norm = dy[d] * weight[d];
-                d_in_row[d] += d_norm * inv_rms - d_rms_sum * x[d] * inv_rms3 / dim as f32;
+                // 上書き (累積にすると使い回し buffer で前回値が残る、上記 doc 参照)
+                d_in_row[d] = d_norm * inv_rms - d_rms_sum * x[d] * inv_rms3 / dim as f32;
             }
         });
 

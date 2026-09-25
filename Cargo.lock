@@ -9,9 +9,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "alice-det-math"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dd4269e9085b09f6218cc8d1aa0d729466d5d7e2e4fba958e32ec7dd6785f03"
+
+[[package]]
 name = "alice-ml"
 version = "0.2.0"
 dependencies = [
+ "alice-det-math",
  "libm",
 ]
 

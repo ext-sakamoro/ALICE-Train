@@ -129,14 +129,19 @@ fn tensor_diff(a: &[f32], b: &[f32]) -> (f32, f32, usize) {
     (max_abs, max_rel, at)
 }
 
+/// allclose 判定 (`atol + rtol`)。相対だけで見るとゼロ近傍要素で誤検知する
+/// (最初この設計で forward が「全層乖離」に見え、修正後も TF32 の雑音で
+/// `d_input rel 5.06e-3 / max_abs 1e-7` を「乖離」と報告していた)。
+fn is_diverged(a: &[f32], b: &[f32], abs: f32, rel: f32, tol: f32) -> bool {
+    let scale = a.iter().chain(b.iter()).fold(0.0f32, |m, v| m.max(v.abs()));
+    let atol = 1e-4 * scale.max(1e-3);
+    abs > atol && rel > tol
+}
+
 /// 突合結果を 1 行で出す。閾値超えなら `!` を付ける。
 fn report_diff(label: &str, a: &[f32], b: &[f32], tol: f32) -> bool {
     let (abs, rel, at) = tensor_diff(a, b);
-    // allclose 判定: 相対だけで見るとゼロ近傍要素で誤検知する (最初この設計で
-    // forward が「全層乖離」に見えた)。絶対許容も併せて見る。
-    let scale = a.iter().chain(b.iter()).fold(0.0f32, |m, v| m.max(v.abs()));
-    let atol = 1e-4 * scale.max(1e-3);
-    let bad = abs > atol && rel > tol;
+    let bad = is_diverged(a, b, abs, rel, tol);
     println!(
         "    {mark} {label:<14} max_abs {abs:>12.3e}  max_rel {rel:>10.3e}  at {at}  (n={n})",
         mark = if bad { "!!" } else { "ok" },
@@ -664,7 +669,7 @@ fn main() -> std::io::Result<()> {
                 bad |= report_diff("gate_silu", &c_cpu.gate_silu, &c_gpu.gate_silu, tol);
             } else {
                 let (abs, rel, _) = tensor_diff(&h_cpu, &h_gpu);
-                bad = rel > tol;
+                bad = is_diverged(&h_cpu, &h_gpu, abs, rel, tol);
                 if bad {
                     println!(
                         "  [fwd] layer {l}: hidden max_abs {abs:.3e} max_rel {rel:.3e} ← 乖離"
@@ -735,11 +740,12 @@ fn main() -> std::io::Result<()> {
                 bad |= report_diff("d_attn_norm", &g_cpu.d_attn_norm, &g_gpu.d_attn_norm, tol);
                 bad |= report_diff("d_ffn_norm", &g_cpu.d_ffn_norm, &g_gpu.d_ffn_norm, tol);
             } else {
-                let (_, rel, _) = tensor_diff(&d_cpu, &d_gpu);
-                let (_, rel_q, _) = tensor_diff(&g_cpu.d_q_proj, &g_gpu.d_q_proj);
-                bad = rel > tol || rel_q > tol;
+                let (abs, rel, _) = tensor_diff(&d_cpu, &d_gpu);
+                let (abs_q, rel_q, _) = tensor_diff(&g_cpu.d_q_proj, &g_gpu.d_q_proj);
+                bad = is_diverged(&d_cpu, &d_gpu, abs, rel, tol)
+                    || is_diverged(&g_cpu.d_q_proj, &g_gpu.d_q_proj, abs_q, rel_q, tol);
                 if bad {
-                    println!("  [bwd] layer {l}: d_input rel {rel:.3e} / d_q_proj rel {rel_q:.3e} ← 乖離");
+                    println!("  [bwd] layer {l}: d_input rel {rel:.3e} (abs {abs:.3e}) / d_q_proj rel {rel_q:.3e} (abs {abs_q:.3e}) ← 乖離");
                 }
             }
             if bad && first_bad_bwd.is_none() {
