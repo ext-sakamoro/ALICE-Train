@@ -98,6 +98,7 @@ pub mod llama;
 pub mod llama_backward;
 pub mod llama_forward;
 pub mod logger;
+pub mod lora;
 pub mod mixed_precision;
 pub mod offload;
 pub mod pipeline;
