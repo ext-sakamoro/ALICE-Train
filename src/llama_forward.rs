@@ -22,6 +22,13 @@ pub struct LayerCache {
     pub attn_weights: Vec<f32>,
     /// Attention output (hidden_dim × seq_len)。
     pub attn_out: Vec<f32>,
+    /// **o_proj 適用前** の attention 出力 (num_heads × head_dim × seq_len)。
+    ///
+    /// `d_o_proj` の weight 勾配は `d_attn_residualᵀ × attn_out_raw` なので、
+    /// o_proj 適用後の `attn_out` では計算できない。以前は `attn_out` を
+    /// 渡していて d_o_proj が誤っていた (中心差分 oracle が検出、
+    /// `tests/layer_backward_oracle.rs`)。
+    pub attn_out_raw: Vec<f32>,
     /// FFN norm 前の入力 (hidden_dim × seq_len)。
     pub residual_ffn: Vec<f32>,
     /// FFN norm 後 (hidden_dim × seq_len)。
@@ -393,6 +400,7 @@ pub fn layer_forward(
     }
 
     LayerCache {
+        attn_out_raw,
         residual_attn,
         normed_attn,
         q,

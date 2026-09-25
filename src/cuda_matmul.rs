@@ -2486,6 +2486,7 @@ pub fn cuda_layer_forward(
     }
 
     LayerCache {
+        attn_out_raw,
         residual_attn,
         normed_attn,
         q,
@@ -2675,6 +2676,31 @@ pub struct LayerWeightGrads {
     pub up_proj: Vec<f32>,
     /// Down projection 勾配
     pub down_proj: Vec<f32>,
+}
+
+/// 本 module の勾配型を canonical な [`crate::llama_backward::LayerWeightGrads`] へ変換する。
+///
+/// 両者は field が完全に同型 (`d_` prefix の有無だけ) の **重複定義** で、
+/// CUDA path と CPU path が別々に育った名残。呼び出し側がどちらの型でも
+/// 受けられるよう橋渡しする。型の統合自体は別途 (rename が cuda_matmul 全体と
+/// train-qat-70b に波及するため Backlog)。
+impl From<LayerWeightGrads> for crate::llama_backward::LayerWeightGrads {
+    fn from(g: LayerWeightGrads) -> Self {
+        Self {
+            d_attn_norm: g.attn_norm,
+            d_q_proj: g.q_proj,
+            d_k_proj: g.k_proj,
+            d_v_proj: g.v_proj,
+            d_o_proj: g.o_proj,
+            d_q_bias: g.q_bias,
+            d_k_bias: g.k_bias,
+            d_v_bias: g.v_bias,
+            d_ffn_norm: g.ffn_norm,
+            d_gate_proj: g.gate_proj,
+            d_up_proj: g.up_proj,
+            d_down_proj: g.down_proj,
+        }
+    }
 }
 
 impl LayerWeightGrads {
@@ -3591,6 +3617,7 @@ pub fn cuda_layer_forward_ws(
     }
 
     LayerCache {
+        attn_out_raw: ws.attn_out_raw[..seq_len * num_heads * head_dim].to_vec(),
         residual_attn,
         normed_attn,
         q: q_cache,
@@ -3770,6 +3797,7 @@ pub fn cuda_layer_forward_ws_vram(
     }
 
     LayerCache {
+        attn_out_raw: ws.attn_out_raw[..seq_len * num_heads * head_dim].to_vec(),
         residual_attn,
         normed_attn,
         q: q_cache,

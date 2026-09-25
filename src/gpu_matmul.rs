@@ -780,6 +780,7 @@ pub fn gpu_layer_forward(
     }
 
     LayerCache {
+        attn_out_raw,
         residual_attn,
         normed_attn,
         q,

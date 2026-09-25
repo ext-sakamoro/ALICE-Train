@@ -23,6 +23,8 @@
 //!     --out checkpoints/lol_sft
 //! ```
 
+#[cfg(feature = "cuda")]
+use alice_train::cuda_matmul::{CudaLayerWorkspace, VramLayerWeights};
 use alice_train::llama::{LlamaConfig, LlamaLayerWeights};
 use alice_train::llama_backward::{layer_backward, rmsnorm_backward};
 use alice_train::llama_forward::{layer_forward, matmul, matmul_bt, rmsnorm};
@@ -84,6 +86,9 @@ struct Args {
     /// 既存 checkpoint から再開する
     #[arg(long, default_value_t = false)]
     resume: bool,
+    /// CPU path と CUDA path を層ごとに突合して終了する (GPU 必須、学習しない)
+    #[arg(long, default_value_t = false)]
+    verify_cuda_parity: bool,
 }
 
 // system prompt は **埋め込まない**。
@@ -97,6 +102,42 @@ struct Args {
 //   python3 scripts/extract_system_prompt.py \
 //       ../ALICE-LOL/alice-lol/examples/llm_bench.rs data/lol_system_prompt.txt
 
+/// 2 実装の tensor を突合し、最大絶対誤差と最大相対誤差を返す。
+///
+/// 同一概念を 2 経路で実装したら突合する (port parity oracle)。
+fn tensor_diff(a: &[f32], b: &[f32]) -> (f32, f32, usize) {
+    assert_eq!(a.len(), b.len(), "長さが違う: {} vs {}", a.len(), b.len());
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    let mut at = 0usize;
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        let abs = (x - y).abs();
+        if abs > max_abs {
+            max_abs = abs;
+            at = i;
+        }
+        let denom = x.abs().max(y.abs()).max(1e-6);
+        max_rel = max_rel.max(abs / denom);
+    }
+    (max_abs, max_rel, at)
+}
+
+/// 突合結果を 1 行で出す。閾値超えなら `!` を付ける。
+fn report_diff(label: &str, a: &[f32], b: &[f32], tol: f32) -> bool {
+    let (abs, rel, at) = tensor_diff(a, b);
+    // allclose 判定: 相対だけで見るとゼロ近傍要素で誤検知する (最初この設計で
+    // forward が「全層乖離」に見えた)。絶対許容も併せて見る。
+    let scale = a.iter().chain(b.iter()).fold(0.0f32, |m, v| m.max(v.abs()));
+    let atol = 1e-4 * scale.max(1e-3);
+    let bad = abs > atol && rel > tol;
+    println!(
+        "    {mark} {label:<14} max_abs {abs:>12.3e}  max_rel {rel:>10.3e}  at {at}  (n={n})",
+        mark = if bad { "!!" } else { "ok" },
+        n = a.len()
+    );
+    bad
+}
+
 /// 学習サンプル 1 件。
 struct Sample {
     /// prompt + completion の token 列。
@@ -109,11 +150,27 @@ struct Sample {
 ///
 /// `src/bin/train_qat_qwen35.rs` の同名関数と同じ定式 (softmax - onehot)。
 fn cross_entropy_loss(logits: &[f32], target: usize) -> (f32, Vec<f32>) {
+    // NaN / Inf を **絶対に黙って通さない**。
+    //
+    // 以前は `probs[target].max(1e-10)` で下限を切っていたが、Rust の `f32::max` は
+    // NaN を受けると他方を返すため、logits が NaN でも loss が -ln(1e-10) = 23.0259 と
+    // いう「もっともらしい数字」に化けて、CUDA path の NaN を丸ごと隠していた。
+    assert!(
+        logits.iter().all(|x| x.is_finite()),
+        "logits に NaN / Inf がある (target={target}, len={}) — forward が壊れている",
+        logits.len()
+    );
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exp: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
     let sum: f32 = exp.iter().sum();
+    assert!(sum.is_finite() && sum > 0.0, "softmax の分母が不正: {sum}");
     let probs: Vec<f32> = exp.iter().map(|&e| e / sum).collect();
-    let loss = -(probs[target].max(1e-10)).ln();
+    // ここまで finite が保証されているので、下限は f32 の真の underflow 用。
+    // (logit 差が -104 を下回ると exp が subnormal → 0 になるのは正当な underflow)
+    const P_FLOOR: f32 = 1e-30;
+    let p = probs[target];
+    debug_assert!(p.is_finite(), "probs に NaN が残っている");
+    let loss = -p.max(P_FLOOR).ln();
     let mut grad = probs;
     grad[target] -= 1.0;
     (loss, grad)
@@ -476,6 +533,208 @@ fn main() -> std::io::Result<()> {
     // merge 用 scratch (1 層分だけ確保して使い回す = 全層 merge より約 10 GB 節約)
     let mut merged = base_layers[0].clone();
 
+    // ── CUDA 常駐状態 ──
+    //
+    // `cuda_layer_forward_ws_vram` / `cuda_layer_backward_ws_vram` は llama layer
+    // 全体 (attention + FFN) を GPU で回し、projection 重みを VRAM 常駐にして
+    // H2D を 1/14 に削る (qwen35 path 由来、L5/L6/L15/L16)。
+    //
+    // LoRA では merged 重みが **optimizer step ごと** にしか変わらないので、
+    // upload も step ごとで済む (grad_accum 分だけ H2D を共有できる)。
+    // 42 層 × 47.2M float = 約 7.9 GB VRAM (A6000 48 GB に収まる)。
+    #[cfg(feature = "cuda")]
+    let mut cuda_ws = CudaLayerWorkspace::new(&config, args.max_seq);
+    #[cfg(feature = "cuda")]
+    let mut vram_layers: Vec<VramLayerWeights> = Vec::new();
+    #[cfg(feature = "cuda")]
+    let use_cuda_layers = alice_train::blas::cuda_blas_available();
+    #[cfg(not(feature = "cuda"))]
+    let use_cuda_layers = false;
+
+    // merged 重みを全層 VRAM に載せ直す (起動時 + optimizer step ごと)
+    #[cfg(feature = "cuda")]
+    macro_rules! refresh_vram {
+        () => {{
+            if use_cuda_layers {
+                let cuda_mtx = alice_train::blas::CUDA_MATMUL
+                    .get()
+                    .expect("cuda_blas_available() が true なのに未初期化");
+                let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+                vram_layers.clear();
+                for l in 0..config.num_layers {
+                    lora[l].merge_into(&base_layers[l], &mut merged);
+                    vram_layers.push(VramLayerWeights::upload(&cuda, &merged));
+                }
+            }
+        }};
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let t = Instant::now();
+        refresh_vram!();
+        if use_cuda_layers {
+            println!(
+                "[sft] VRAM 常駐: {} layer, {:.2} GB, upload {:.1}s",
+                vram_layers.len(),
+                vram_layers
+                    .iter()
+                    .map(VramLayerWeights::vram_bytes)
+                    .sum::<usize>() as f64
+                    / 1e9,
+                t.elapsed().as_secs_f32()
+            );
+        }
+    }
+    println!(
+        "[sft] layer 実行経路: {}",
+        if use_cuda_layers {
+            "CUDA (attention + FFN を GPU、重みは VRAM 常駐)"
+        } else {
+            "CPU (blas 経由)"
+        }
+    );
+
+    // ── CPU ↔ CUDA parity 突合 (--verify-cuda-parity) ──
+    //
+    // 同一入力から両 path を走らせ、最初に乖離する層 / tensor を特定する。
+    // CPU 版 layer_forward は blas 経由で CUDA_MATMUL の mutex を取るので、
+    // CPU 呼び出し中は lock を持たない (持つと deadlock)。
+    #[cfg(feature = "cuda")]
+    if args.verify_cuda_parity {
+        assert!(use_cuda_layers, "CUDA が初期化されていない (GPU 必須)");
+        let sample = &samples[0];
+        let seq_len = sample.tokens.len();
+        let hd = config.hidden_dim;
+        println!("\n[parity] sample[0] seq_len {seq_len}, 層ごとに同一入力で突合する");
+        // tol: TF32 の cuBLAS は f32 比で 1e-3 級の相対誤差が出うる
+        let tol = 5e-3f32;
+
+        let mut hidden = vec![0.0f32; seq_len * hd];
+        for (t, &tid) in sample.tokens.iter().enumerate() {
+            let tid = tid as usize;
+            hidden[t * hd..(t + 1) * hd].copy_from_slice(&embedding[tid * hd..(tid + 1) * hd]);
+        }
+
+        let mut caches_cpu = Vec::with_capacity(config.num_layers);
+        let mut first_bad_fwd: Option<usize> = None;
+        for l in 0..config.num_layers {
+            lora[l].merge_into(&base_layers[l], &mut merged);
+            let mut h_cpu = hidden.clone();
+            let c_cpu = layer_forward(&mut h_cpu, &merged, &config, seq_len);
+            let mut h_gpu = hidden.clone();
+            let c_gpu = {
+                let cuda_mtx = alice_train::blas::CUDA_MATMUL.get().expect("CUDA 未初期化");
+                let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+                alice_train::cuda_matmul::cuda_layer_forward_ws_vram(
+                    &cuda,
+                    &mut h_gpu,
+                    &base_layers[l],
+                    &vram_layers[l],
+                    &config,
+                    seq_len,
+                    &mut cuda_ws,
+                )
+            };
+            let mut bad = false;
+            if l < 3 || first_bad_fwd.is_some() || l + 1 == config.num_layers {
+                println!("  [fwd] layer {l}");
+                bad |= report_diff("hidden", &h_cpu, &h_gpu, tol);
+                bad |= report_diff("normed_attn", &c_cpu.normed_attn, &c_gpu.normed_attn, tol);
+                bad |= report_diff("q", &c_cpu.q, &c_gpu.q, tol);
+                bad |= report_diff("k", &c_cpu.k, &c_gpu.k, tol);
+                bad |= report_diff("v", &c_cpu.v, &c_gpu.v, tol);
+                bad |= report_diff(
+                    "attn_weights",
+                    &c_cpu.attn_weights,
+                    &c_gpu.attn_weights,
+                    tol,
+                );
+                bad |= report_diff("attn_out", &c_cpu.attn_out, &c_gpu.attn_out, tol);
+                bad |= report_diff("gate", &c_cpu.gate, &c_gpu.gate, tol);
+                bad |= report_diff("up", &c_cpu.up, &c_gpu.up, tol);
+                bad |= report_diff("gate_silu", &c_cpu.gate_silu, &c_gpu.gate_silu, tol);
+            } else {
+                let (abs, rel, _) = tensor_diff(&h_cpu, &h_gpu);
+                bad = rel > tol;
+                if bad {
+                    println!(
+                        "  [fwd] layer {l}: hidden max_abs {abs:.3e} max_rel {rel:.3e} ← 乖離"
+                    );
+                }
+            }
+            if bad && first_bad_fwd.is_none() {
+                first_bad_fwd = Some(l);
+                println!("  ==> forward の最初の乖離は layer {l}");
+            }
+            hidden = h_cpu; // canonical (CPU) で先へ進める
+            caches_cpu.push(c_cpu);
+        }
+        println!(
+            "[parity] forward: {}",
+            first_bad_fwd.map_or_else(|| "全層一致".to_string(), |l| format!("layer {l} から乖離"))
+        );
+
+        // backward は CPU の cache を両方に食わせて backward 計算だけを比べる
+        let mut d_hidden = vec![0.0f32; seq_len * hd];
+        for (i, v) in d_hidden.iter_mut().enumerate() {
+            *v = ((i % 17) as f32 - 8.0) * 1e-3; // 決定論的な疑似勾配
+        }
+        let mut first_bad_bwd: Option<usize> = None;
+        for l in (0..config.num_layers).rev() {
+            lora[l].merge_into(&base_layers[l], &mut merged);
+            let (d_cpu, g_cpu) =
+                layer_backward(&d_hidden, &caches_cpu[l], &merged, &config, seq_len);
+            let (d_gpu, g_gpu_raw) = {
+                let cuda_mtx = alice_train::blas::CUDA_MATMUL.get().expect("CUDA 未初期化");
+                let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+                alice_train::cuda_matmul::cuda_layer_backward_ws_vram(
+                    &cuda,
+                    &d_hidden,
+                    &caches_cpu[l],
+                    &base_layers[l],
+                    &vram_layers[l],
+                    &config,
+                    seq_len,
+                    &mut cuda_ws,
+                )
+            };
+            let g_gpu: alice_train::llama_backward::LayerWeightGrads = g_gpu_raw.into();
+            let mut bad = false;
+            let verbose = l + 1 == config.num_layers || l < 2 || first_bad_bwd.is_some();
+            if verbose {
+                println!("  [bwd] layer {l}");
+                bad |= report_diff("d_input", &d_cpu, &d_gpu, tol);
+                bad |= report_diff("d_q_proj", &g_cpu.d_q_proj, &g_gpu.d_q_proj, tol);
+                bad |= report_diff("d_k_proj", &g_cpu.d_k_proj, &g_gpu.d_k_proj, tol);
+                bad |= report_diff("d_v_proj", &g_cpu.d_v_proj, &g_gpu.d_v_proj, tol);
+                bad |= report_diff("d_o_proj", &g_cpu.d_o_proj, &g_gpu.d_o_proj, tol);
+                bad |= report_diff("d_gate_proj", &g_cpu.d_gate_proj, &g_gpu.d_gate_proj, tol);
+                bad |= report_diff("d_up_proj", &g_cpu.d_up_proj, &g_gpu.d_up_proj, tol);
+                bad |= report_diff("d_down_proj", &g_cpu.d_down_proj, &g_gpu.d_down_proj, tol);
+                bad |= report_diff("d_attn_norm", &g_cpu.d_attn_norm, &g_gpu.d_attn_norm, tol);
+                bad |= report_diff("d_ffn_norm", &g_cpu.d_ffn_norm, &g_gpu.d_ffn_norm, tol);
+            } else {
+                let (_, rel, _) = tensor_diff(&d_cpu, &d_gpu);
+                let (_, rel_q, _) = tensor_diff(&g_cpu.d_q_proj, &g_gpu.d_q_proj);
+                bad = rel > tol || rel_q > tol;
+                if bad {
+                    println!("  [bwd] layer {l}: d_input rel {rel:.3e} / d_q_proj rel {rel_q:.3e} ← 乖離");
+                }
+            }
+            if bad && first_bad_bwd.is_none() {
+                first_bad_bwd = Some(l);
+                println!("  ==> backward の最初の乖離は layer {l}");
+            }
+            d_hidden = d_cpu;
+        }
+        println!(
+            "[parity] backward: {}",
+            first_bad_bwd.map_or_else(|| "全層一致".to_string(), |l| format!("layer {l} から乖離"))
+        );
+        println!("[parity] tol = {tol:e} (相対) で判定 完了");
+        return Ok(());
+    }
+
     let mut log_file = fs::File::create(args.out.join("train.log"))?;
     let mut accum_in_batch = 0usize;
     let mut running_loss = 0.0f32;
@@ -500,9 +759,30 @@ fn main() -> std::io::Result<()> {
                 );
             }
             let mut caches = Vec::with_capacity(config.num_layers);
-            for l in 0..config.num_layers {
-                lora[l].merge_into(&base_layers[l], &mut merged);
-                caches.push(layer_forward(&mut hidden, &merged, &config, seq_len));
+            if use_cuda_layers {
+                // Mutex は layer loop の間だけ保持する。logits 側の matmul は
+                // blas 経由で同じ mutex を取るので、scope を分けないと deadlock する。
+                #[cfg(feature = "cuda")]
+                {
+                    let cuda_mtx = alice_train::blas::CUDA_MATMUL.get().expect("CUDA 未初期化");
+                    let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+                    for l in 0..config.num_layers {
+                        caches.push(alice_train::cuda_matmul::cuda_layer_forward_ws_vram(
+                            &cuda,
+                            &mut hidden,
+                            &base_layers[l], // norm / bias のみ参照される (LoRA は触らない)
+                            &vram_layers[l],
+                            &config,
+                            seq_len,
+                            &mut cuda_ws,
+                        ));
+                    }
+                }
+            } else {
+                for l in 0..config.num_layers {
+                    lora[l].merge_into(&base_layers[l], &mut merged);
+                    caches.push(layer_forward(&mut hidden, &merged, &config, seq_len));
+                }
             }
             let pre_norm = hidden.clone();
             rmsnorm(
@@ -570,12 +850,36 @@ fn main() -> std::io::Result<()> {
                 config.hidden_dim,
                 config.norm_eps,
             );
-            for l in (0..config.num_layers).rev() {
-                lora[l].merge_into(&base_layers[l], &mut merged);
-                let (d_in, grads) =
-                    layer_backward(&d_hidden, &caches[l], &merged, &config, seq_len);
-                lora[l].project_grads(&grads, &mut lora_grads[l]);
-                d_hidden = d_in;
+            if use_cuda_layers {
+                #[cfg(feature = "cuda")]
+                {
+                    let cuda_mtx = alice_train::blas::CUDA_MATMUL.get().expect("CUDA 未初期化");
+                    let cuda = cuda_mtx.lock().expect("CUDA mutex poisoned");
+                    for l in (0..config.num_layers).rev() {
+                        let (d_in, grads) = alice_train::cuda_matmul::cuda_layer_backward_ws_vram(
+                            &cuda,
+                            &d_hidden,
+                            &caches[l],
+                            &base_layers[l],
+                            &vram_layers[l],
+                            &config,
+                            seq_len,
+                            &mut cuda_ws,
+                        );
+                        // CUDA path の勾配型は重複定義なので canonical 側へ変換する
+                        let grads: alice_train::llama_backward::LayerWeightGrads = grads.into();
+                        lora[l].project_grads(&grads, &mut lora_grads[l]);
+                        d_hidden = d_in;
+                    }
+                }
+            } else {
+                for l in (0..config.num_layers).rev() {
+                    lora[l].merge_into(&base_layers[l], &mut merged);
+                    let (d_in, grads) =
+                        layer_backward(&d_hidden, &caches[l], &merged, &config, seq_len);
+                    lora[l].project_grads(&grads, &mut lora_grads[l]);
+                    d_hidden = d_in;
+                }
             }
 
             running_loss += sample_loss;
@@ -596,6 +900,9 @@ fn main() -> std::io::Result<()> {
                     lora_grads[l].zero_out();
                 }
                 global_step += 1;
+                // 重みが動いたので VRAM 常駐分を作り直す (次の grad_accum 分で共有)
+                #[cfg(feature = "cuda")]
+                refresh_vram!();
 
                 if global_step.is_multiple_of(args.log_every as u64) {
                     let avg = running_loss / running_tokens.max(1) as f32;

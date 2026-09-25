@@ -467,7 +467,10 @@ pub fn layer_backward(
     let mut d_attn_out_raw = vec![0.0f32; seq_len * num_heads * head_dim];
     matmul_bt_backward(
         &d_attn_residual,
-        &cache.attn_out, // attn_out_raw (reshaped) — we stored o_proj output
+        // o_proj 適用「前」の出力を渡す。以前は `cache.attn_out` (適用後) を
+        // 渡していて weight 勾配 d_o_proj が誤っていた (符号すら合わない、
+        // 中心差分 oracle `tests/layer_backward_oracle.rs` が検出)。
+        &cache.attn_out_raw,
         &weights.o_proj,
         &mut d_attn_out_raw,
         &mut grads.d_o_proj,
