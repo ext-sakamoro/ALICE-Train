@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- **License: `AGPL-3.0` → `AGPL-3.0 OR LicenseRef-Commercial` (dual-licensed、2026-09-27)** AGPL 側の条件は変更なし (既存 AGPL 利用者への影響ゼロ)、商用という選択肢が追加されただけ SPDX が AGPL 単独だと cargo-deny / FOSSA / SBOM に「商用オプションなし」と見えるため宣言を dual に 変更点: SPDX / `LICENSE` → `LICENSE-AGPL` / `LICENSE-COMMERCIAL.md` (商用トリガー 6 条件 = クローズド製品・商用 SaaS・エッジ / ファームウェア配布・plugin 再配布・プラットフォーム NDA・保証、社内利用は AGPL 側で無償と明記) / README の選択肢表 商用窓口は法人 `contact@extoria.co.jp`
+
 ### Added
 - `tests/cuda_layer_oracle.rs` に 2 本追加 (GPU 必須、`--features cuda` 単独で実行): **実 shape** (hidden 2048 / heads 16/2 / head_dim 128 / seq 466) の中心差分 oracle と、同じ `CudaLayerWorkspace` で forward→backward を **2 組連続** 回した時の 2 組目を検査する oracle 小 shape 1 組だけの検査では下の `rmsnorm_backward` の使い回しバグが見えなかった
 - `tests/layer_backward_oracle.rs` に CPU 版の実 shape 中心差分 oracle (`#[ignore]`、`-- --ignored` で実行、Mac 実測 86s)
