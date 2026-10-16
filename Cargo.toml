@@ -102,7 +102,7 @@ safetensors = { version = "0.4", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 
 # PyTorch .pth ローダー
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # ALICE-TTS v2.0 R4 AudioFeatureExtractor 用 STFT (feature = "tts" gate)
 rustfft = { version = "6", optional = true }
