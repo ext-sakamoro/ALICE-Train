@@ -35,7 +35,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[info] Griffin-Lim iter: {}", gl_iter);
 
     let config_json = fs::read_to_string(&config_path)?;
-    let _config: serde_json::Value = serde_json::from_str(&config_json)?;
+    // read by the tts path below; without tts the config is only validated
+    #[cfg_attr(not(feature = "tts"), allow(unused_variables))]
+    let config: serde_json::Value = serde_json::from_str(&config_json)?;
 
     #[cfg(feature = "cuda")]
     {
