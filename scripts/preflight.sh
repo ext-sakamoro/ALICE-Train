@@ -20,8 +20,6 @@ relint() { git ls-files | grep -E '(^|/)src/(lib|main)\.rs$' | xargs -r touch; }
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing tool: $1 ($2)" >&2; exit 1; }; }
 has_toolchain() { rustup toolchain list | grep -q "^$1"; }
 
-# Steps CI runs that this file cannot reproduce locally (they can only fail remotely):
-#   - ci.yml:test:Strip the private optional path dep (alice-world / tts) (needs network / runner-only)
 
 need actionlint "brew install actionlint"
 
@@ -38,6 +36,9 @@ fi
 step "ci.yml / test: Test (default features)"
 ( export CARGO_TERM_COLOR="always"; cargo test )
 
+step "ci.yml / test: Test (tts feature)"
+( export CARGO_TERM_COLOR="always"; cargo test --features tts )
+
 step "ci.yml / features: Test (cuda feature)"
 # cudarc は dynamic-loading なので CUDA 不在の Mac でも compile / test できる。
 # default features しか回していなかったため cuda 経路が E0425 で壊れていた事案の gate。
@@ -49,7 +50,7 @@ step "ci.yml / features: Check (qat-cuda, all bins)"
 
 if command -v cargo-hack >/dev/null 2>&1; then
   step "ci.yml / features: Feature powerset (depth 2)"
-  ( export CARGO_TERM_COLOR="always"; cargo hack check --lib --feature-powerset --depth 2 --exclude-features tts,blas-openblas )
+  ( export CARGO_TERM_COLOR="always"; cargo hack check --lib --feature-powerset --depth 2 --exclude-features blas-openblas )
 else
   echo "  (skip) cargo-hack 未 install — CI 側の feature-powerset だけが gate になる: cargo install cargo-hack"
 fi

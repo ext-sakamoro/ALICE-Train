@@ -32,33 +32,25 @@
 //! ```
 
 use super::{f0, mel, stft};
+use crate::F0Extractor;
 
-/// F0 抽出アルゴリズムの選択。
+/// YIN F0 extraction (de Cheveigné & Kawahara 2002) as an [`F0Extractor`]
 ///
-/// [`AudioFeatureExtractor::extract_f0_with_algorithm`] で切替可能。
-///
-/// # 精度比較 (harmonic 220Hz sine、実測)
-///
-/// | Algorithm | 誤差 | Reference |
-/// |-----------|------|-----------|
-/// | [`F0Algorithm::Yin`] | ~3% (~7 Hz) | librosa YIN |
-/// | [`F0Algorithm::AliceWorldDioStoneMask`] | ~0.05% (0.10 Hz) | pyworld dio+stonemask |
-///
-/// 実音声 / 時変 F0 では alice-world の multi-harmonic weighted average が
-/// さらに優位になる見込み。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum F0Algorithm {
-    /// YIN algorithm (de Cheveigné & Kawahara 2002)。
-    /// [`super::f0::yin_f0`] を呼び出す。default (backward compat)。
-    Yin,
-    /// alice-world の DIO + StoneMask (Morise 2010/2016)。
-    /// pyworld と実質同一の精度、~70x 高精度。
-    AliceWorldDioStoneMask,
-}
+/// The default of [`AudioFeatureExtractor`]: the same path as
+/// [`AudioFeatureExtractor::extract_f0`] (`f_min = 50`, `f_max = 550`,
+/// `threshold = 0.15`, `frame_length = 2048`). Another algorithm is supplied by a type
+/// that implements [`F0Extractor`] and passed to [`AudioFeatureExtractor::extract_f0_with`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Yin;
 
-impl Default for F0Algorithm {
-    fn default() -> Self {
-        Self::Yin
+impl F0Extractor for Yin {
+    fn extract_f0(
+        &self,
+        wav: &[f32],
+        sample_rate: u32,
+        hop_length: usize,
+    ) -> (Vec<f32>, Vec<bool>) {
+        f0::yin_f0(wav, sample_rate, 2048, hop_length, 50.0, 550.0, 0.15)
     }
 }
 
@@ -188,53 +180,33 @@ impl AudioFeatureExtractor {
         )
     }
 
-    /// F0 抽出 (algorithm 選択可、Bridge C 統合 API)。
+    /// F0 抽出 (抽出器を差し込む)。
     ///
-    /// [`F0Algorithm::Yin`] は既存 [`Self::extract_f0`] と同等 (backward compat)。
-    /// [`F0Algorithm::AliceWorldDioStoneMask`] は alice-world crate の
-    /// DIO + StoneMask 経路で ~70x 高精度に F0 抽出する。
-    ///
-    /// # 引数
-    ///
-    /// - `wav`: 入力波形 (mono f32、[-1.0, 1.0] range)
-    /// - `algo`: [`F0Algorithm`]
-    ///
-    /// # 戻り値
-    ///
-    /// `(Vec<f32>, Vec<bool>)`: (F0 Hz, voiced flag)。両 Vec は
-    /// frame 数 = `1 + wav.len() / hop_length` (YIN 準拠、alice-world も同 frame 数に揃える)。
+    /// この抽出器の `sample_rate` と `hop_length` を `extractor` に渡して呼ぶ。
+    /// [`Yin`] は [`Self::extract_f0`] と同じ結果を返す。別の algorithm は
+    /// [`F0Extractor`] を実装した型で差し込む (この crate はその algorithm に依存しない)。
     ///
     /// # 例
     ///
     /// ```rust
     /// # #[cfg(feature = "tts")] {
-    /// use alice_train::tts::{AudioFeatureExtractor, F0Algorithm};
+    /// use alice_train::tts::{AudioFeatureExtractor, Yin};
     ///
     /// let extractor = AudioFeatureExtractor::new(24_000, 1024, 256, 80);
     /// let wav: Vec<f32> = vec![0.0; 24_000]; // silence
     ///
-    /// let (f0_yin, _) = extractor.extract_f0_with_algorithm(&wav, F0Algorithm::Yin);
-    /// let (f0_aw, _) = extractor.extract_f0_with_algorithm(&wav, F0Algorithm::AliceWorldDioStoneMask);
-    ///
-    /// assert_eq!(f0_yin.len(), f0_aw.len()); // 両者同 frame 数
+    /// let (f0, voiced) = extractor.extract_f0_with(&wav, &Yin);
+    /// assert_eq!(f0.len(), 1 + wav.len() / 256);
+    /// assert_eq!((f0, voiced), extractor.extract_f0(&wav));
     /// # }
     /// ```
     #[must_use]
-    pub fn extract_f0_with_algorithm(
+    pub fn extract_f0_with(
         &self,
         wav: &[f32],
-        algo: F0Algorithm,
+        extractor: &dyn F0Extractor,
     ) -> (Vec<f32>, Vec<bool>) {
-        match algo {
-            F0Algorithm::Yin => self.extract_f0(wav),
-            F0Algorithm::AliceWorldDioStoneMask => {
-                alice_world::interop::alice_train::extract_f0_train_compat(
-                    wav,
-                    self.sample_rate,
-                    self.hop_length,
-                )
-            }
-        }
+        extractor.extract_f0(wav, self.sample_rate, self.hop_length)
     }
 
     /// RMS energy (dB) を frame ごとに抽出する。
@@ -403,66 +375,25 @@ mod tests {
         assert!(err < 0.03, "f0={} err={:.4}", f0[mid], err);
     }
 
-    /// harmonic 440Hz sine を YIN と alice-world で処理、両者 shape 一致 +
-    /// 両者 voiced detect すること (Bridge C 統合の基本動作)。
+    /// The YIN plug-in is the default path, bit for bit, on a voiced and a silent input
     #[test]
-    fn f0_algorithm_switching_produces_same_shape() {
+    fn yin_plug_in_equals_extract_f0() {
         let ex = AudioFeatureExtractor::new(24_000, 1024, 256, 80);
-        let sr = 24_000_f32;
-        let wav: Vec<f32> = (0..24_000)
-            .map(|i| {
-                let t = (i as f32) / sr;
-                let phase = 2.0 * std::f32::consts::PI * 440.0 * t;
-                phase.sin() + 0.5 * (2.0 * phase).sin() + 0.25 * (3.0 * phase).sin()
-            })
+        let voiced: Vec<f32> = (0..24_000)
+            .map(|i| ((i % 109) as f32 / 109.0) * 1.6 - 0.8)
             .collect();
-
-        let (f0_yin, voiced_yin) = ex.extract_f0_with_algorithm(&wav, F0Algorithm::Yin);
-        let (f0_aw, voiced_aw) =
-            ex.extract_f0_with_algorithm(&wav, F0Algorithm::AliceWorldDioStoneMask);
-
-        // Shape 一致 (両者とも 1 + wav.len() / hop_length frame)
-        assert_eq!(f0_yin.len(), f0_aw.len());
-        assert_eq!(voiced_yin.len(), voiced_aw.len());
-        assert_eq!(f0_yin.len(), 1 + wav.len() / 256);
-
-        // 中央 frame 両方 voiced
-        let mid = f0_yin.len() / 2;
-        assert!(voiced_yin[mid], "YIN center should be voiced");
-        assert!(voiced_aw[mid], "alice-world center should be voiced");
-    }
-
-    /// harmonic 440Hz sine で YIN / alice-world 両者とも sub-Hz 精度で動作すること。
-    ///
-    /// 【実測結果】: 静止 integer Hz signal では YIN (0.024 Hz err) と
-    /// alice-world (0.034 Hz err) が同 order。alice-world の真価は
-    /// 時変 F0 / vibrato / jitter / 実音声で multi-harmonic averaging robustness で発揮。
-    /// この test は「両者とも sub-Hz 精度で動作する」ことを保証する regression detector。
-    #[test]
-    fn both_f0_algorithms_sub_hz_precision_on_pure_signal() {
-        let ex = AudioFeatureExtractor::new(24_000, 1024, 256, 80);
-        let sr = 24_000_f32;
-        let target = 440.0_f32;
-        let wav: Vec<f32> = (0..24_000)
-            .map(|i| {
-                let t = (i as f32) / sr;
-                let phase = 2.0 * std::f32::consts::PI * target * t;
-                phase.sin() + 0.5 * (2.0 * phase).sin() + 0.25 * (3.0 * phase).sin()
-            })
-            .collect();
-
-        let (f0_yin, _) = ex.extract_f0_with_algorithm(&wav, F0Algorithm::Yin);
-        let (f0_aw, _) = ex.extract_f0_with_algorithm(&wav, F0Algorithm::AliceWorldDioStoneMask);
-
-        let mid = f0_yin.len() / 2;
-        let err_yin = (f0_yin[mid] - target).abs();
-        let err_aw = (f0_aw[mid] - target).abs();
-
-        // 両者とも sub-Hz 精度 (regression detector)
-        assert!(err_yin < 1.0, "YIN F0 err too large on 440Hz: {err_yin} Hz");
+        let silence = vec![0.0_f32; 24_000];
+        for wav in [&voiced, &silence] {
+            let (a, va) = ex.extract_f0_with(wav, &Yin);
+            let (b, vb) = ex.extract_f0(wav);
+            assert_eq!(va, vb);
+            assert_eq!(a.len(), 1 + wav.len() / 256);
+            assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()));
+        }
+        let (_, v) = ex.extract_f0_with(&voiced, &Yin);
         assert!(
-            err_aw < 1.0,
-            "alice-world F0 err too large on 440Hz: {err_aw} Hz"
+            v.iter().any(|b| *b),
+            "the saw input must be voiced somewhere (compared nothing)"
         );
     }
 }

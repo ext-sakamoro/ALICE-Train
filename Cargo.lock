@@ -24,10 +24,9 @@ dependencies = [
 
 [[package]]
 name = "alice-train"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "alice-ml",
- "alice-world",
  "bytemuck",
  "clap",
  "cudarc",
@@ -46,14 +45,6 @@ dependencies = [
  "tempfile",
  "wgpu",
  "zip",
-]
-
-[[package]]
-name = "alice-world"
-version = "0.1.0-alpha.0"
-dependencies = [
- "rustfft",
- "serde",
 ]
 
 [[package]]

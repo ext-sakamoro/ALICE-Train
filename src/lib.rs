@@ -91,6 +91,7 @@ pub mod deltanet;
 pub mod distill;
 pub mod evaluator;
 pub mod export;
+pub mod f0_extractor;
 pub mod fast_math;
 pub mod fp32_cache;
 pub mod inference;
@@ -112,6 +113,8 @@ pub mod safetensors_loader;
 pub mod scheduler;
 pub mod tokenizer;
 pub mod trainer;
+
+pub use f0_extractor::F0Extractor;
 pub mod vision;
 
 // ALICE-TTS v2.0 対応モジュール (feature gate、既存 LLM 学習に影響なし)
