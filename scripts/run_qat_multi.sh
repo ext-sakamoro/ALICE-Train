@@ -173,7 +173,7 @@ case "$TARGET" in
         echo "  1b    — Llama-3.2 1B (小型デバイス向け)"
         echo "  3b    — Llama-3.2 3B (中型デバイス向け)"
         echo "  qwen  — Qwen2.5 7B (5B クラス)"
-        echo "  8b    — Llama-3.1 8B full (RPi 5 向け)"
+        echo "  8b    — Llama-3.1 8B full (ARM64 single-board computer 向け)"
         echo "  70b   — Llama-3 70B (要 200GB+ RAM)"
         echo "  all   — 全モデル順次実行 (70B 除く)"
         exit 1
