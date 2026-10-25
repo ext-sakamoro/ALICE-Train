@@ -17,7 +17,7 @@ touch "$UPLOADED_LOG"
 
 echo "[box_watcher] start: ckpt_dir=$CKPT_DIR box_dir=$BOX_DIR"
 
-# 初回に session dir を Box 上に作成
+# 初回に保存先の dir を Box 上に作成
 sshpass -f /tmp/.bp sftp -B 32768 -oStrictHostKeyChecking=no -oKexAlgorithms=+diffie-hellman-group14-sha1 "$BOX_USER"@"$BOX_HOST" <<EOF > /tmp/box_mkdir_${SESSION}.log 2>&1
 -mkdir Project-ALICE
 -mkdir Project-ALICE/TTS

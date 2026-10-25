@@ -281,7 +281,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let t0 = std::time::Instant::now();
                 let result = trainer.step(mora_ids, &durations_scaled, &mel_target, 1, mora_len)?;
                 let dt = t0.elapsed().as_secs_f32();
-                // Bug fix: 真の累積 step = resume 元 step + このセッション内 trainer.step_count()
+                // Bug fix: 真の累積 step = resume 元 step + この実行内の trainer.step_count()
                 // 旧実装は step_count = result.step で resume_step を毎回上書き → checkpoint 名衝突
                 let session_step = result.step;
                 step_count = resume_step + session_step;

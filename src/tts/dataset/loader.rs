@@ -2,7 +2,7 @@
 //!
 //! 全 entry を memory 保持しつつ、audio 実データは batch iterate 時に都度 WAV load + feature
 //! extract する streaming 設計。50k utterance の JVS 全 audio (24 kHz mono 15 sec × 100 speaker
-//! × 500 utt ≈ 72 GB) を memory に載せずに済む。
+//! × 500 utt ≈ 72 GB) を RAM に載せずに済む。
 //!
 //! # 例
 //!
