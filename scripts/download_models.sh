@@ -154,11 +154,11 @@ download_elyza() {
         "ELYZA Llama-3 JP 70B (日本語特化)"
 }
 
-# Llama-3.2-1B Instruct — reCamera / 小型デバイス向け QAT
+# Llama-3.2-1B Instruct — 小型デバイス向け QAT
 download_llama_1b() {
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  Llama-3.2-1B Instruct (reCamera 向け)"
+    echo "  Llama-3.2-1B Instruct (小型デバイス向け)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     check_disk_space 3 || return 1
     download_model \
@@ -167,11 +167,11 @@ download_llama_1b() {
         "Meta Llama-3.2 1B Instruct (~2.5GB)"
 }
 
-# Llama-3.2-3B Instruct — reCamera / 中型デバイス向け QAT
+# Llama-3.2-3B Instruct — 中型デバイス向け QAT
 download_llama_3b() {
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  Llama-3.2-3B Instruct (reCamera 向け)"
+    echo "  Llama-3.2-3B Instruct (中型デバイス向け)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     check_disk_space 7 || return 1
     download_model \
@@ -180,7 +180,7 @@ download_llama_3b() {
         "Meta Llama-3.2 3B Instruct (~6.4GB)"
 }
 
-# Qwen2.5-7B Instruct — reCamera MAX / 中型デバイス向け QAT
+# Qwen2.5-7B Instruct — 中型デバイス向け QAT
 download_qwen_7b() {
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

@@ -2698,7 +2698,7 @@ pub struct LayerWeightGrads {
 /// 両者は field が完全に同型 (`d_` prefix の有無だけ) の **重複定義** で、
 /// CUDA path と CPU path が別々に育った名残。呼び出し側がどちらの型でも
 /// 受けられるよう橋渡しする。型の統合自体は別途 (rename が cuda_matmul 全体と
-/// train-qat-70b に波及するため Backlog)。
+/// train-qat-70b に波及するため未対応)。
 impl From<LayerWeightGrads> for crate::llama_backward::LayerWeightGrads {
     fn from(g: LayerWeightGrads) -> Self {
         Self {

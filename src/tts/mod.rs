@@ -14,8 +14,8 @@
 //!
 //! # 関連ドキュメント
 //!
-//! - `~/ALICE-TTS/docs/v2/feature-requests/alice-train-tts-support.md` — Feature Request 詳細
-//! - `~/ALICE-TTS/docs/v2/ARCHITECTURE.md` §AD-7 — Rust 学習 pipeline は ALICE-Train 派生
+//! - ALICE-TTS の feature request (ALICE-Train の TTS 対応)
+//! - ALICE-TTS の architecture AD-7 — Rust 学習 pipeline は ALICE-Train 派生
 
 pub mod audio;
 pub mod batch;

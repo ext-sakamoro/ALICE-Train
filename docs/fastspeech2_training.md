@@ -165,4 +165,4 @@ brew install open-jtalk
 
 - Paper: Ren et al. "FastSpeech 2: Fast and High-Quality End-to-End Text to Speech" (ICLR 2021)
 - 参照実装: Wataru-Nakata/FastSpeech2-JSUT (日本語 JSUT 特化 fork)
-- ALICE-TTS docs: `~/ALICE-TTS/docs/v2/ROADMAP.md` Phase T.4a / `ARCHITECTURE.md` §AD-1
+- ALICE-TTS の設計文書 (roadmap Phase T.4a / architecture AD-1)

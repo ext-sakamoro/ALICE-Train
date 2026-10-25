@@ -26,9 +26,9 @@
 //!
 //! # 参照
 //!
-//! - `~/ALICE-TTS/docs/v2/ARCHITECTURE.md` §AD-7 — 手書き backward の設計方針
-//! - `~/ALICE-TTS/docs/v2/ROADMAP.md` Phase T.0-P
-//! - Vocos primitives (`~/ALICE-TTS/crates/alice-tts-vocoder/src/primitives.rs`) — 将来集約対象
+//! - ALICE-TTS の architecture AD-7 — 手書き backward の設計方針
+//! - ALICE-TTS の roadmap Phase T.0-P
+//! - ALICE-TTS の Vocos primitives — 将来集約対象
 
 pub mod conv1d;
 pub mod layer_norm;
