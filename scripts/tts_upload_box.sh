@@ -30,7 +30,7 @@ fi
 echo "Uploading $WAV_COUNT audio files to Box: $BOX_DEST"
 
 # Create remote directory and upload
-sshpass -p "$BOX_SFTP_PASS" sftp -oBatchMode=no -oStrictHostKeyChecking=no "$BOX_USER@$BOX_HOST" <<SFTP_EOF
+SSHPASS="$BOX_SFTP_PASS" sshpass -e sftp -oBatchMode=no -oStrictHostKeyChecking=no "$BOX_USER@$BOX_HOST" <<SFTP_EOF
 -mkdir $BOX_DEST
 cd $BOX_DEST
 lcd $SOURCE_DIR

@@ -97,9 +97,10 @@ def upload_to_box(file_path):
 
     try:
         result = subprocess.run(
-            ["sshpass", "-p", box_pass, "sftp", "-oBatchMode=no", "-oStrictHostKeyChecking=no",
+            ["sshpass", "-e", "sftp", "-oBatchMode=no", "-oStrictHostKeyChecking=no",
              "-B", "32768", f"{BOX_USER}@{BOX_HOST}"],
             input=cmds, capture_output=True, text=True, timeout=120,
+            env={**os.environ, "SSHPASS": box_pass},
         )
         if result.returncode == 0:
             print(f"  [Box] {fname}: OK")

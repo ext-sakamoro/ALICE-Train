@@ -78,7 +78,7 @@ done
 PUT_CMDS="${PUT_CMDS}ls -la
 "
 
-sshpass -p "$BOX_SFTP_PASS" sftp -o StrictHostKeyChecking=no -o ConnectTimeout=30 "${BOX_USER}@${BOX_HOST}" << EOF
+SSHPASS="$BOX_SFTP_PASS" sshpass -e sftp -o StrictHostKeyChecking=no -o ConnectTimeout=30 "${BOX_USER}@${BOX_HOST}" << EOF
 ${PUT_CMDS}
 EOF
 
