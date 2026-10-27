@@ -95,7 +95,7 @@ ALICE-ML (Inference)          ALICE-Train (Learning)
 | QAT Pipeline | Full orchestration: FP32→BF16→Ternary with scheduler, checkpoint, eval |
 | GPU backward | wgpu compute shader for `ternary_matvec_backward` (feature: `gpu`) |
 | ZeRO-Offload | AdamW optimizer state (m/v) offloaded to CPU RAM — 50% VRAM reduction |
-| **TTS (FastSpeech2)** | Non-autoregressive TTS acoustic model with variance adaptor, `ProsodyLoss` joint training, variable-length + masked attention (feature: `tts`) |
+| **TTS features and data** | Audio features (STFT + mel filterbank + F0 + energy, pluggable F0 extractor), manifest-based dataset loader and batch type (feature: `tts`) |
 
 ## Quick Start
 
@@ -222,129 +222,16 @@ let mut ternary = vec![0.0f32; latent_weights.len()];
 pipeline.finalize_weights(&latent_weights, &mut ternary);
 ```
 
-### TTS (FastSpeech2) — feature: `tts`
+### TTS features and data — feature: `tts`
 
-Non-autoregressive TTS acoustic model based on FastSpeech2 (Ren et al. 2021).
-Enable with `--features tts`. Reference implementation: [Wataru-Nakata/FastSpeech2-JSUT](https://github.com/Wataru-Nakata/FastSpeech2-JSUT).
-
-**Architecture**:
-
-```
-mora_ids [B, N]  ──► Embedding + PE ──► Encoder (FFT blocks × M)
-                                        │
-                                        ▼
-                              Variance Adaptor
-                              (Duration / Pitch / Energy predictors)
-                                        │  + pitch/energy embed injection
-                                        ▼
-                              Length Regulator (mora → frame expansion)
-                                        │
-                                        ▼
-                              Decoder (FFT blocks × M) + PE
-                                        │
-                                        ▼
-                              mel_linear → Postnet residual → mel_after
-```
-
-**Sub-modules** (`src/tts/`):
+Enable with `--features tts`. The acoustic model and its training are no longer part of this crate
+(the earlier FastSpeech2 implementation was removed); what stays is the data side.
 
 | Module | Purpose |
 |--------|---------|
-| `primitives/` | Conv1D / LayerNorm / MultiHeadAttention / Linear / PositionalEncoding / WeightNorm — hand-written forward+backward |
-| `audio/` | STFT + Mel filterbank + F0 (YIN) + Energy — `AudioFeatureExtractor` |
-| `dataset/` | Manifest jsonl + streaming loader + WAV I/O |
-| `loss/` | `ProsodyLoss` (F0 L1 + Duration MSE + Energy MSE weighted joint) |
-| `batch/` | `TtsBatch` (11-field batch struct with validation) |
-| `fastspeech2` | `FastSpeech2` (Config, forward/forward_variable/forward_with_prosody, backward_full/backward_full_variable/backward_full_with_prosody, apply_sgd/apply_adamw, save/load safetensors) |
-| `tts_trainer` | `TtsTrainer` (SGD/AdamW switch, `step`/`step_variable`/`step_prosody`/`step_variable_prosody`) |
-
-**Quick Start — FastSpeech2 training** (SGD):
-
-```rust
-use alice_train::tts::{
-    AdamWConfig, FastSpeech2, FastSpeech2Config, ProsodyLoss, ProsodyTarget,
-    TtsTrainConfig, TtsTrainer,
-};
-
-let cfg = FastSpeech2Config {
-    vocab_size: 100, hidden_dim: 256, num_heads: 2,
-    num_encoder_layers: 4, num_decoder_layers: 4,
-    fft_kernel_size: 3, fft_expansion: 4,
-    predictor_kernel_size: 3, predictor_hidden: 256,
-    mel_dim: 80, postnet_kernel_size: 5,
-    postnet_layers: 5, postnet_hidden: 512, max_len: 2048,
-};
-let mut model = FastSpeech2::zeros(cfg).expect("model");
-model.init_xavier(42);
-// Phase E-next-4: log-domain bias tuning (log(4+1)=1.5 duration, log(150Hz)=5.0 pitch, -20dB energy)
-model.init_variance_biases(1.5, 5.0, -20.0);
-
-let mut trainer = TtsTrainer::with_adamw(
-    model,
-    TtsTrainConfig { learning_rate: 1e-4, log_interval: 100 },
-    AdamWConfig::default(),
-);
-
-// Simple mel-only training:
-let mora_ids: Vec<u32> = vec![1, 2, 3];
-let durations: Vec<u32> = vec![2, 2, 2];  // 6 frames total
-let mel_target = vec![0.0_f32; 6 * 80];
-let result = trainer.step(&mora_ids, &durations, &mel_target, 1, 3).unwrap();
-println!("step {}: mel_loss={}", result.step, result.mel_loss);
-
-// Joint mel + prosody training (recommended, use log-duration target):
-let prosody_target = ProsodyTarget {
-    f0: vec![vec![120.0, 130.0, 125.0]],
-    duration_frames: vec![vec![2.0_f32.ln_1p(), 2.0_f32.ln_1p(), 2.0_f32.ln_1p()]],
-    energy: vec![vec![-20.0, -18.0, -19.0]],
-    mask: None,
-};
-let prosody_cfg = ProsodyLoss::default_weights();  // w_f0=1.0, w_dur=1.0, w_energy=0.5
-let result = trainer
-    .step_prosody(&mora_ids, &durations, &mel_target, &prosody_target, prosody_cfg, 1, 3)
-    .unwrap();
-println!("total={}, mel={}, prosody={}", result.total_loss, result.mel_loss, result.prosody.total);
-```
-
-**Checkpoint save/load** (safetensors format for Paperspace 6h session resume):
-
-```rust
-model.save_safetensors("checkpoints/fs2_step10000.safetensors").unwrap();
-// Later:
-let mut model2 = FastSpeech2::zeros(cfg).unwrap();
-model2.load_safetensors("checkpoints/fs2_step10000.safetensors").unwrap();
-```
-
-**Variable-length training** (batch > 1 with different mora/frame lengths):
-
-```rust
-let batch = 2;
-let max_mora_len = 3;
-let mora_ids = vec![1, 2, 3, 4, 5, 0];  // sample 0 = 3 mora, sample 1 = 2 mora + padding
-let durations = vec![2, 2, 2, 2, 3, 0];  // padding duration = 0
-let mora_lens = vec![3_usize, 2];
-let max_frame_len = 6;
-let mel_target = vec![0.0_f32; batch * max_frame_len * 80];
-let result = trainer
-    .step_variable(&mora_ids, &durations, &mel_target, batch, max_mora_len, &mora_lens, max_frame_len)
-    .unwrap();
-```
-
-**Roadmap** (Phase T.4a completed features):
-
-- ✅ MVP forward-only + backward Phase 1-3
-- ✅ Phase 4 `TtsTrainer` (SGD)
-- ✅ Phase 5 JSUT pipeline (Python `prepare_jsut_manifest.py`)
-- ✅ Phase A Xavier init
-- ✅ Phase B AdamW optimizer
-- ✅ Phase C Checkpoint save/load (safetensors)
-- ✅ Phase D Variable frame length + attention mask
-- ✅ Phase E ProsodyLoss joint training
-- ✅ Phase E-next-1 pitch/energy embed hidden injection
-- ✅ Phase E-next-2 AdamW variance state expansion
-- ✅ Phase E-next-3 variable-length prosody
-- ✅ Phase E-next-4 VariancePredictor init tune (log-domain bias)
-- 🔜 Paperspace JSUT fine-tune (300k steps, ~7 sessions × 6h)
+| `tts::audio` | `AudioFeatureExtractor`: STFT + mel filterbank + F0 + energy; the F0 extractor is pluggable through `F0Extractor` (`Yin` built in) |
+| `tts::dataset` | `TtsDataset`: manifest jsonl + streaming loader + WAV I/O |
+| `tts::batch` | `TtsBatch`: batch struct with validation |
 
 ## Design Decisions
 
@@ -358,8 +245,7 @@ let result = trainer
 - **Callback-based token training**: `train_tokens()` takes `token_embed_fn` / `target_embed_fn` closures to decouple token representation from the training loop.
 - **GPU backward via wgpu**: WGSL compute shader mirrors CPU logic. Each thread handles one `grad_input[col]`, iterating over all rows. Feature-gated (`gpu`).
 - **ZeRO-Offload**: AdamW m/v stored in CPU RAM. Reduces VRAM from 4N to 2N parameters. Includes gradient clipping, bias correction, and memory budget estimation.
-- **TTS module isolation**: `feature = "tts"` gate ensures TTS-specific dependencies (rustfft, hound, safetensors, bytemuck) don't bloat the base LLM training binary. Additional deps only pulled when `--features tts`.
-- **Log-domain prosody target**: FastSpeech2 paper convention. `ProsodyTarget::to_log_duration()` transforms `duration_frames → log(dur + 1)`, and `FastSpeech2::init_variance_biases(1.5, ...)` pre-sets predictor linear bias to typical log-mean values for faster convergence.
+- **TTS module isolation**: `feature = "tts"` gate ensures TTS-specific dependencies (rustfft, hound) don't bloat the base LLM training binary. Additional deps only pulled when `--features tts`.
 
 ## Dependencies
 
@@ -372,8 +258,8 @@ let result = trainer
 | `serde_json` | JSON format for checkpoint header and training log |
 | `wgpu` | GPU compute (optional, feature: `gpu`) |
 | `pollster` | Async→sync bridge for wgpu (optional, feature: `gpu`) |
-| `bytemuck` | Zero-copy GPU buffer casting (optional, features: `gpu` / `tts`) |
-| `safetensors` | Model checkpoint I/O (optional, features: `qat-cli` / `tts`) |
+| `bytemuck` | Zero-copy GPU buffer casting (optional, feature: `gpu`) |
+| `safetensors` | Model checkpoint I/O (optional, feature: `qat-cli`) |
 | `rustfft` | STFT for `AudioFeatureExtractor` (optional, feature: `tts`) |
 | `hound` | WAV I/O for `TtsDataset` (optional, feature: `tts`) |
 

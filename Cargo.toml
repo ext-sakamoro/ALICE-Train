@@ -17,13 +17,10 @@ cuda = ["cudarc"]
 qat-cli = ["dep:safetensors", "clap"]
 qat-gpu = ["gpu", "qat-cli"]
 qat-cuda = ["cuda", "qat-cli"]
-# TTS 対応 (Feature Request R1-R4 + Phase T.4a)
-# R1: TtsBatch (serde 流用、追加 dep 無し)
-# R4: AudioFeatureExtractor (STFT + mel filterbank + F0 (YIN) + energy) — rustfft 使用
-# R2: TtsDataset loader (manifest jsonl + WAV load) — hound 使用
-# R3: ProsodyLoss — 追加 dep 無し
-# Phase T.4a Phase C: Checkpoint save/load — safetensors + bytemuck (f32 ↔ u8 cast)
-tts = ["dep:rustfft", "dep:hound", "dep:safetensors", "dep:bytemuck"]
+# TTS 用の音声特徴量と data loader
+# TtsBatch (serde 流用、追加 dep 無し) / AudioFeatureExtractor (STFT + mel filterbank + F0 + energy、
+# rustfft) / TtsDataset (manifest jsonl + WAV load、hound)
+tts = ["dep:rustfft", "dep:hound"]
 # Linux OpenBLAS backend for CPU BLAS (Phase T.4b: TTS 学習高速化)
 # apt-get install libopenblas-dev で system openblas を install してから使用
 blas-openblas = []

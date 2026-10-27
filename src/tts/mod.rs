@@ -1,37 +1,16 @@
-//! TTS 対応モジュール — TTS 学習用の型・データローダー・損失関数を提供。
+//! TTS 用の音声特徴量と data loader
 //!
-//! TTS (Path α: 完全独自 Neural TTS from-scratch) の Phase T.0-R
-//! (Feature Request R1-R4) の実装を担う。既存 LLM 学習パイプラインには影響しないよう
-//! `feature = "tts"` gate で切り離されている。
+//! 学習用の batch 型 ([`TtsBatch`])、manifest からの loader ([`TtsDataset`])、音声特徴量
+//! ([`AudioFeatureExtractor`]: STFT + mel filterbank + F0 + energy) を提供する F0 の抽出器は
+//! [`crate::F0Extractor`] で差し替えられる 既存の LLM 学習 pipeline に影響しないよう
+//! `feature = "tts"` で切り離している
 //!
-//! # Feature Request
-//!
-//! - **R1**: [`TtsBatch`] — 音声 + テキスト + prosody + alignment + speaker + duration の
-//!   マルチモーダルバッチ型 (実装済)
-//! - **R2**: [`TtsDataset`] — JSUT/JVS/JVNV manifest からの batch loader (実装済)
-//! - **R3**: [`ProsodyLoss`] — F0/duration/energy の重み付き joint loss (実装済) — **Phase T.0-R 4 R 完了**
-//! - **R4**: [`AudioFeatureExtractor`] — STFT + mel filterbank + F0 (YIN) + energy 抽出 (実装済)
+//! 音響 model (以前の FastSpeech2) とその学習はこの crate から外した
 
 pub mod audio;
 pub mod batch;
 pub mod dataset;
-pub mod fastspeech2;
-pub mod loss;
-pub mod primitives;
-pub mod tts_trainer;
 
 pub use audio::{AudioFeatureExtractor, Yin};
 pub use batch::{TtsBatch, TtsBatchError};
 pub use dataset::{TtsDataset, TtsDatasetError, TtsManifestEntry};
-pub use fastspeech2::{
-    AdamWConfig, FastSpeech2, FastSpeech2AdamWState, FastSpeech2Config, FastSpeech2Error,
-    FastSpeech2Grads, FftBlockAdamWState,
-};
-pub use loss::{LossComponents, ProsodyLoss, ProsodyLossError, ProsodyPrediction, ProsodyTarget};
-pub use primitives::{
-    Conv1d, Conv1dConfig, Conv1dError, LayerNorm, LayerNormConfig, LayerNormError, Linear,
-    LinearConfig, LinearError, MhaError, MhaGrads, MultiHeadAttention, MultiHeadAttentionConfig,
-    PosEncError, RotaryEmbedding, RotaryEmbeddingConfig, SinusoidalPositionalEncoding,
-    SinusoidalPositionalEncodingConfig, WeightNorm, WeightNormConfig, WeightNormError,
-};
-pub use tts_trainer::{TtsOptimizer, TtsStepResult, TtsTrainConfig, TtsTrainer};

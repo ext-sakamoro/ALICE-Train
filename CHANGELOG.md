@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Removed
+- **破壊的変更: TTS の音響 model (FastSpeech2) とその学習を外した** `tts::fastspeech2` / `tts::tts_trainer` / `tts::loss` (`ProsodyLoss`) / `tts::primitives` (Conv1d / LayerNorm / MultiHeadAttention / Linear / 位置符号 / WeightNorm) と、その re-export (`FastSpeech2` / `TtsTrainer` / `ProsodyLoss` ほか) を削除 example `fs2_train` / `fs2_synthesize`、`configs/fs2_jsut.json`、`docs/fastspeech2_training.md`、学習の運用 script (`run_fastspeech2_train.sh` / `quick_restart.sh` / `box_watcher.sh`) も削除 `tts` に残るのは data 側 (`AudioFeatureExtractor` と `F0Extractor`、`TtsDataset`、`TtsBatch`) で、`tts` feature は `safetensors` / `bytemuck` を引かなくなった
+
 ### Changed
 - **破壊的変更 (0.3.0): F0 抽出を差し込み口にし、`tts` feature が `alice-world` に依存しなくなった** `F0Algorithm` (`Yin` / `AliceWorldDioStoneMask`) と `extract_f0_with_algorithm` を外し、依存の無い trait `alice_train::F0Extractor` と `AudioFeatureExtractor::extract_f0_with(&wav, &dyn F0Extractor)` に置き換えた 組み込みは `tts::Yin` (`extract_f0` と同じ YIN の経路、bit 単位で一致を試験で固定) DIO + StoneMask を使う側は、その実装を持つ crate の抽出器を差し込む (この crate は依存しない) 差し込まない限り F0 は YIN `tts` の試験は CI と preflight で走るようになった (以前は依存を外す step で `tts` ごと消していた) `tests/q1_speech_like_ab.rs` と YIN / DIO を比べる 2 本の試験は、DIO の実装を持つ側に移した
 - 依存: `zip` を `2` から `9` に上げた (`default-features = false`、`deflate`) 1.x から 9.0.2 までが crates.io で yank され、lock の 2.4.2 も yank 済みだった 使っている API (`ZipArchive::new` / `by_name` / `read_to_end`) は変わらず、source の変更は無い `tests/pth_zip_corpus.rs` の corpus は 2.4.2 と 9.0.4 で同じ結果 (全 tensor の dtype・shape・byte の SHA-256 が生成 script の期待値と一致)
