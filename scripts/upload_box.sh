@@ -5,12 +5,12 @@ set -euo pipefail
 
 CKPT_DIR="${1:?Usage: upload_box.sh <checkpoint_dir> [--all-checkpoints]}"
 ALL_CKPTS="${2:-}"
-BOX_USER="sakamoro@extoria.co.jp"
+BOX_USER="${BOX_USER:-}"
 BOX_HOST="sftp.services.box.com"
 BOX_DIR="Project-ALICE/QAT"
 
-if [ -z "${BOX_SFTP_PASS:-}" ]; then
-    echo "[upload_box] ERROR: BOX_SFTP_PASS not set"
+if [ -z "${BOX_SFTP_PASS:-}" ] || [ -z "$BOX_USER" ]; then
+    echo "[upload_box] ERROR: BOX_USER / BOX_SFTP_PASS not set"
     exit 1
 fi
 

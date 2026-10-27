@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """RunPod A100 Pod作成 — QAT完了/崩壊時にPod自動停止"""
 import json
-import subprocess
 import sys
+import urllib.request
 
 import os
 RUNPOD_KEY = os.environ.get("RUNPOD_API_KEY", "")
@@ -66,14 +66,17 @@ for gpu_id, name, price in gpu_types:
     query = query.replace("ARGS_PLACEHOLDER", json.dumps(docker_args)).replace("ENV_PLACEHOLDER", POD_ENV)
     payload = json.dumps({"query": query})
 
-    result = subprocess.run(
-        ["curl", "-s", "https://api.runpod.io/graphql",
-         "-H", f"Authorization: Bearer {RUNPOD_KEY}",
-         "-H", "Content-Type: application/json",
-         "-d", payload],
-        capture_output=True, text=True,
+    # 認証 header と payload (Pod の env を含む) は process の引数に載せない
+    req = urllib.request.Request(
+        "https://api.runpod.io/graphql",
+        data=payload.encode(),
+        headers={
+            "Authorization": f"Bearer {RUNPOD_KEY}",
+            "Content-Type": "application/json",
+        },
     )
-    data = json.loads(result.stdout)
+    with urllib.request.urlopen(req) as resp:
+        data = json.loads(resp.read())
 
     if data.get("data", {}).get("podFindAndDeployOnDemand"):
         pod = data["data"]["podFindAndDeployOnDemand"]

@@ -9,14 +9,15 @@ echo "=== TTS Paperspace quick restart ==="
 # 1. Container reset で消える dep を再 install
 apt-get install -y -qq sshpass tmux libopenblas0 libopenblas-dev 2>&1 | tail -1
 
-# 2. Box の接続情報は環境変数 BOX_SFTP_PASS から受け取る (未設定なら止める)
-if [ -z "${BOX_SFTP_PASS:-}" ]; then
-    echo "ERROR: BOX_SFTP_PASS not set" >&2
+# 2. Box の接続情報は環境変数 BOX_USER / BOX_SFTP_PASS から受け取る (未設定なら止める)
+if [ -z "${BOX_SFTP_PASS:-}" ] || [ -z "${BOX_USER:-}" ]; then
+    echo "ERROR: BOX_USER / BOX_SFTP_PASS not set" >&2
     exit 1
 fi
-# box_watcher.sh は sshpass -e で SSHPASS を読む (tmux server はこの後に起動するので環境を継承する)
+# box_watcher.sh は BOX_USER と、sshpass -e で SSHPASS を読む (tmux server はこの後に起動するので環境を継承する)
+export BOX_USER
 export SSHPASS="$BOX_SFTP_PASS"
-echo "  [ok] BOX_SFTP_PASS set"
+echo "  [ok] BOX_USER / BOX_SFTP_PASS set"
 
 # 3. Rust default toolchain
 export PATH=/notebooks/.cargo/bin:$PATH

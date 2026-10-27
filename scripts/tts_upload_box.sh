@@ -2,17 +2,17 @@
 # Box SFTP Upload Script for TTS Output
 # Usage: bash tts_upload_box.sh /notebooks/tts_output
 #
-# BOX_SFTP_PASS must be set as environment variable
+# BOX_USER and BOX_SFTP_PASS must be set as environment variables
 
 set -euo pipefail
 
 SOURCE_DIR="${1:-/notebooks/tts_output}"
 BOX_HOST="sftp.services.box.com"
-BOX_USER="sakamoro@extoria.co.jp"
+BOX_USER="${BOX_USER:-}"
 BOX_DEST="Shizai/DLsite/Voice"
 
-if [ -z "${BOX_SFTP_PASS:-}" ]; then
-    echo "ERROR: BOX_SFTP_PASS not set"
+if [ -z "${BOX_SFTP_PASS:-}" ] || [ -z "$BOX_USER" ]; then
+    echo "ERROR: BOX_USER / BOX_SFTP_PASS not set"
     exit 1
 fi
 

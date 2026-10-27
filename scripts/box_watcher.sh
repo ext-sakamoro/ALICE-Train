@@ -7,16 +7,16 @@ set -uo pipefail
 
 CKPT_DIR="${1:?Usage: box_watcher.sh <ckpt_dir> <session_id>}"
 SESSION="${2:?session_id required}"
-BOX_USER="sakamoro@extoria.co.jp"
+BOX_USER="${BOX_USER:-}"
 BOX_HOST="sftp.services.box.com"
 BOX_DIR="Project-ALICE/TTS/fs2_jsut_${SESSION}"
 UPLOADED_LOG="/tmp/box_uploaded_${SESSION}.txt"
 CHECK_INTERVAL=60  # 60 秒毎に polling
 
-# Box の接続情報は環境変数から受け取る (SSHPASS か BOX_SFTP_PASS、未設定なら止める)
+# Box の接続情報は環境変数から受け取る (BOX_USER と、SSHPASS か BOX_SFTP_PASS、未設定なら止める)
 export SSHPASS="${SSHPASS:-${BOX_SFTP_PASS:-}}"
-if [ -z "$SSHPASS" ]; then
-    echo "[box_watcher] ERROR: SSHPASS / BOX_SFTP_PASS not set" >&2
+if [ -z "$SSHPASS" ] || [ -z "$BOX_USER" ]; then
+    echo "[box_watcher] ERROR: BOX_USER / SSHPASS / BOX_SFTP_PASS not set" >&2
     exit 1
 fi
 

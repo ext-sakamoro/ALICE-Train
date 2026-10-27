@@ -28,7 +28,6 @@ import soundfile as sf
 
 
 BOX_HOST = "sftp.services.box.com"
-BOX_USER = "sakamoro@extoria.co.jp"
 BOX_DEST = "Shizai/DLsite/Voice"
 
 REF_DIR = "/notebooks/tts_ref"
@@ -91,6 +90,9 @@ def upload_to_box(file_path):
     box_pass = os.environ.get("BOX_SFTP_PASS", "")
     if not box_pass:
         return False
+    box_user = os.environ.get("BOX_USER", "")
+    if not box_user:
+        sys.exit("BOX_USER not set")
 
     fname = os.path.basename(file_path)
     cmds = f"cd {BOX_DEST}\nput {file_path}\nbye\n"
@@ -98,7 +100,7 @@ def upload_to_box(file_path):
     try:
         result = subprocess.run(
             ["sshpass", "-e", "sftp", "-oBatchMode=no", "-oStrictHostKeyChecking=no",
-             "-B", "32768", f"{BOX_USER}@{BOX_HOST}"],
+             "-B", "32768", f"{box_user}@{BOX_HOST}"],
             input=cmds, capture_output=True, text=True, timeout=120,
             env={**os.environ, "SSHPASS": box_pass},
         )
