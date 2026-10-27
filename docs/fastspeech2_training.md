@@ -1,6 +1,6 @@
 # FastSpeech2 学習ガイド (Phase T.4a)
 
-ALICE-TTS v2.0 Phase T.4a の FastSpeech2 モデルを JSUT / JVS で学習するための手順書
+TTS Phase T.4a の FastSpeech2 モデルを JSUT / JVS で学習するための手順書
 
 ## 前提
 
@@ -165,4 +165,3 @@ brew install open-jtalk
 
 - Paper: Ren et al. "FastSpeech 2: Fast and High-Quality End-to-End Text to Speech" (ICLR 2021)
 - 参照実装: Wataru-Nakata/FastSpeech2-JSUT (日本語 JSUT 特化 fork)
-- ALICE-TTS docs: `~/ALICE-TTS/docs/v2/ROADMAP.md` Phase T.4a / `ARCHITECTURE.md` §AD-1

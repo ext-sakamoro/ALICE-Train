@@ -117,7 +117,7 @@ pub mod trainer;
 pub use f0_extractor::F0Extractor;
 pub mod vision;
 
-// ALICE-TTS v2.0 対応モジュール (feature gate、既存 LLM 学習に影響なし)
+// TTS 対応モジュール (feature gate、既存 LLM 学習に影響なし)
 #[cfg(feature = "tts")]
 pub mod tts;
 

@@ -23,12 +23,6 @@
 //! - ✅ WeightNorm (Vocos / HiFi-GAN 用の weight reparametrization)
 //!
 //! **Phase T.0-P 100% 完了、Phase T.4a FastSpeech2 architecture 実装着手可能。**
-//!
-//! # 参照
-//!
-//! - `~/ALICE-TTS/docs/v2/ARCHITECTURE.md` §AD-7 — 手書き backward の設計方針
-//! - `~/ALICE-TTS/docs/v2/ROADMAP.md` Phase T.0-P
-//! - Vocos primitives (`~/ALICE-TTS/crates/alice-tts-vocoder/src/primitives.rs`) — 将来集約対象
 
 pub mod conv1d;
 pub mod layer_norm;

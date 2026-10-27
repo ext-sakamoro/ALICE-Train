@@ -4,7 +4,7 @@
 
 set -uo pipefail
 
-echo "=== ALICE-TTS Paperspace quick restart ==="
+echo "=== TTS Paperspace quick restart ==="
 
 # 1. Container reset で消える dep を再 install
 apt-get install -y -qq sshpass tmux libopenblas0 libopenblas-dev 2>&1 | tail -1

@@ -63,7 +63,7 @@ impl F0Extractor for Yin {
 ///
 /// | Field | 用途 | 推奨値 |
 /// |---|---|---|
-/// | `sample_rate` | 入力波形の Hz | 24000 (ALICE-TTS v2.0 baseline) |
+/// | `sample_rate` | 入力波形の Hz | 24000 (TTS baseline) |
 /// | `n_fft` | STFT FFT サイズ | 1024 |
 /// | `hop_length` | STFT hop | 256 |
 /// | `n_mels` | mel channel 数 | 80 (Vocos vocoder 準拠) |
