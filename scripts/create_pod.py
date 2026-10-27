@@ -5,11 +5,24 @@ import os
 import urllib.request
 
 API_KEY = os.environ.get("RUNPOD_API_KEY", "")
+HF_USER = os.environ.get("HF_USER", "")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
-if not API_KEY:
-    print("RUNPOD_API_KEY not set")
+if not API_KEY or not HF_USER or not HF_TOKEN:
+    print("RUNPOD_API_KEY / HF_USER / HF_TOKEN not set")
     exit(1)
+
+# Pod には HF_USER / HF_TOKEN を env で渡す (URL や引数には入れない)
+# git の認証 header も env (GIT_CONFIG_*) で渡すので process 一覧に出ない
+GIT_AUTH = (
+    "export GIT_CONFIG_COUNT=1 "
+    "GIT_CONFIG_KEY_0=http.https://huggingface.co/.extraheader "
+    "GIT_CONFIG_VALUE_0=\"Authorization: Basic $(printf %s:%s \"$HF_USER\" \"$HF_TOKEN\" | base64 -w0)\" && "
+)
+POD_ENV = "[%s]" % ", ".join(
+    "{key: %s, value: %s}" % (json.dumps(k), json.dumps(v))
+    for k, v in (("HF_USER", HF_USER), ("HF_TOKEN", HF_TOKEN))
+)
 
 docker_args = (
     "bash -c '"
@@ -17,8 +30,9 @@ docker_args = (
     "curl --proto=https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && "
     "export PATH=/root/.cargo/bin:$PATH && "
     "cd /workspace && "
-    f"git clone https://sakamoro:{HF_TOKEN}@huggingface.co/sakamoro/alice-ml ALICE-ML && "
-    f"git clone https://sakamoro:{HF_TOKEN}@huggingface.co/sakamoro/alice-train ALICE-Train && "
+    + GIT_AUTH
+    + "git clone \"https://huggingface.co/$HF_USER/alice-ml\" ALICE-ML && "
+    "git clone \"https://huggingface.co/$HF_USER/alice-train\" ALICE-Train && "
     "cd ALICE-Train && "
     "export CUDA_PATH=/usr/local/cuda && "
     "export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH && "
@@ -39,6 +53,7 @@ mutation {
     gpuCount: 1
     cloudType: COMMUNITY
     dockerArgs: "%s"
+    env: %s
   }) {
     id
     desiredStatus
@@ -47,7 +62,7 @@ mutation {
     machine { gpuDisplayName }
   }
 }
-""" % docker_args.replace('"', '\\"')
+""" % (docker_args.replace('"', '\\"'), POD_ENV)
 
 req = urllib.request.Request(
     "https://api.runpod.io/graphql",

@@ -6,10 +6,18 @@ import sys
 
 import os
 RUNPOD_KEY = os.environ.get("RUNPOD_API_KEY", "")
+HF_USER = os.environ.get("HF_USER", "")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-if not RUNPOD_KEY or not HF_TOKEN:
-    print("環境変数 RUNPOD_API_KEY, HF_TOKEN を設定してください")
+if not RUNPOD_KEY or not HF_USER or not HF_TOKEN:
+    print("環境変数 RUNPOD_API_KEY, HF_USER, HF_TOKEN を設定してください")
     sys.exit(1)
+
+# Pod には HF_USER / HF_TOKEN を env で渡す (URL や引数には入れない)
+# git の認証 header は GIT_CONFIG_* の env、huggingface_hub は HF_TOKEN の env を読む
+POD_ENV = "[%s]" % ", ".join(
+    "{key: %s, value: %s}" % (json.dumps(k), json.dumps(v))
+    for k, v in (("HF_USER", HF_USER), ("HF_TOKEN", HF_TOKEN))
+)
 
 docker_args = (
     "bash -c '"
@@ -18,14 +26,16 @@ docker_args = (
     "&& export PATH=/root/.cargo/bin:$PATH "
     # Clone
     "&& cd /workspace "
-    f"&& git clone https://sakamoro:{HF_TOKEN}@huggingface.co/sakamoro/alice-ml ALICE-ML "
-    f"&& git clone https://sakamoro:{HF_TOKEN}@huggingface.co/sakamoro/alice-train "
+    "&& export GIT_CONFIG_COUNT=1 "
+    "GIT_CONFIG_KEY_0=http.https://huggingface.co/.extraheader "
+    "GIT_CONFIG_VALUE_0=\"Authorization: Basic $(printf %s:%s \"$HF_USER\" \"$HF_TOKEN\" | base64 -w0)\" "
+    "&& git clone \"https://huggingface.co/$HF_USER/alice-ml\" ALICE-ML "
+    "&& git clone \"https://huggingface.co/$HF_USER/alice-train\" "
     "&& cd alice-train "
     # Build
     "&& cargo build --release --features qat-cuda --bin train-qat-qwen35 "
     # Python deps + model
     "&& pip install -q huggingface_hub transformers datasets fsspec==2024.2.0 "
-    f"&& huggingface-cli login --token {HF_TOKEN} "
     "&& huggingface-cli download Qwen/Qwen3.5-9B --local-dir models/Qwen--Qwen3.5-9B "
     # Data
     "&& python3 scripts/prepare_real_data.py --model_path models/Qwen--Qwen3.5-9B --output data/qwen35/train.bin --max_tokens 2000000 "
@@ -49,10 +59,11 @@ for gpu_id, name, price in gpu_types:
       imageName: "runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04",
       gpuCount: 1, volumeInGb: 0, containerDiskInGb: 50,
       minVcpuCount: 4, minMemoryInGb: 64,
-      dockerArgs: ARGS_PLACEHOLDER
+      dockerArgs: ARGS_PLACEHOLDER,
+      env: ENV_PLACEHOLDER
     }}) {{ id name }} }}"""
 
-    query = query.replace("ARGS_PLACEHOLDER", json.dumps(docker_args))
+    query = query.replace("ARGS_PLACEHOLDER", json.dumps(docker_args)).replace("ENV_PLACEHOLDER", POD_ENV)
     payload = json.dumps({"query": query})
 
     result = subprocess.run(

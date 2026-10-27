@@ -11,7 +11,7 @@
 //! - フィルタ形: 三角形 (mel-space で等間隔配置)
 //! - 正規化: Slaney (面積正規化、`2 / (mel_freqs[i+2] - mel_freqs[i])`)
 //!
-//! Phase T.5 Vocos vocoder (`alice-tts-vocoder`) 側の primitive と数値一致を目指す。
+//! Phase T.5 の Vocos vocoder 側の primitive と数値一致を目指す。
 
 /// Hz を mel scale に変換する (Slaney formula)。
 ///
