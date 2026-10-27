@@ -34,8 +34,8 @@ jobs:
 
 
   # 2026-09-17 新設: それまで fmt + actionlint のみで test は CI 未実行だった
-  # (解析解 oracle `tests/analytic_oracle.rs` を feature-gated でなくても必ず走らせる、
-  # CLAUDE.md § 解析解突合テスト規律 (5) / strict-eval 16) alice-ml は path dep
+  # (解析解 oracle `tests/analytic_oracle.rs` を feature-gated でなくても必ず走らせる)
+  # alice-ml は path dep
   # (`../ALICE-ML`) なので sibling を checkout する (public repo)
   test:
     name: Test (default features, CPU)
@@ -66,8 +66,7 @@ jobs:
   # feature の code path が腐っていた (`cuda` feature の qwen35_backward が E0425 で
   # 壊れており、Paperspace で GPU ビルドを試みて初めて発覚) cudarc は
   # dynamic-loading なので CUDA 不在の runner でも compile / test できる。
-  # canonical: reference_alice_ci_canonical_template §4.6 feature-powerset +
-  # 罠 #37 (feature ごとの step は build ではなく test にする)
+  # feature ごとの step は build ではなく test にする (feature powerset)
   features:
     name: Feature powerset + cuda test
     runs-on: ubuntu-latest

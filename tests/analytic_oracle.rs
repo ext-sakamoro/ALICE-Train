@@ -1,5 +1,5 @@
 //! Analytic oracles — closed-form / independent-reference checks for the
-//! numeric laws in ALICE-Train (CLAUDE.md § 解析解突合テスト規律, 2026-09-17).
+//! numeric laws in ALICE-Train.
 //!
 //! Expected values come from closed forms or f64 references written in this
 //! file, never from the crate function under test.  Default constructors
