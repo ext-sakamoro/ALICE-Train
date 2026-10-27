@@ -13,12 +13,19 @@ BOX_DIR="Project-ALICE/TTS/fs2_jsut_${SESSION}"
 UPLOADED_LOG="/tmp/box_uploaded_${SESSION}.txt"
 CHECK_INTERVAL=60  # 60 秒毎に polling
 
+# Box の接続情報は環境変数から受け取る (SSHPASS か BOX_SFTP_PASS、未設定なら止める)
+export SSHPASS="${SSHPASS:-${BOX_SFTP_PASS:-}}"
+if [ -z "$SSHPASS" ]; then
+    echo "[box_watcher] ERROR: SSHPASS / BOX_SFTP_PASS not set" >&2
+    exit 1
+fi
+
 touch "$UPLOADED_LOG"
 
 echo "[box_watcher] start: ckpt_dir=$CKPT_DIR box_dir=$BOX_DIR"
 
 # 初回に session dir を Box 上に作成
-sshpass -f /tmp/.bp sftp -B 32768 -oStrictHostKeyChecking=no -oKexAlgorithms=+diffie-hellman-group14-sha1 "$BOX_USER"@"$BOX_HOST" <<EOF > /tmp/box_mkdir_${SESSION}.log 2>&1
+sshpass -e sftp -B 32768 -oStrictHostKeyChecking=no -oKexAlgorithms=+diffie-hellman-group14-sha1 "$BOX_USER"@"$BOX_HOST" <<EOF > /tmp/box_mkdir_${SESSION}.log 2>&1
 -mkdir Project-ALICE
 -mkdir Project-ALICE/TTS
 -mkdir $BOX_DIR
@@ -46,7 +53,7 @@ while true; do
         # upload
         echo "[box_watcher] uploading $BASENAME ($SIZE_1 bytes)..."
         UPLOAD_LOG="/tmp/box_upload_${SESSION}_${BASENAME}.log"
-        sshpass -f /tmp/.bp sftp -B 32768 -oStrictHostKeyChecking=no -oKexAlgorithms=+diffie-hellman-group14-sha1 "$BOX_USER"@"$BOX_HOST" <<EOF > "$UPLOAD_LOG" 2>&1
+        sshpass -e sftp -B 32768 -oStrictHostKeyChecking=no -oKexAlgorithms=+diffie-hellman-group14-sha1 "$BOX_USER"@"$BOX_HOST" <<EOF > "$UPLOAD_LOG" 2>&1
 cd $BOX_DIR
 put "$f"
 ls -l $BASENAME
@@ -66,7 +73,7 @@ EOF
     # train.log も上書き upload (毎回)
     LOG_FILE="$CKPT_DIR/../logs/train.log"
     if [ -f "$LOG_FILE" ]; then
-        sshpass -f /tmp/.bp sftp -B 32768 -oStrictHostKeyChecking=no -oKexAlgorithms=+diffie-hellman-group14-sha1 "$BOX_USER"@"$BOX_HOST" <<EOF > /dev/null 2>&1
+        sshpass -e sftp -B 32768 -oStrictHostKeyChecking=no -oKexAlgorithms=+diffie-hellman-group14-sha1 "$BOX_USER"@"$BOX_HOST" <<EOF > /dev/null 2>&1
 cd $BOX_DIR
 put $LOG_FILE
 bye
