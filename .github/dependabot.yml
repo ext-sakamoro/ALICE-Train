@@ -1,10 +1,7 @@
 # Dependabot 設定
 #
-# 注: root cargo entry は意図的に削除
-# 理由: root Cargo.toml に sibling path dep (= path = "../ALICE-Xxxx") が存在し、
-#       dependabot は sibling repo を checkout しないため
-#       path_dependencies_not_reachable で fail する
-#       root 直接の cargo dep update は手動 `cargo update -p <name>` で対応
+# 注: root cargo entry は置かない
+#       alice-ml は git の main を引き、更新は `cargo update -p alice-ml` で対応
 version: 2
 updates:
   - package-ecosystem: github-actions

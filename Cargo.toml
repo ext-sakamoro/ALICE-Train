@@ -71,7 +71,7 @@ path = "src/bin/eval_ppl.rs"
 required-features = ["qat-cli"]
 
 [dependencies]
-alice-ml = { path = "../ALICE-ML", default-features = true }
+alice-ml = { git = "https://github.com/ext-sakamoro/ALICE-ML", branch = "main", version = "0.4.0", default-features = true }
 memmap2 = "0.9"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

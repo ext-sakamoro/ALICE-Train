@@ -10,13 +10,13 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "alice-det-math"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2857e06dcc3838a2138f4c8ed7b30cf8515a223eeb6d5fbd068dd13d45cb4ff4"
+version = "0.6.1"
+source = "git+https://github.com/ext-sakamoro/ALICE-DetMath?branch=main#81b301495181edb559de9e36052bd7b96646e91f"
 
 [[package]]
 name = "alice-ml"
-version = "0.3.0"
+version = "0.4.0"
+source = "git+https://github.com/ext-sakamoro/ALICE-ML?branch=main#f3cccc24e63bff90919e278a41d88b1e41c3383a"
 dependencies = [
  "alice-det-math",
  "libm",

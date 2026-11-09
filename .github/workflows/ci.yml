@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "ci/**"]
   pull_request:
     branches: [main]
 
@@ -35,8 +35,7 @@ jobs:
 
   # 2026-09-17 新設: それまで fmt + actionlint のみで test は CI 未実行だった
   # (解析解 oracle `tests/analytic_oracle.rs` を feature-gated でなくても必ず走らせる)
-  # alice-ml は path dep
-  # (`../ALICE-ML`) なので sibling を checkout する (public repo)
+  # alice-ml は ALICE-ML の main を git で引く (Cargo.lock が commit を固定する)
   test:
     name: Test (default features, CPU)
     runs-on: ubuntu-latest
@@ -44,10 +43,6 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: ALICE-Train
-      - uses: actions/checkout@v5
-        with:
-          repository: ext-sakamoro/ALICE-ML
-          path: ALICE-ML
       # toolchain は ALICE-Train/rust-toolchain.toml の pin (1.92.0) が効く
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -74,10 +69,6 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: ALICE-Train
-      - uses: actions/checkout@v5
-        with:
-          repository: ext-sakamoro/ALICE-ML
-          path: ALICE-ML
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:

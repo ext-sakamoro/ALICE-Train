@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - Rust 1.75+
-- `alice-ml` crate (sibling directory `../ALICE-ML`)
+- `alice-ml` crate (fetched by Cargo from the ALICE-ML repository, `main` branch)
 
 ## Build & Test
 
