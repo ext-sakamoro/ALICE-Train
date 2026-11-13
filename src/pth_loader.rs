@@ -38,8 +38,11 @@
 //! }
 //! ```
 
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io;
+
+use alice_zip::pkzip::{Archive, Limits, Method};
 use std::path::Path;
 
 /// テンソルのデータ型。
@@ -111,8 +114,8 @@ impl TensorMeta {
 
 /// `.pth` ファイルローダー。
 pub struct PthLoader {
-    /// ZIP アーカイブのバイト列（全体をメモリに保持）。
-    data: Vec<u8>,
+    /// ZIP アーカイブ (全体をメモリに保持、central directory は開く時に検査済み)。
+    archive: Archive<Vec<u8>>,
     /// テンソル名 → メタデータ。
     tensors: HashMap<String, TensorMeta>,
 }
@@ -136,8 +139,9 @@ impl PthLoader {
     ///
     /// ZIP / pickle パースエラー。
     pub fn from_bytes(data: Vec<u8>) -> io::Result<Self> {
-        let tensors = parse_pth(&data)?;
-        Ok(Self { data, tensors })
+        let archive = Archive::new(data, LIMITS)?;
+        let tensors = parse_pth(&archive)?;
+        Ok(Self { archive, tensors })
     }
 
     /// ローダーが保持するテンソル数。
@@ -166,7 +170,7 @@ impl PthLoader {
     pub fn get_tensor_f32(&self, name: &str) -> Option<Vec<f32>> {
         let meta = self.tensors.get(name)?;
         let storage_key = format!("archive/data/{}", meta.storage_key);
-        let raw = read_zip_entry(&self.data, &storage_key)?;
+        let raw = entry_bytes(&self.archive, &storage_key)?;
         let offset = meta.byte_offset();
         let size = meta.byte_size();
         let slice = raw.get(offset..offset + size)?;
@@ -180,7 +184,7 @@ impl PthLoader {
     pub fn get_tensor_raw(&self, name: &str) -> Option<(Vec<u8>, PthDtype, Vec<usize>)> {
         let meta = self.tensors.get(name)?;
         let storage_key = format!("archive/data/{}", meta.storage_key);
-        let raw = read_zip_entry(&self.data, &storage_key)?;
+        let raw = entry_bytes(&self.archive, &storage_key)?;
         let offset = meta.byte_offset();
         let size = meta.byte_size();
         let slice = raw.get(offset..offset + size)?;
@@ -193,45 +197,27 @@ impl PthLoader {
 // ---------------------------------------------------------------------------
 
 /// The most bytes a compressed entry may decompress to (256 MiB): a compressed entry is where a few kilobytes can
-/// expand without bound; a stored entry (what `torch.save` writes) cannot expand past the archive
+/// expand without bound
 const MAX_COMPRESSED_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Reads `entry` up to its limit: a stored entry its stored size, a compressed one
-/// [`MAX_COMPRESSED_ENTRY_BYTES`]. The size the archive declares is not trusted: above the limit the entry is
-/// refused before reading, and the read itself stops one byte past the limit (nothing is allocated from the
-/// declared size).
-fn read_entry_bounded<R: Read + ?Sized>(
-    entry: &mut zip::read::ZipFile<'_, R>,
-) -> io::Result<Vec<u8>> {
-    let limit = if entry.compression() == zip::CompressionMethod::Stored {
-        entry.compressed_size()
-    } else {
-        MAX_COMPRESSED_ENTRY_BYTES
-    };
-    let name = entry.name().map(|n| n.to_string()).unwrap_or_default();
-    let too_large = |what: &str| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("ZIP entry {name} {what}, above the limit of {limit} bytes"),
-        )
-    };
-    if entry.size() > limit {
-        return Err(too_large(&format!("declares {} bytes", entry.size())));
-    }
-    let mut buf = Vec::new();
-    Read::take(&mut *entry, limit + 1).read_to_end(&mut buf)?;
-    if buf.len() as u64 > limit {
-        return Err(too_large("expands"));
-    }
-    Ok(buf)
-}
+/// The most bytes the compressed entries of one archive may declare together (1 GiB, four entries at the limit)
+const MAX_COMPRESSED_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// ZIP アーカイブからエントリのバイト列を取得する (上限は [`read_entry_bounded`])。
-fn read_zip_entry(data: &[u8], entry_name: &str) -> Option<Vec<u8>> {
-    let cursor = std::io::Cursor::new(data);
-    let mut archive = zip::ZipArchive::new(cursor).ok()?;
-    let mut entry = archive.by_name(entry_name).ok()?;
-    read_entry_bounded(&mut entry).ok()
+/// The limits of `alice_zip::pkzip`: stored entries (what `torch.save` writes) are bounded by the archive itself and
+/// read in place; compressed entries are held to the two caps, the total checked when the archive is opened
+const LIMITS: Limits = Limits::new(MAX_COMPRESSED_ENTRY_BYTES, MAX_COMPRESSED_TOTAL_BYTES);
+
+/// The bytes of the entry `name`: a stored entry in place, a compressed one decoded within [`LIMITS`] (`None` when
+/// there is no such entry or it is refused)
+fn entry_bytes<'a>(archive: &'a Archive<Vec<u8>>, name: &str) -> Option<Cow<'a, [u8]>> {
+    let entry = archive
+        .entries()
+        .iter()
+        .find(|e| e.name() == name.as_bytes())?;
+    match entry.method() {
+        Method::Stored => archive.in_place(name).ok().map(Cow::Borrowed),
+        Method::Deflated => archive.read(name).ok().map(Cow::Owned),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -239,20 +225,17 @@ fn read_zip_entry(data: &[u8], entry_name: &str) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 /// `.pth` ZIP を解析し、テンソルメタデータを抽出する。
-fn parse_pth(data: &[u8]) -> io::Result<HashMap<String, TensorMeta>> {
-    let cursor = std::io::Cursor::new(data);
-    let mut archive =
-        zip::ZipArchive::new(cursor).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
+fn parse_pth(archive: &Archive<Vec<u8>>) -> io::Result<HashMap<String, TensorMeta>> {
     // data.pkl を読み込む
-    let pkl_bytes = {
-        let mut entry = archive.by_name("archive/data.pkl").map_err(|e| {
-            io::Error::new(
+    let pkl_bytes = match archive.read("archive/data.pkl") {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("archive/data.pkl が見つかりません: {e}"),
-            )
-        })?;
-        read_entry_bounded(&mut entry)?
+            ))
+        }
+        Err(e) => return Err(e),
     };
 
     parse_pickle(&pkl_bytes).map_err(|e| {

@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Security
+- `.pth` は `alice_zip::pkzip` (上限付きの PKZIP reader) で読む: 格納 (stored) の entry は archive の内に在ることと CRC-32 を検査して複製せずに読み、圧縮された entry は 1 本 256 MiB、archive の圧縮 entry の宣言長の和は 1 GiB まで (和は開く時に判定) 宣言長より伸びる・足りない entry、2 つの entry が同じ byte を覆う archive、同名の entry、暗号化は拒む 自前の上限付き読み (`read_entry_bounded`) と依存 `zip` を外した (`zip` は試験の archive を書く dev-dependency に残す)
 - `.pth` の ZIP の entry は上限までしか読まない: 格納 (stored、`torch.save` の形) は格納された長さ、圧縮された entry は 256 MiB まで archive が宣言する長さは信じず、上限を超える宣言は読む前に拒み、読み取りも上限 + 1 byte で止める (宣言の長さで確保しない) 以前は宣言の長さで確保して上限なしに読んだ (小さな `.pth` が任意の大きさに伸びた) 試験 `tests/pth_expansion_limits.rs`
 
 ### Removed
