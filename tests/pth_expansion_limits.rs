@@ -121,3 +121,38 @@ fn an_entry_that_declares_a_small_size_and_expands_past_the_limit_is_not_read() 
     );
     assert!(loader.get_tensor_raw("b").is_some());
 }
+
+/// The archive with `n` more deflated entries of 16 bytes each (`archive/extra/<k>`), every original entry copied
+fn with_extra(src: &[u8], n: usize) -> Vec<u8> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(src)).unwrap();
+    let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for i in 0..archive.len() {
+        out.raw_copy_file(archive.by_index_raw(i).unwrap()).unwrap();
+    }
+    for k in 0..n {
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        out.start_file(format!("archive/extra/{k}"), opts).unwrap();
+        out.write_all(&[k as u8; 16]).unwrap();
+    }
+    out.finish().unwrap().into_inner()
+}
+
+#[test]
+fn compressed_entries_that_declare_more_than_the_archive_total_are_refused() {
+    // each entry declares just under the per-entry limit, so only the archive-wide total can refuse them: five of
+    // them declare 1275 MiB, past the 1 GiB the loader allows the compressed entries of one archive together
+    let per_entry = (256u32 << 20) - (1 << 20);
+    let mut bomb = with_extra(&fixture("stored.pth"), 5);
+    for k in 0..5 {
+        bomb = declaring(bomb, &format!("archive/extra/{k}"), per_entry);
+    }
+    let err = PthLoader::from_bytes(bomb).err().expect("refused");
+    assert!(err.to_string().contains("total"), "{err}");
+    // four of them (1020 MiB) are within the total
+    let mut fine = with_extra(&fixture("stored.pth"), 4);
+    for k in 0..4 {
+        fine = declaring(fine, &format!("archive/extra/{k}"), per_entry);
+    }
+    assert!(PthLoader::from_bytes(fine).is_ok());
+}
