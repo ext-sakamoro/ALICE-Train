@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Security
+- `.pth` の ZIP の entry は上限までしか読まない: 格納 (stored、`torch.save` の形) は格納された長さ、圧縮された entry は 256 MiB まで archive が宣言する長さは信じず、上限を超える宣言は読む前に拒み、読み取りも上限 + 1 byte で止める (宣言の長さで確保しない) 以前は宣言の長さで確保して上限なしに読んだ (小さな `.pth` が任意の大きさに伸びた) 試験 `tests/pth_expansion_limits.rs`
+
 ### Removed
 - **破壊的変更: TTS の音響 model (FastSpeech2) とその学習を外した** `tts::fastspeech2` / `tts::tts_trainer` / `tts::loss` (`ProsodyLoss`) / `tts::primitives` (Conv1d / LayerNorm / MultiHeadAttention / Linear / 位置符号 / WeightNorm) と、その re-export (`FastSpeech2` / `TtsTrainer` / `ProsodyLoss` ほか) を削除 example `fs2_train` / `fs2_synthesize`、`configs/fs2_jsut.json`、`docs/fastspeech2_training.md`、学習の運用 script (`run_fastspeech2_train.sh` / `quick_restart.sh` / `box_watcher.sh`) も削除 `tts` に残るのは data 側 (`AudioFeatureExtractor` と `F0Extractor`、`TtsDataset`、`TtsBatch`) で、`tts` feature は `safetensors` / `bytemuck` を引かなくなった
 

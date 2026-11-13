@@ -192,14 +192,46 @@ impl PthLoader {
 // ZIP エントリ読み込み
 // ---------------------------------------------------------------------------
 
-/// ZIP アーカイブからエントリのバイト列を取得する。
+/// The most bytes a compressed entry may decompress to (256 MiB): a compressed entry is where a few kilobytes can
+/// expand without bound; a stored entry (what `torch.save` writes) cannot expand past the archive
+const MAX_COMPRESSED_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Reads `entry` up to its limit: a stored entry its stored size, a compressed one
+/// [`MAX_COMPRESSED_ENTRY_BYTES`]. The size the archive declares is not trusted: above the limit the entry is
+/// refused before reading, and the read itself stops one byte past the limit (nothing is allocated from the
+/// declared size).
+fn read_entry_bounded<R: Read + ?Sized>(
+    entry: &mut zip::read::ZipFile<'_, R>,
+) -> io::Result<Vec<u8>> {
+    let limit = if entry.compression() == zip::CompressionMethod::Stored {
+        entry.compressed_size()
+    } else {
+        MAX_COMPRESSED_ENTRY_BYTES
+    };
+    let name = entry.name().map(|n| n.to_string()).unwrap_or_default();
+    let too_large = |what: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("ZIP entry {name} {what}, above the limit of {limit} bytes"),
+        )
+    };
+    if entry.size() > limit {
+        return Err(too_large(&format!("declares {} bytes", entry.size())));
+    }
+    let mut buf = Vec::new();
+    Read::take(&mut *entry, limit + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > limit {
+        return Err(too_large("expands"));
+    }
+    Ok(buf)
+}
+
+/// ZIP アーカイブからエントリのバイト列を取得する (上限は [`read_entry_bounded`])。
 fn read_zip_entry(data: &[u8], entry_name: &str) -> Option<Vec<u8>> {
     let cursor = std::io::Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor).ok()?;
     let mut entry = archive.by_name(entry_name).ok()?;
-    let mut buf = Vec::with_capacity(entry.size() as usize);
-    entry.read_to_end(&mut buf).ok()?;
-    Some(buf)
+    read_entry_bounded(&mut entry).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -220,9 +252,7 @@ fn parse_pth(data: &[u8]) -> io::Result<HashMap<String, TensorMeta>> {
                 format!("archive/data.pkl が見つかりません: {e}"),
             )
         })?;
-        let mut buf = Vec::with_capacity(entry.size() as usize);
-        entry.read_to_end(&mut buf)?;
-        buf
+        read_entry_bounded(&mut entry)?
     };
 
     parse_pickle(&pkl_bytes).map_err(|e| {
